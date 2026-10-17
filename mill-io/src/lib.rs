@@ -447,6 +447,12 @@ impl EventLoop {
         self.reactor.spawn_compute(task, priority);
     }
 
+    /// Number of handler panics caught since creation (pool and direct mode).
+    /// A panicking [`EventHandler`] is caught and counted; the loop keeps running.
+    pub fn handler_panics(&self) -> u64 {
+        self.reactor.handler_panics()
+    }
+
     /// Returns metrics for the compute-intensive thread pool.
     pub fn get_compute_metrics(&self) -> std::sync::Arc<ComputePoolMetrics> {
         self.reactor.get_compute_metrics()

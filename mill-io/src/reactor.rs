@@ -6,9 +6,10 @@ use crate::{
 };
 use mio::{event::Event, Events};
 use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, PoisonError, RwLock,
     },
     time::Duration,
 };
@@ -29,6 +30,8 @@ pub struct Reactor {
     poll_timeout_ms: u64,
     options: ReactorOptions,
     pub(crate) timer_wheel: Arc<TimerWheel>,
+    /// Panics caught on the reactor thread; pool-mode panics are counted by the pool.
+    direct_panics: AtomicU64,
 }
 
 impl Default for Reactor {
@@ -48,6 +51,7 @@ impl Default for Reactor {
                 direct_dispatch: false,
             },
             timer_wheel: Arc::new(TimerWheel::new()),
+            direct_panics: AtomicU64::new(0),
         }
     }
 }
@@ -65,6 +69,7 @@ impl Reactor {
                 direct_dispatch: false,
             },
             timer_wheel: Arc::new(TimerWheel::new()),
+            direct_panics: AtomicU64::new(0),
         })
     }
 
@@ -83,6 +88,7 @@ impl Reactor {
             poll_timeout_ms,
             options,
             timer_wheel: Arc::new(TimerWheel::new()),
+            direct_panics: AtomicU64::new(0),
         })
     }
 
@@ -99,11 +105,18 @@ impl Reactor {
                 None => Duration::from_millis(self.poll_timeout_ms),
             };
 
-            let _ = self
-                .poll_handle
-                .poll(&mut self.events.write().unwrap(), Some(poll_timeout))?;
+            // Handler panics are caught, so these locks are never poisoned in practice.
+            let _ = self.poll_handle.poll(
+                &mut self.events.write().unwrap_or_else(PoisonError::into_inner),
+                Some(poll_timeout),
+            )?;
 
-            for event in self.events.read().unwrap().iter() {
+            for event in self
+                .events
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+            {
                 self.dispatch_event(event.clone())?;
             }
 
@@ -135,7 +148,10 @@ impl Reactor {
                 if (interest.is_readable() && is_readable)
                     || (interest.is_writable() && is_writable)
                 {
-                    handler.handle_event(&event);
+                    let result = catch_unwind(AssertUnwindSafe(|| handler.handle_event(&event)));
+                    if result.is_err() {
+                        self.direct_panics.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Ok(())
@@ -161,6 +177,11 @@ impl Reactor {
         F: FnOnce() + Send + 'static,
     {
         self.compute_pool.spawn(task, priority);
+    }
+
+    /// Handler panics caught since creation, in both pool and direct mode.
+    pub fn handler_panics(&self) -> u64 {
+        self.direct_panics.load(Ordering::Relaxed) + self.pool.panics()
     }
 
     pub fn get_compute_metrics(&self) -> Arc<ComputePoolMetrics> {

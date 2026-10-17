@@ -31,6 +31,7 @@ pub struct ThreadPool {
     workers: Vec<Worker>,
     senders: Vec<channel::Sender<WorkerMessage>>,
     next_worker: AtomicUsize,
+    panics: Arc<AtomicU64>,
 }
 
 impl Default for ThreadPool {
@@ -46,10 +47,11 @@ impl ThreadPool {
     pub fn new(capacity: usize) -> Self {
         let mut workers = Vec::with_capacity(capacity);
         let mut senders = Vec::with_capacity(capacity);
+        let panics = Arc::new(AtomicU64::new(0));
 
         for id in 0..capacity {
             let (sender, receiver) = channel::channel::<WorkerMessage>();
-            workers.push(Worker::new(id, receiver));
+            workers.push(Worker::new(id, receiver, Arc::clone(&panics)));
             senders.push(sender);
         }
 
@@ -57,6 +59,7 @@ impl ThreadPool {
             workers,
             senders,
             next_worker: AtomicUsize::new(0),
+            panics,
         }
     }
 
@@ -72,6 +75,11 @@ impl ThreadPool {
     pub fn workers_len(&self) -> usize {
         self.workers.len()
     }
+
+    /// Number of tasks that panicked since the pool was created.
+    pub fn panics(&self) -> u64 {
+        self.panics.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for ThreadPool {
@@ -81,7 +89,7 @@ impl Drop for ThreadPool {
         }
         for worker in &mut self.workers {
             if let Some(t) = worker.take_thread() {
-                t.join().unwrap();
+                let _ = t.join();
             }
         }
     }
@@ -94,14 +102,24 @@ struct Worker {
 }
 
 impl Worker {
-    pub fn new(id: usize, receiver: channel::Receiver<WorkerMessage>) -> Self {
+    pub fn new(
+        id: usize,
+        receiver: channel::Receiver<WorkerMessage>,
+        panics: Arc<AtomicU64>,
+    ) -> Self {
         let thread = Some(
             Builder::new()
                 .name(format!("thread-pool-worker-{id}"))
                 .spawn(move || {
                     while let Ok(message) = receiver.recv() {
                         match message {
-                            WorkerMessage::Task(task) => task(),
+                            WorkerMessage::Task(task) => {
+                                // If this thread ended, its receiver would drop and
+                                // every later `exec` routed here would fail.
+                                if catch_unwind(AssertUnwindSafe(task)).is_err() {
+                                    panics.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             WorkerMessage::Terminate => break,
                         }
                     }
