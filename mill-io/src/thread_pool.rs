@@ -698,60 +698,45 @@ mod tests {
 
     #[test]
     fn test_compute_pool_multi_worker_picks_highest_first() {
-        // 2 workers. Block both, then queue Critical + Low.
-        // When released, the first worker to pop should get Critical.
+        // 2 workers. Block both, then queue Low + Critical.
         let pool = ComputeThreadPool::new(2);
         let order = Arc::new(Mutex::new(Vec::new()));
 
-        let barrier = Arc::new(Barrier::new(3)); // 2 workers + main
-        let b1 = barrier.clone();
-        let b2 = barrier.clone();
-        let release = Arc::new(Barrier::new(3));
-        let rel1 = release.clone();
-        let rel2 = release.clone();
+        let started = Arc::new(Barrier::new(3)); // 2 workers + main
+        let release_first = Arc::new(Barrier::new(2));
+        let release_second = Arc::new(Barrier::new(2));
 
-        pool.spawn(
-            move || {
-                b1.wait();
-                rel1.wait();
-            },
-            TaskPriority::Low,
-        );
-        pool.spawn(
-            move || {
-                b2.wait();
-                rel2.wait();
-            },
-            TaskPriority::Low,
-        );
-        barrier.wait();
+        for release in [release_first.clone(), release_second.clone()] {
+            let s = started.clone();
+            pool.spawn(
+                move || {
+                    s.wait();
+                    release.wait();
+                },
+                TaskPriority::Low,
+            );
+        }
+        started.wait();
 
-        // Both workers are blocked. Queue one Critical and one Low.
         let o1 = order.clone();
+        pool.spawn(move || o1.lock().unwrap().push("low"), TaskPriority::Low);
+        let o2 = order.clone();
         pool.spawn(
-            move || o1.lock().unwrap().push("critical"),
+            move || o2.lock().unwrap().push("critical"),
             TaskPriority::Critical,
         );
-        let o2 = order.clone();
-        pool.spawn(move || o2.lock().unwrap().push("low"), TaskPriority::Low);
 
-        release.wait();
+        // Free one worker only: with both free, the two tasks run concurrently
+        // and the order they record in is not the order they were popped in.
+        release_first.wait();
 
-        let start = std::time::Instant::now();
-        loop {
-            if order.lock().unwrap().len() == 2 {
-                break;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "Timed out waiting for tasks"
-            );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while order.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
+        release_second.wait();
 
-        // Critical must be the first one popped.
-        let res = order.lock().unwrap();
-        assert_eq!(res[0], "critical");
+        assert_eq!(*order.lock().unwrap(), vec!["critical", "low"]);
     }
 
     #[test]
