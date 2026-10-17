@@ -70,3 +70,6 @@
 
 pub mod errors;
 pub mod tcp;
+/// Test tools, such as a TCP proxy that misbehaves on purpose.
+#[cfg(feature = "testing")]
+pub mod testing;
