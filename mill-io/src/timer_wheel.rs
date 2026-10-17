@@ -132,7 +132,7 @@ impl WheelInner {
     /// Called when a lower level's cursor wraps around.
     fn cascade(&mut self, level: usize) {
         let slot = (self.current_tick >> SHIFTS[level]) & MASKS[level];
-        let ids: Vec<u64> = self.levels[level][slot as usize].drain(..).collect();
+        let ids = std::mem::take(&mut self.levels[level][slot as usize]);
         for id in ids {
             if self.timers.contains_key(&id) {
                 let deadline = self.timers[&id].deadline_tick;
@@ -171,7 +171,7 @@ impl WheelInner {
             let slot = (self.current_tick & MASKS[0]) as usize;
 
             // Fire all timers in the current level-0 slot.
-            let ids: Vec<u64> = self.levels[0][slot].drain(..).collect();
+            let ids = std::mem::take(&mut self.levels[0][slot]);
             for id in ids {
                 if let Some(entry) = self.timers.remove(&id) {
                     self.timer_count -= 1;
