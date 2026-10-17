@@ -57,14 +57,12 @@ impl math_service::Service for MathImpl {
             return true;
         }
 
-        #[allow(clippy::incompatible_msrv)]
-        if n.is_multiple_of(2) {
+        if n % 2 == 0 {
             return false;
         }
         let mut i = 3;
         while i * i <= n {
-            #[allow(clippy::incompatible_msrv)]
-            if n.is_multiple_of(i) {
+            if n % i == 0 {
                 return false;
             }
             i += 2;

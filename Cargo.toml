@@ -13,7 +13,7 @@ version = "3.0.0"
 authors = ["Citadel-tech", "Mohamed Emad"]
 license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.74"
 
 [workspace.dependencies]
 mio = { version = "1.1.0", features = ["os-poll", "net"] }
