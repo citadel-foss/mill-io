@@ -25,7 +25,8 @@ pub struct ChaosConfig {
     pub throttle_for: Option<Duration>,
     /// Each direction on its own: stop forwarding after N bytes, keeping the sockets open.
     pub stall_after: Option<usize>,
-    /// Reset both sockets (`SO_LINGER` 0, then close) once either direction forwarded N bytes.
+    /// Unix only: reset both sockets (`SO_LINGER` 0, then close) once either direction
+    /// forwarded N bytes. Elsewhere [`ChaosProxy::start`] fails with `Unsupported`.
     pub reset_after: Option<usize>,
 }
 
@@ -46,6 +47,12 @@ impl ChaosProxy {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "split_writes must be at least 1",
+            ));
+        }
+        if cfg.reset_after.is_some() && !linger::SUPPORTED {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "reset_after needs SO_LINGER, which this platform lacks",
             ));
         }
 
@@ -505,6 +512,8 @@ mod linger {
     )))]
     const OPT: Option<(c_int, c_int)> = None;
 
+    pub(super) const SUPPORTED: bool = OPT.is_some();
+
     #[repr(C)]
     struct Linger {
         l_onoff: c_int,
@@ -554,6 +563,8 @@ mod linger {
 mod linger {
     use std::io;
     use std::net::TcpStream;
+
+    pub(super) const SUPPORTED: bool = false;
 
     pub(super) fn set_zero(_stream: &TcpStream) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
