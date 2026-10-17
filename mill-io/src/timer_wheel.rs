@@ -32,6 +32,10 @@ const MASKS: [u64; NUM_LEVELS] = [0xFF, 0x3F, 0x3F, 0x3F];
 // Total addressable ticks: 2^26 = 67,108,864 (~18.6 hours at 1ms/tick)
 const MAX_RANGE_TICKS: u64 = 1 << 26;
 
+fn duration_to_ticks(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 enum TimerKind {
     Once(Option<Box<dyn FnOnce() + Send>>),
     Repeating(Box<dyn Fn() + Send + Sync>, Duration),
@@ -93,9 +97,11 @@ impl WheelInner {
     }
 
     fn instant_to_tick(&self, instant: Instant) -> u64 {
-        instant
-            .saturating_duration_since(self.start_time)
-            .as_millis() as u64
+        duration_to_ticks(instant.saturating_duration_since(self.start_time))
+    }
+
+    fn deadline_after(now_tick: u64, delay: Duration) -> u64 {
+        now_tick.saturating_add(duration_to_ticks(delay))
     }
 
     /// Place a timer ID into the correct wheel slot based on its deadline.
@@ -132,7 +138,7 @@ impl WheelInner {
     /// Called when a lower level's cursor wraps around.
     fn cascade(&mut self, level: usize) {
         let slot = (self.current_tick >> SHIFTS[level]) & MASKS[level];
-        let ids: Vec<u64> = self.levels[level][slot as usize].drain(..).collect();
+        let ids = std::mem::take(&mut self.levels[level][slot as usize]);
         for id in ids {
             if self.timers.contains_key(&id) {
                 let deadline = self.timers[&id].deadline_tick;
@@ -171,7 +177,7 @@ impl WheelInner {
             let slot = (self.current_tick & MASKS[0]) as usize;
 
             // Fire all timers in the current level-0 slot.
-            let ids: Vec<u64> = self.levels[0][slot].drain(..).collect();
+            let ids = std::mem::take(&mut self.levels[0][slot]);
             for id in ids {
                 if let Some(entry) = self.timers.remove(&id) {
                     self.timer_count -= 1;
@@ -317,6 +323,8 @@ impl TimerWheel {
     }
 
     /// Schedule a one-shot timer that fires once after `delay`.
+    /// A delay too large to represent, up to `Duration::MAX`, saturates: the
+    /// timer never fires but can still be cancelled.
     pub fn schedule_once<F>(&self, delay: Duration, callback: F) -> TimerId
     where
         F: FnOnce() + Send + 'static,
@@ -325,7 +333,8 @@ impl TimerWheel {
         let timer_id = TimerId(id);
 
         let mut inner = self.inner.lock();
-        let deadline_tick = inner.instant_to_tick(Instant::now()) + delay.as_millis() as u64;
+        let now_tick = inner.instant_to_tick(Instant::now());
+        let deadline_tick = WheelInner::deadline_after(now_tick, delay);
 
         let entry = TimerEntry {
             id: timer_id,
@@ -343,6 +352,8 @@ impl TimerWheel {
 
     /// Schedule a repeating timer that fires every `interval`.
     /// The first firing happens after one `interval` elapses.
+    /// Intervals too large to represent saturate as in
+    /// [`schedule_once`](Self::schedule_once).
     pub fn schedule_repeating<F>(&self, interval: Duration, callback: F) -> TimerId
     where
         F: Fn() + Send + Sync + 'static,
@@ -351,7 +362,8 @@ impl TimerWheel {
         let timer_id = TimerId(id);
 
         let mut inner = self.inner.lock();
-        let deadline_tick = inner.instant_to_tick(Instant::now()) + interval.as_millis() as u64;
+        let now_tick = inner.instant_to_tick(Instant::now());
+        let deadline_tick = WheelInner::deadline_after(now_tick, interval);
 
         let entry = TimerEntry {
             id: timer_id,
@@ -442,7 +454,7 @@ impl TimerWheel {
                     continue;
                 }
                 if let TimerKind::Repeating(_, interval) = &entry.kind {
-                    let next_deadline = now_tick + interval.as_millis() as u64;
+                    let next_deadline = WheelInner::deadline_after(now_tick, *interval);
 
                     let new_entry = TimerEntry {
                         id: entry.id,

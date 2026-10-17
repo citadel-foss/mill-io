@@ -309,8 +309,7 @@ fn generate_service_module(def: ServiceDef) -> syn::Result<proc_macro2::TokenStr
                 let req_construct = if m.args.is_empty() {
                     quote! { types::#req_name }
                 } else {
-                    let fields: Vec<_> = arg_names.iter().map(|n| quote! { #n: #n }).collect();
-                    quote! { types::#req_name { #( #fields, )* } }
+                    quote! { types::#req_name { #( #arg_names, )* } }
                 };
 
                 quote! {
