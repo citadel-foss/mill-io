@@ -325,34 +325,154 @@ fn counts_connections() {
 
 /// (stress)
 #[test]
+fn stall_keeps_socket_open() {
+    let _serial = serial();
+    const STALL: usize = 1000;
+    let sent = pattern(5 * STALL);
+
+    let (upstream, server) = serve(1, |mut stream| {
+        let (received, _) = read_sizes(&mut stream, STALL);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let after_stall = stream.read(&mut [0u8; 1]).map_err(|e| e.kind());
+        stream.write_all(b"pong").unwrap();
+        stream.set_read_timeout(Some(DEADLINE)).unwrap();
+        read_until_closed(&mut stream);
+        (received, after_stall)
+    });
+    let proxy = ChaosProxy::start(
+        upstream,
+        ChaosConfig {
+            stall_after: Some(STALL),
+            ..ChaosConfig::default()
+        },
+    )
+    .unwrap();
+
+    let mut client = connect(&proxy);
+    client.write_all(&sent).unwrap();
+    let mut pong = [0u8; 4];
+    client.read_exact(&mut pong).unwrap();
+    assert_eq!(&pong, b"pong");
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let client_after = client.read(&mut [0u8; 1]).map_err(|e| e.kind());
+    assert!(
+        matches!(
+            client_after,
+            Err(io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        ),
+        "client side not left open: {client_after:?}"
+    );
+
+    drop(proxy);
+    let (received, after_stall) = server.join().unwrap().pop().unwrap();
+    assert!(received == sent[..STALL], "first {STALL} bytes changed");
+    assert!(
+        matches!(
+            after_stall,
+            Err(io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        ),
+        "expected nothing after {STALL} bytes and no EOF, got {after_stall:?}"
+    );
+}
+
+fn read_until_reset(stream: &mut TcpStream) -> Vec<u8> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => panic!("EOF after {} bytes, expected a reset", data.len()),
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return data,
+            Err(e) => panic!("expected a reset after {} bytes, got {e}", data.len()),
+        }
+    }
+}
+
+#[test]
+fn reset_after_n_bytes() {
+    let _serial = serial();
+    const RESET: usize = 1000;
+    let sent = pattern(5 * RESET);
+    let cfg = ChaosConfig {
+        reset_after: Some(RESET),
+        ..ChaosConfig::default()
+    };
+
+    let (upstream, server) = serve(1, |mut stream| read_until_reset(&mut stream));
+    let proxy = ChaosProxy::start(upstream, cfg.clone()).unwrap();
+    let mut client = connect(&proxy);
+    if let Err(e) = client.write_all(&sent) {
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionReset, "{e}");
+    } else {
+        let err = client.read(&mut [0u8; 1]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+    }
+    let received = server.join().unwrap().pop().unwrap();
+    assert!(
+        received.len() <= RESET,
+        "{} bytes before the reset",
+        received.len()
+    );
+    assert!(received == sent[..received.len()], "bytes changed");
+
+    let (upstream, server) = {
+        let sent = sent.clone();
+        serve(1, move |mut stream| {
+            let _ = stream.write_all(&sent);
+            let err = stream.read(&mut [0u8; 1]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+        })
+    };
+    let proxy = ChaosProxy::start(upstream, cfg).unwrap();
+    let received = read_until_reset(&mut connect(&proxy));
+    assert!(
+        received.len() <= RESET,
+        "{} bytes before the reset",
+        received.len()
+    );
+    assert!(received == sent[..received.len()], "bytes changed");
+    server.join().unwrap();
+    assert_eq!(proxy.connections_seen(), 1);
+}
+
+/// (stress)
+#[test]
 fn drop_stops_threads() {
     let _serial = serial();
     #[cfg(unix)]
     let fds_before = open_fds();
 
     let (upstream, server) = serve(2, echo);
-    let proxy = ChaosProxy::start(
-        upstream,
-        ChaosConfig {
-            read_rate_bps: Some(1),
-            ..ChaosConfig::default()
-        },
-    )
-    .unwrap();
+    let throttled = ChaosConfig {
+        read_rate_bps: Some(1),
+        ..ChaosConfig::default()
+    };
+    let stalled = ChaosConfig {
+        stall_after: Some(0),
+        ..ChaosConfig::default()
+    };
+    let proxies: Vec<_> = [throttled, stalled]
+        .into_iter()
+        .map(|cfg| ChaosProxy::start(upstream, cfg).unwrap())
+        .collect();
 
-    let mut clients: Vec<_> = (0..2).map(|_| connect(&proxy)).collect();
+    let mut clients: Vec<_> = proxies.iter().map(connect).collect();
     for client in &mut clients {
         client.write_all(&[0u8; 4096]).unwrap();
     }
     wait_until(DEADLINE, "both connections to be accepted", || {
-        proxy.connections_seen() == 2
+        proxies.iter().all(|proxy| proxy.connections_seen() == 1)
     });
     #[cfg(target_os = "linux")]
     wait_until(DEADLINE, "the proxy's threads to start", || {
-        proxy_threads().len() == 5
+        proxy_threads().len() == 6
     });
 
-    drop(proxy);
+    drop(proxies);
 
     // A joined thread can linger in /proc/self/task for a moment after `join` returns.
     #[cfg(target_os = "linux")]
