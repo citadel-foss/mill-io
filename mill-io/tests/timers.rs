@@ -241,3 +241,49 @@ fn zero_interval_does_not_spin() {
     );
     assert!(fired.load(Ordering::SeqCst) >= 10);
 }
+
+#[test]
+fn timer_panic_keeps_loop_running() {
+    let (event_loop, handle) = spawn_loop();
+
+    event_loop.schedule_once(Duration::from_millis(5), || panic!("one-shot timer panic"));
+
+    let repeat_fires = counter();
+    let r = repeat_fires.clone();
+    let repeating = event_loop.schedule_repeating(Duration::from_millis(5), move || {
+        r.fetch_add(1, Ordering::SeqCst);
+        panic!("repeating timer panic");
+    });
+
+    let later = counter();
+    let l = later.clone();
+    event_loop.schedule_once(Duration::from_millis(40), move || {
+        l.fetch_add(1, Ordering::SeqCst);
+    });
+
+    assert!(
+        wait_until(Duration::from_secs(5), || later.load(Ordering::SeqCst) == 1),
+        "timer due after the panics did not fire"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || repeat_fires
+            .load(Ordering::SeqCst)
+            >= 3),
+        "panicking repeating timer was not re-armed"
+    );
+    assert!(!handle.is_finished(), "run() exited after a timer panic");
+
+    assert!(event_loop.cancel_timer(repeating));
+    let after = counter();
+    let a = after.clone();
+    event_loop.schedule_once(Duration::from_millis(5), move || {
+        a.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || after.load(Ordering::SeqCst) == 1),
+        "timer scheduled after the panics did not fire"
+    );
+    assert_eq!(event_loop.pending_timers(), 0);
+
+    stop_loop(&event_loop, handle);
+}

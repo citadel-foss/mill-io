@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -322,6 +323,7 @@ impl WheelInner {
 pub struct TimerWheel {
     inner: Mutex<WheelInner>,
     next_id: AtomicU64,
+    panics: AtomicU64,
 }
 
 impl TimerWheel {
@@ -329,6 +331,7 @@ impl TimerWheel {
         TimerWheel {
             inner: Mutex::new(WheelInner::new()),
             next_id: AtomicU64::new(1),
+            panics: AtomicU64::new(0),
         }
     }
 
@@ -364,6 +367,8 @@ impl TimerWheel {
     /// The first firing happens after one `interval` elapses.
     /// Intervals below one tick (1 ms), including zero, are clamped to one
     /// tick; huge ones saturate as in [`schedule_once`](Self::schedule_once).
+    /// A callback that panics stays scheduled until cancelled; a cancel made
+    /// before or during the panicking call still applies.
     pub fn schedule_repeating<F>(&self, interval: Duration, callback: F) -> TimerId
     where
         F: Fn() + Send + Sync + 'static,
@@ -413,6 +418,8 @@ impl TimerWheel {
     /// Repeating timers are automatically re-scheduled after firing.
     /// Callbacks run outside the wheel lock so they can safely schedule
     /// or cancel other timers.
+    /// A panicking callback is caught and counted, and the other expired
+    /// timers still fire.
     pub fn tick(&self) {
         let now = Instant::now();
 
@@ -436,18 +443,19 @@ impl TimerWheel {
             }
         }
 
-        // Fire callbacks without holding the lock.
+        // Fire callbacks without holding the lock. Repeating entries go to
+        // `to_reschedule` even after a panic, so `in_flight` is always cleared.
         let mut to_reschedule = Vec::new();
 
         for mut entry in expired {
             match &mut entry.kind {
                 TimerKind::Once(cb) => {
                     if let Some(callback) = cb.take() {
-                        callback();
+                        self.run_callback(callback);
                     }
                 }
                 TimerKind::Repeating(cb, _) => {
-                    cb();
+                    self.run_callback(cb.as_ref());
                     to_reschedule.push(entry);
                 }
             }
@@ -480,6 +488,20 @@ impl TimerWheel {
                 }
             }
         }
+    }
+
+    fn run_callback(&self, callback: impl FnOnce()) {
+        // AssertUnwindSafe: no wheel lock is held while a callback runs, so a
+        // panic cannot leave the wheel half-updated.
+        if catch_unwind(AssertUnwindSafe(callback)).is_err() {
+            self.panics.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Not read in the crate until `EventLoop::timer_panics()` exists.
+    #[allow(dead_code)]
+    pub(crate) fn panics(&self) -> u64 {
+        self.panics.load(Ordering::Relaxed)
     }
 
     /// Duration until the nearest pending timer, or None if no timers exist.
@@ -945,6 +967,98 @@ mod tests {
         wheel.tick();
         assert_eq!(fired.load(Ordering::SeqCst), 0);
         assert_eq!(wheel.pending_count(), 1);
+    }
+
+    fn tick_until(wheel: &TimerWheel, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "condition not met in time");
+            std::thread::sleep(Duration::from_millis(1));
+            wheel.tick();
+        }
+    }
+
+    #[test]
+    fn test_panicking_once_callback_does_not_stop_others() {
+        let wheel = TimerWheel::new();
+        let fired = Arc::new(AtomicUsize::new(0));
+
+        let f = fired.clone();
+        wheel.schedule_once(Duration::from_millis(2), move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        });
+        wheel.schedule_once(Duration::from_millis(2), || panic!("timer panic"));
+        let f = fired.clone();
+        wheel.schedule_once(Duration::from_millis(2), move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        });
+
+        tick_until(&wheel, || wheel.pending_count() == 0);
+
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
+        assert_eq!(wheel.panics(), 1);
+    }
+
+    #[test]
+    fn test_panicking_repeating_timer_stays_scheduled() {
+        let wheel = TimerWheel::new();
+        let fired = Arc::new(AtomicUsize::new(0));
+
+        let f = fired.clone();
+        let id = wheel.schedule_repeating(Duration::from_millis(1), move || {
+            f.fetch_add(1, Ordering::SeqCst);
+            panic!("repeating timer panic");
+        });
+
+        tick_until(&wheel, || fired.load(Ordering::SeqCst) >= 3);
+
+        assert_eq!(wheel.panics(), fired.load(Ordering::SeqCst) as u64);
+        assert_eq!(wheel.pending_count(), 1, "panicking timer was not re-armed");
+        assert!(wheel.inner.lock().in_flight.is_empty());
+
+        assert!(wheel.cancel(id));
+        assert_eq!(wheel.pending_count(), 0);
+        let inner = wheel.inner.lock();
+        assert!(inner.in_flight.is_empty());
+        assert!(inner.canceled_in_flight.is_empty());
+    }
+
+    #[test]
+    fn test_repeating_timer_cancelled_then_panicking_is_dropped() {
+        let wheel = Arc::new(TimerWheel::new());
+        let fired = Arc::new(AtomicUsize::new(0));
+        let id_slot: Arc<Mutex<Option<TimerId>>> = Arc::new(Mutex::new(None));
+
+        let w = wheel.clone();
+        let f = fired.clone();
+        let slot = id_slot.clone();
+        let id = wheel.schedule_repeating(Duration::from_millis(1), move || {
+            f.fetch_add(1, Ordering::SeqCst);
+            if let Some(tid) = *slot.lock() {
+                assert!(w.cancel(tid));
+            }
+            panic!("panic after self-cancel");
+        });
+        *id_slot.lock() = Some(id);
+
+        tick_until(&wheel, || fired.load(Ordering::SeqCst) == 1);
+
+        assert_eq!(wheel.panics(), 1);
+        assert_eq!(wheel.pending_count(), 0);
+        {
+            let inner = wheel.inner.lock();
+            assert!(inner.in_flight.is_empty());
+            assert!(inner.canceled_in_flight.is_empty());
+        }
+
+        let later = Arc::new(AtomicUsize::new(0));
+        let l = later.clone();
+        wheel.schedule_once(Duration::from_millis(5), move || {
+            l.fetch_add(1, Ordering::SeqCst);
+        });
+        tick_until(&wheel, || later.load(Ordering::SeqCst) == 1);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(!wheel.cancel(id));
     }
 
     #[test]
