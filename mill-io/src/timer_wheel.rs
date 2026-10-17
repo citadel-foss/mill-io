@@ -498,8 +498,6 @@ impl TimerWheel {
         }
     }
 
-    // Not read in the crate until `EventLoop::timer_panics()` exists.
-    #[allow(dead_code)]
     pub(crate) fn panics(&self) -> u64 {
         self.panics.load(Ordering::Relaxed)
     }

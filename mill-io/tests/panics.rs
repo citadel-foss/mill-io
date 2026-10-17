@@ -304,3 +304,46 @@ fn run_after_consumed_stop_runs_again() {
         assert_eq!(runner.join().expect("run() panicked"), Ok(()));
     }
 }
+
+#[test]
+fn timer_panic_keeps_loop_running() {
+    for event_loop in [
+        Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
+        Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
+    ] {
+        let runner = spawn_loop(&event_loop);
+        event_loop.schedule_once(Duration::from_millis(5), || {
+            panic!("intentional timer panic")
+        });
+        let later = Arc::new(AtomicUsize::new(0));
+        {
+            let later = Arc::clone(&later);
+            event_loop.schedule_once(Duration::from_millis(30), move || {
+                later.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert!(
+            wait_until(Duration::from_secs(1), || later.load(Ordering::SeqCst) == 1),
+            "a timer due after the panicking one did not fire"
+        );
+        assert_eq!(event_loop.timer_panics(), 1);
+
+        let after = Arc::new(AtomicUsize::new(0));
+        {
+            let after = Arc::clone(&after);
+            event_loop.schedule_once(Duration::from_millis(1), move || {
+                after.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert!(
+            wait_until(Duration::from_secs(1), || after.load(Ordering::SeqCst) == 1),
+            "a timer scheduled after the panic did not fire"
+        );
+        assert!(!runner.is_finished(), "run() returned after a timer panic");
+        assert_eq!(event_loop.timer_panics(), 1);
+        assert_eq!(event_loop.handler_panics(), 0);
+
+        event_loop.stop();
+        assert_eq!(runner.join().expect("run() panicked"), Ok(()));
+    }
+}
