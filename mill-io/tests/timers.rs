@@ -147,3 +147,97 @@ fn huge_delays_saturate_on_the_wheel() {
     assert_eq!(wheel.pending_count(), 0);
     assert!(wheel.time_until_next().is_none());
 }
+
+#[test]
+fn zero_interval_is_clamped() {
+    let (event_loop, handle) = spawn_loop();
+
+    let fired = counter();
+    let f = fired.clone();
+    let id = event_loop.schedule_repeating(Duration::ZERO, move || {
+        f.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || fired.load(Ordering::SeqCst) >= 1),
+        "zero-interval timer never fired"
+    );
+
+    let start_count = fired.load(Ordering::SeqCst);
+    let started = Instant::now();
+    thread::sleep(Duration::from_secs(1));
+    let fires = fired.load(Ordering::SeqCst) - start_count;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    assert!(event_loop.cancel_timer(id));
+    stop_loop(&event_loop, handle);
+
+    let per_second = fires as f64 / elapsed;
+    assert!(
+        per_second <= 1100.0,
+        "zero-interval timer fired {fires} times in {elapsed:.3}s ({per_second:.0}/s)"
+    );
+    assert!(
+        fires >= 10,
+        "zero-interval timer stopped repeating: {fires}"
+    );
+}
+
+#[test]
+fn sub_tick_interval_is_clamped_under_tight_ticking() {
+    let wheel = TimerWheel::new();
+    let fired = counter();
+    let f1 = fired.clone();
+    let f2 = fired.clone();
+    wheel.schedule_repeating(Duration::ZERO, move || {
+        f1.fetch_add(1, Ordering::SeqCst);
+    });
+    wheel.schedule_repeating(Duration::from_micros(10), move || {
+        f2.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(500) {
+        wheel.tick();
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let per_timer_per_second = fired.load(Ordering::SeqCst) as f64 / 2.0 / elapsed;
+
+    assert!(
+        per_timer_per_second <= 1100.0,
+        "sub-tick timers fired {per_timer_per_second:.0}/s each"
+    );
+    assert_eq!(wheel.pending_count(), 2);
+}
+
+#[test]
+fn zero_interval_does_not_spin() {
+    let wheel = TimerWheel::new();
+    let fired = counter();
+    let f = fired.clone();
+    wheel.schedule_repeating(Duration::ZERO, move || {
+        f.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let mut zero_timeouts = 0u64;
+    let mut wasted = 0u64;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(200) {
+        let next = wheel.time_until_next().expect("timer pending");
+        let before = fired.load(Ordering::SeqCst);
+        wheel.tick();
+        if next == Duration::ZERO {
+            zero_timeouts += 1;
+            if fired.load(Ordering::SeqCst) == before {
+                wasted += 1;
+            }
+        } else {
+            assert!(next <= Duration::from_millis(1), "{next:?}");
+        }
+    }
+
+    assert_eq!(
+        wasted, 0,
+        "{wasted} of {zero_timeouts} zero poll timeouts fired nothing"
+    );
+    assert!(fired.load(Ordering::SeqCst) >= 10);
+}

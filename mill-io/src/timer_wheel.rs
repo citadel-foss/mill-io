@@ -32,6 +32,8 @@ const MASKS: [u64; NUM_LEVELS] = [0xFF, 0x3F, 0x3F, 0x3F];
 // Total addressable ticks: 2^26 = 67,108,864 (~18.6 hours at 1ms/tick)
 const MAX_RANGE_TICKS: u64 = 1 << 26;
 
+const TICK: Duration = Duration::from_millis(1);
+
 fn duration_to_ticks(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -292,10 +294,18 @@ impl WheelInner {
             None => self.recompute_earliest()?,
         };
 
-        let now_tick = self.instant_to_tick(Instant::now());
+        let now = Instant::now();
+        let now_tick = self.instant_to_tick(now);
 
-        if earliest <= now_tick {
+        if earliest < now_tick {
             Some(Duration::ZERO)
+        } else if earliest == now_tick {
+            // A timer due at tick T fires only once tick T + 1 has started;
+            // returning zero here would make the reactor spin on poll(0).
+            let next_tick_start = self
+                .start_time
+                .checked_add(Duration::from_millis(now_tick.saturating_add(1)));
+            Some(next_tick_start.map_or(TICK, |t| t.saturating_duration_since(now)))
         } else {
             Some(Duration::from_millis(earliest - now_tick))
         }
@@ -352,12 +362,13 @@ impl TimerWheel {
 
     /// Schedule a repeating timer that fires every `interval`.
     /// The first firing happens after one `interval` elapses.
-    /// Intervals too large to represent saturate as in
-    /// [`schedule_once`](Self::schedule_once).
+    /// Intervals below one tick (1 ms), including zero, are clamped to one
+    /// tick; huge ones saturate as in [`schedule_once`](Self::schedule_once).
     pub fn schedule_repeating<F>(&self, interval: Duration, callback: F) -> TimerId
     where
         F: Fn() + Send + Sync + 'static,
     {
+        let interval = interval.max(TICK);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let timer_id = TimerId(id);
 
@@ -473,6 +484,8 @@ impl TimerWheel {
 
     /// Duration until the nearest pending timer, or None if no timers exist.
     /// Used by the reactor to shorten the poll timeout when a timer is due soon.
+    ///
+    /// Returns zero only when a `tick()` made now would fire that timer.
     pub fn time_until_next(&self) -> Option<Duration> {
         self.inner.lock().time_until_next()
     }
