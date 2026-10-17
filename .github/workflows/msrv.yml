@@ -1,0 +1,60 @@
+name: MSRV
+
+# unstable and unstable-mpmc need nightly, so only default features are checked.
+# The lockfile comes from the MSRV-aware resolver: the newest dev-dependencies need a newer rustc.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msrv:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Read MSRV from Cargo.toml
+      id: msrv
+      run: |
+        version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+        test -n "$version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Install Rust stable (lockfile generation)
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Rust ${{ steps.msrv.outputs.version }}
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.msrv.outputs.version }}
+
+    - name: Generate MSRV-compatible lockfile
+      run: cargo +stable generate-lockfile
+      env:
+        CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: msrv-${{ runner.os }}-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          msrv-${{ runner.os }}-${{ steps.msrv.outputs.version }}-
+
+    - name: Check all targets
+      run: cargo +${{ steps.msrv.outputs.version }} check --locked --workspace --all-targets
