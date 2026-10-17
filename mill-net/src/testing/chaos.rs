@@ -23,11 +23,16 @@ pub struct ChaosConfig {
     pub read_rate_bps: Option<u64>,
     /// How long `read_rate_bps` lasts from accept; `None` means for the whole connection.
     pub throttle_for: Option<Duration>,
+    /// Each direction on its own: stop forwarding after N bytes, keeping the sockets open.
+    pub stall_after: Option<usize>,
+    /// Unix only: reset both sockets (`SO_LINGER` 0, then close) once either direction
+    /// forwarded N bytes. Elsewhere [`ChaosProxy::start`] fails with `Unsupported`.
+    pub reset_after: Option<usize>,
 }
 
 /// A TCP proxy on `127.0.0.1` that forwards to `upstream` as its [`ChaosConfig`] says.
 ///
-/// Half-closes pass through and an error on either side closes both. Dropping the proxy closes
+/// Half-closes pass through and an error on either side resets both. Dropping the proxy closes
 /// every socket it opened and joins every thread it started.
 pub struct ChaosProxy {
     addr: SocketAddr,
@@ -42,6 +47,12 @@ impl ChaosProxy {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "split_writes must be at least 1",
+            ));
+        }
+        if cfg.reset_after.is_some() && !linger::SUPPORTED {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "reset_after needs SO_LINGER, which this platform lacks",
             ));
         }
 
@@ -242,6 +253,24 @@ impl Conn {
         }
     }
 
+    fn reset(&self) {
+        *self.closing.lock() = true;
+        self.closing_cv.notify_all();
+        let upstream = self.upstream.get();
+        for stream in std::iter::once(&self.client).chain(upstream) {
+            let _ = linger::set_zero(stream);
+            // Unlike `Shutdown::Write` this sends nothing, so the peer's first sign of the
+            // reset is the RST sent when the last `Arc<Conn>` closes the socket.
+            let _ = stream.shutdown(Shutdown::Read);
+        }
+    }
+
+    fn fail(&self) {
+        if !self.is_closing() {
+            self.reset();
+        }
+    }
+
     fn wait_closing(&self, timeout: Option<Duration>) -> bool {
         let mut closing = self.closing.lock();
         match timeout {
@@ -288,12 +317,29 @@ fn pump(conn: &Conn, dir: Direction, cfg: &ChaosConfig) {
         )),
         _ => None,
     };
+    let limit = match (cfg.stall_after, cfg.reset_after) {
+        (Some(stall), Some(reset)) => Some(stall.min(reset)),
+        (stall, reset) => stall.or(reset),
+    };
+    let mut forwarded = 0usize;
     let split = cfg.split_writes.is_some();
     let chunk = cfg.split_writes.unwrap_or(BUF_SIZE).max(1);
     let mut buf = vec![0u8; BUF_SIZE];
 
     loop {
+        if cfg.reset_after == Some(forwarded) {
+            conn.reset();
+            return;
+        }
+        if cfg.stall_after == Some(forwarded) {
+            conn.wait_closing(None);
+            return;
+        }
+
         let mut want = buf.len();
+        if let Some(limit) = limit {
+            want = want.min(limit - forwarded);
+        }
         if let Some(t) = throttle.as_mut() {
             match t.admit(conn) {
                 Admit::Upto(n) => want = want.min(n),
@@ -304,13 +350,15 @@ fn pump(conn: &Conn, dir: Direction, cfg: &ChaosConfig) {
 
         let n = match src.read(&mut buf[..want]) {
             Ok(0) => {
-                let _ = dst.shutdown(Shutdown::Write);
+                if !conn.is_closing() {
+                    let _ = dst.shutdown(Shutdown::Write);
+                }
                 return;
             }
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
-                conn.close();
+                conn.fail();
                 return;
             }
         };
@@ -320,7 +368,7 @@ fn pump(conn: &Conn, dir: Direction, cfg: &ChaosConfig) {
 
         for piece in buf[..n].chunks(chunk) {
             if write_fully(conn, dst, piece).is_err() {
-                conn.close();
+                conn.fail();
                 return;
             }
             if split {
@@ -329,6 +377,7 @@ fn pump(conn: &Conn, dir: Direction, cfg: &ChaosConfig) {
                 thread::yield_now();
             }
         }
+        forwarded += n;
     }
 }
 
@@ -415,5 +464,109 @@ impl Throttle {
 
     fn consume(&mut self, n: usize) {
         self.tokens = (self.tokens - n as f64).max(0.0);
+    }
+}
+
+#[cfg(unix)]
+mod linger {
+    use std::io;
+    use std::net::TcpStream;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::io::AsRawFd;
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    ))]
+    const OPT: Option<(c_int, c_int)> = Some((1, 13));
+    #[cfg(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "mips",
+                target_arch = "mips64",
+                target_arch = "sparc",
+                target_arch = "sparc64"
+            )
+        ),
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    const OPT: Option<(c_int, c_int)> = Some((0xffff, 0x0080));
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    const OPT: Option<(c_int, c_int)> = None;
+
+    pub(super) const SUPPORTED: bool = OPT.is_some();
+
+    #[repr(C)]
+    struct Linger {
+        l_onoff: c_int,
+        l_linger: c_int,
+    }
+
+    extern "C" {
+        fn setsockopt(
+            socket: c_int,
+            level: c_int,
+            name: c_int,
+            value: *const c_void,
+            len: u32,
+        ) -> c_int;
+    }
+
+    // `std` keeps `TcpStream::set_linger` unstable (rust-lang/rust#88494) and mill-net may not
+    // add socket2 or libc, so `SOL_SOCKET`/`SO_LINGER` are spelled out per target above.
+    pub(super) fn set_zero(stream: &TcpStream) -> io::Result<()> {
+        let Some((level, name)) = OPT else {
+            return Err(io::ErrorKind::Unsupported.into());
+        };
+        let linger = Linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: the fd is owned by `stream` and open for this call; `value` points to a
+        // live `struct linger` and `len` is its size, matching what `setsockopt` reads.
+        let rc = unsafe {
+            setsockopt(
+                stream.as_raw_fd(),
+                level,
+                name,
+                (&linger as *const Linger).cast(),
+                std::mem::size_of::<Linger>() as u32,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod linger {
+    use std::io;
+    use std::net::TcpStream;
+
+    pub(super) const SUPPORTED: bool = false;
+
+    pub(super) fn set_zero(_stream: &TcpStream) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 }

@@ -70,6 +70,6 @@
 
 pub mod errors;
 pub mod tcp;
-/// Test tools, such as a TCP proxy that misbehaves on purpose.
+/// Test tools, such as a TCP proxy that splits, throttles, stalls and resets connections.
 #[cfg(feature = "testing")]
 pub mod testing;
