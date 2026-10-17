@@ -1,0 +1,149 @@
+use mill_io::timer_wheel::TimerWheel;
+use mill_io::EventLoop;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+type RunResult = Result<(), String>;
+
+fn spawn_loop() -> (Arc<EventLoop>, JoinHandle<RunResult>) {
+    let event_loop = Arc::new(EventLoop::new(2, 64, 50).expect("create event loop"));
+    let runner = event_loop.clone();
+    let handle = thread::spawn(move || runner.run().map_err(|e| e.to_string()));
+    (event_loop, handle)
+}
+
+fn stop_loop(event_loop: &EventLoop, handle: JoinHandle<RunResult>) {
+    event_loop.stop();
+    let result = handle.join().expect("run() thread panicked");
+    assert!(result.is_ok(), "run() returned an error: {result:?}");
+}
+
+fn counter() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
+}
+
+fn move_wheel_clock_past_tick_zero(event_loop: &EventLoop) {
+    let fired = counter();
+    let f = fired.clone();
+    event_loop.schedule_once(Duration::from_millis(5), move || {
+        f.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || fired.load(Ordering::SeqCst) == 1),
+        "warm-up timer did not fire"
+    );
+}
+
+#[test]
+fn max_delay_saturates() {
+    let (event_loop, handle) = spawn_loop();
+    move_wheel_clock_past_tick_zero(&event_loop);
+
+    let fired = counter();
+    let f1 = fired.clone();
+    let f2 = fired.clone();
+    let once = event_loop.schedule_once(Duration::MAX, move || {
+        f1.fetch_add(1, Ordering::SeqCst);
+    });
+    let repeating = event_loop.schedule_repeating(Duration::MAX, move || {
+        f2.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(event_loop.pending_timers(), 2);
+
+    // A deadline that wrapped to just behind the cursor fires only when the
+    // 256 ms level-0 rotation comes round, so the sentinel is due after that.
+    let sentinel = counter();
+    let s = sentinel.clone();
+    event_loop.schedule_once(Duration::from_millis(300), move || {
+        s.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || sentinel.load(Ordering::SeqCst)
+            == 1),
+        "sentinel timer did not fire"
+    );
+
+    assert_eq!(fired.load(Ordering::SeqCst), 0, "Duration::MAX timer fired");
+    assert_eq!(event_loop.pending_timers(), 2);
+
+    assert!(event_loop.cancel_timer(once));
+    assert!(event_loop.cancel_timer(repeating));
+    assert_eq!(event_loop.pending_timers(), 0);
+    assert!(!event_loop.cancel_timer(once), "double cancel succeeded");
+
+    stop_loop(&event_loop, handle);
+    assert_eq!(fired.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn huge_delays_saturate_on_the_wheel() {
+    let wheel = TimerWheel::new();
+
+    let past_tick_zero = counter();
+    let p = past_tick_zero.clone();
+    wheel.schedule_once(Duration::from_millis(1), move || {
+        p.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(wait_until(Duration::from_secs(5), || {
+        wheel.tick();
+        past_tick_zero.load(Ordering::SeqCst) == 1
+    }));
+
+    let delays = [
+        Duration::MAX,
+        Duration::from_secs(u64::MAX),
+        Duration::from_millis(u64::MAX),
+        Duration::from_millis(u64::MAX - 1),
+        Duration::MAX - Duration::from_millis(1),
+    ];
+    let fired = counter();
+    let mut ids = Vec::new();
+    for delay in delays {
+        let f = fired.clone();
+        ids.push(wheel.schedule_once(delay, move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        }));
+        let f = fired.clone();
+        ids.push(wheel.schedule_repeating(delay, move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        }));
+    }
+    assert_eq!(wheel.pending_count(), ids.len());
+
+    let next = wheel.time_until_next().expect("timers pending");
+    assert!(next > Duration::from_secs(365 * 24 * 3600), "{next:?}");
+
+    // Due after one 256 ms level-0 rotation, when a wrapped deadline fires.
+    let sentinel = counter();
+    let s = sentinel.clone();
+    wheel.schedule_once(Duration::from_millis(300), move || {
+        s.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(wait_until(Duration::from_secs(5), || {
+        wheel.tick();
+        sentinel.load(Ordering::SeqCst) == 1
+    }));
+    assert_eq!(fired.load(Ordering::SeqCst), 0, "a saturated timer fired");
+    assert_eq!(wheel.pending_count(), ids.len());
+
+    for id in ids {
+        assert!(wheel.cancel(id));
+    }
+    assert_eq!(wheel.pending_count(), 0);
+    assert!(wheel.time_until_next().is_none());
+}
