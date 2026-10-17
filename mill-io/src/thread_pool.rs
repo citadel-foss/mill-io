@@ -580,6 +580,12 @@ mod tests {
 
         done.wait();
 
+        // The barrier opens inside the task; the worker counts it only after it returns.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while metrics.tasks_completed() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
         assert_eq!(metrics.tasks_failed(), 1);
         assert_eq!(metrics.tasks_completed(), 1);
     }
