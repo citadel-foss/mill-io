@@ -1,5 +1,5 @@
 // TODO: add custom error module and use it here
-use lock_freedom::map::Map;
+use lock_freedom::map::{Insertion, Map, Preview, Removed};
 use mio::{Events, Interest, Poll, Token};
 use std::{
     io,
@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     error::Result,
-    handler::{EventHandler, HandlerEntry},
+    handler::{EventHandler, HandlerEntry, SharedHandler},
 };
 
 type Registry = Arc<Map<Token, HandlerEntry>>;
@@ -27,6 +27,8 @@ pub struct PollHandle {
     poller: Arc<RwLock<mio::Poll>>,
     mio_registry: mio::Registry,
     registery: Registry,
+    /// Handlers by token, so `reregister` can rebuild an entry. Not on the dispatch path.
+    handlers: Map<Token, SharedHandler>,
     waker: Arc<mio::Waker>,
     next_token: AtomicUsize,
 }
@@ -42,6 +44,7 @@ impl PollHandle {
             poller,
             mio_registry,
             registery,
+            handlers: Map::new(),
             waker: Arc::new(waker),
             next_token: AtomicUsize::new(FIRST_ALLOCATED_TOKEN.0),
         })
@@ -73,18 +76,62 @@ impl PollHandle {
         H: EventHandler + Send + Sync + 'static,
         S: mio::event::Source + ?Sized,
     {
-        if token == WAKER_TOKEN {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Token(0) is reserved for the event loop's waker",
-            )));
+        reject_waker_token(token)?;
+
+        let handler = SharedHandler(Arc::new(handler));
+        let handler_entry = HandlerEntry::new(handler.clone(), interest);
+
+        // The entry must exist before the OS registration: a source that is
+        // already ready produces its only edge-triggered event right away, and
+        // a dispatch that finds no entry drops it for good.
+        let previous_handler = self.handlers.insert(token, handler);
+        let previous_entry = self.registery.insert(token, handler_entry);
+
+        if let Err(e) = src.register(&self.mio_registry, token, interest) {
+            restore(&self.handlers, token, previous_handler);
+            restore(&self.registery, token, previous_entry);
+            return Err(Box::new(e));
         }
+        Ok(())
+    }
 
-        let handler_entry = HandlerEntry::new(handler, interest);
+    /// Changes the interests of a source registered under `token`, keeping its handler.
+    pub fn reregister<S>(&self, src: &mut S, token: Token, interest: Interest) -> Result<()>
+    where
+        S: mio::event::Source + ?Sized,
+    {
+        reject_waker_token(token)?;
 
-        src.register(&self.mio_registry, token, interest)?;
+        let handler = match self.handlers.get(&token) {
+            Some(entry) => entry.val().clone(),
+            None => return Err(Box::new(not_registered(token))),
+        };
 
-        self.registery.insert(token, handler_entry);
+        // Store the new interest before telling the OS: a source that is already
+        // ready raises its only edge-triggered event at once, and a dispatch that
+        // still sees the old interest filters it out. The swap is one step and
+        // only happens if the entry is still present, so a dispatch never sees a
+        // missing entry and a racing deregister is not undone.
+        let insertion =
+            self.registery
+                .insert_with(token, |_, generated, stored| match (stored, generated) {
+                    (None, _) => Preview::Discard,
+                    (Some(_), Some(_)) => Preview::Keep,
+                    (Some(_), None) => Preview::New(HandlerEntry::new(handler.clone(), interest)),
+                });
+        let previous = match insertion {
+            Insertion::Failed(_) => return Err(Box::new(not_registered(token))),
+            Insertion::Updated(previous) => Some(previous),
+            Insertion::Created => None,
+        };
+
+        if let Err(e) = src.reregister(&self.mio_registry, token, interest) {
+            if let Some(previous) = previous {
+                self.registery
+                    .reinsert_with(previous, |_, stored| stored.is_some());
+            }
+            return Err(Box::new(e));
+        }
         Ok(())
     }
 
@@ -95,6 +142,7 @@ impl PollHandle {
         self.mio_registry.deregister(source)?;
 
         self.registery.remove(&token);
+        self.handlers.remove(&token);
 
         Ok(())
     }
@@ -116,6 +164,36 @@ impl PollHandle {
         self.registery.clone()
     }
 }
+
+/// Undoes an `insert` into `map`: puts back what it replaced, or removes the key.
+fn restore<V>(map: &Map<Token, V>, token: Token, previous: Option<Removed<Token, V>>) {
+    match previous {
+        Some(previous) => {
+            map.reinsert(previous);
+        }
+        None => {
+            map.remove(&token);
+        }
+    }
+}
+
+fn reject_waker_token(token: Token) -> Result<()> {
+    if token == WAKER_TOKEN {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Token(0) is reserved for the event loop's waker",
+        )));
+    }
+    Ok(())
+}
+
+fn not_registered(token: Token) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{token:?} is not registered with this event loop"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

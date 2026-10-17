@@ -1,4 +1,5 @@
 use mio::{event::Event, Interest};
+use std::sync::Arc;
 
 pub trait EventHandler {
     fn handle_event(&self, event: &Event);
@@ -17,5 +18,15 @@ impl HandlerEntry {
             handler: Box::new(handler),
             interest,
         }
+    }
+}
+
+/// Lets `reregister` rebuild a registry entry around the same handler.
+#[derive(Clone)]
+pub(crate) struct SharedHandler(pub(crate) Arc<dyn EventHandler + Send + Sync>);
+
+impl EventHandler for SharedHandler {
+    fn handle_event(&self, event: &Event) {
+        self.0.handle_event(event)
     }
 }

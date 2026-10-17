@@ -321,6 +321,19 @@ impl EventLoop {
             .register(source, token, interests, handler)
     }
 
+    /// Changes the interests of a registered source; its handler stays the same.
+    ///
+    /// Returns an error for `Token(0)`, for a token not registered with this
+    /// loop, or if the OS rejects the new interests.
+    pub fn reregister<S>(&self, source: &mut S, token: Token, interests: Interest) -> Result<()>
+    where
+        S: mio::event::Source + ?Sized,
+    {
+        self.reactor
+            .poll_handle
+            .reregister(source, token, interests)
+    }
+
     /// Returns a token that is not `Token(0)` and that this loop never returned
     /// before, taken from [`poll::FIRST_ALLOCATED_TOKEN`] upward.
     ///
@@ -388,7 +401,8 @@ impl EventLoop {
     /// 3. Continue until [`stop()`](Self::stop) is called or an error occurs
     ///
     /// The method blocks the calling thread and will only return when the event loop
-    /// is stopped or encounters a fatal error.
+    /// is stopped or encounters a fatal error. If a [`stop()`](Self::stop) is already
+    /// pending, `run()` consumes it and returns `Ok(())` at once.
     ///
     /// ## Errors
     ///
@@ -464,7 +478,8 @@ impl EventLoop {
     }
 
     /// Number of handler panics caught since creation (pool and direct mode).
-    /// A panicking [`EventHandler`] is caught and counted; the loop keeps running.
+    /// Counts panics caught in event handlers and in closures passed to
+    /// [`post`](Self::post); the loop keeps running.
     pub fn handler_panics(&self) -> u64 {
         self.reactor.handler_panics()
     }
@@ -547,6 +562,27 @@ impl EventLoop {
         self.reactor.timer_wheel.pending_count()
     }
 
+    /// Runs `f` on the reactor thread and wakes the poll. Callable from any thread.
+    ///
+    /// Closures run once each, in posting order, after the current poll's
+    /// events. Closures posted while the loop is not running wait for the next
+    /// [`run`](Self::run). A panic in `f` is caught and counted in
+    /// [`handler_panics`](Self::handler_panics), which counts panics caught in
+    /// event handlers and in closures passed to `post()`. Returns an error only
+    /// if the wake-up failed; `f` is still queued and runs by the next poll timeout.
+    pub fn post<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.reactor.post(f)
+    }
+
+    /// True when called on the thread currently inside [`run`](Self::run).
+    /// Pool-mode handlers run on worker threads and see `false`.
+    pub fn is_reactor_thread(&self) -> bool {
+        self.reactor.is_reactor_thread()
+    }
+
     /// Signals the event loop to stop gracefully.
     ///
     /// Sends a shutdown signal to the reactor, which will cause the main loop
@@ -555,7 +591,10 @@ impl EventLoop {
     /// This method is non-blocking and returns immediately. The actual shutdown happens
     /// asynchronously, and [`run()`](Self::run) will return once the shutdown is complete.
     ///
-    /// Thread-safe: can be called from any thread.
+    /// Thread-safe and never panics. Each stop request is consumed by exactly one
+    /// [`run()`](Self::run): the one in progress, or the next one if none is
+    /// running, which then returns at once. Stops made before that run consumes
+    /// one are merged into it; a later `run()` runs normally.
     ///
     /// ## Example
     ///
