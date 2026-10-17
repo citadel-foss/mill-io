@@ -258,6 +258,8 @@ impl EventLoop {
     /// This method registers an I/O source (such as a TCP listener or socket) with the event loop.
     /// When events occur on the source, the provided handler will be invoked on a worker thread.
     ///
+    /// All events for one token run on the same worker, one at a time and in
+    /// poll order.
     ///
     /// ## Arguments
     /// * `source` - The I/O source to register (e.g., [`mio::net::TcpListener`])

@@ -72,6 +72,16 @@ impl ThreadPool {
         Ok(self.senders[index].send(WorkerMessage::Task(Box::new(task)))?)
     }
 
+    /// Runs `task` on worker `key % workers`. Tasks with the same key run one
+    /// at a time, in submission order.
+    pub fn exec_keyed<F>(&self, key: usize, task: F) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let index = key % self.senders.len();
+        Ok(self.senders[index].send(WorkerMessage::Task(Box::new(task)))?)
+    }
+
     pub fn workers_len(&self) -> usize {
         self.workers.len()
     }
