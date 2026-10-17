@@ -367,8 +367,13 @@ impl ComputeThreadPool {
 
 impl Drop for ComputeThreadPool {
     fn drop(&mut self) {
-        self.state.shutdown.store(true, Ordering::SeqCst);
-        self.state.condvar.notify_all();
+        {
+            // Under the queue lock, so a worker between its `shutdown` check and
+            // `wait` cannot miss this wake-up.
+            let _queue = self.state.queue.lock();
+            self.state.shutdown.store(true, Ordering::SeqCst);
+            self.state.condvar.notify_all();
+        }
 
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -741,6 +746,21 @@ mod tests {
         // Critical must be the first one popped.
         let res = order.lock().unwrap();
         assert_eq!(res[0], "critical");
+    }
+
+    #[test]
+    fn test_compute_pool_drop_never_hangs() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                drop(ComputeThreadPool::new(4));
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "dropping a ComputeThreadPool hung"
+        );
     }
 
     #[test]
