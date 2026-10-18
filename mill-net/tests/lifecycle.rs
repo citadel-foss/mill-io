@@ -13,6 +13,14 @@ mod common;
 
 use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
 
+/// `cargo test` runs a file's tests as threads of one process, and the fd count is per
+/// process, so these tests take turns.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Clone, Default)]
 struct Echo {
     connected: Arc<Mutex<Vec<ConnectionId>>>,
@@ -106,6 +114,7 @@ fn round_trip(client: &TcpClient<Client>, handler: &Client, message: &[u8]) -> b
 
 #[test]
 fn client_disconnect_deregisters_its_own_token() {
+    let _serial = serial();
     for (mode, event_loop) in pool_and_direct() {
         let (server, echo) = echo_server(&event_loop);
         let runner = spawn_loop(&event_loop);
@@ -175,6 +184,7 @@ fn client_disconnect_deregisters_its_own_token() {
 
 #[test]
 fn two_servers_on_one_loop_do_not_share_connection_ids() {
+    let _serial = serial();
     for (mode, event_loop) in pool_and_direct() {
         let (first, first_echo) = echo_server(&event_loop);
         let (second, second_echo) = echo_server(&event_loop);
@@ -219,5 +229,241 @@ fn two_servers_on_one_loop_do_not_share_connection_ids() {
 
         stop_loop(&event_loop, runner);
         drop((clients, first, second));
+    }
+}
+
+#[cfg(unix)]
+fn open_fds() -> usize {
+    std::fs::read_dir("/dev/fd").unwrap().count()
+}
+
+#[cfg(unix)]
+#[test]
+fn ten_thousand_cycles_leave_nothing_behind() {
+    let _serial = serial();
+    const CYCLES: usize = 10_000;
+    const BATCH: usize = 100;
+
+    for (mode, event_loop) in pool_and_direct() {
+        let weak_loop = Arc::downgrade(&event_loop);
+        let (server, echo) = echo_server(&event_loop);
+        let runner = spawn_loop(&event_loop);
+
+        let warmup = connected_client(&event_loop, &server);
+        assert!(round_trip(&warmup.0, &warmup.1, b"warm"), "{mode}");
+        drop(warmup);
+        assert!(wait_until(Duration::from_secs(5), || server
+            .connection_count()
+            == 0));
+
+        let fds = open_fds();
+        let timers = event_loop.pending_timers();
+
+        for batch in 0..CYCLES / BATCH {
+            let handler = Client::default();
+            let clients: Vec<_> = (0..BATCH)
+                .map(|_| {
+                    let mut client = TcpClient::connect(
+                        server.local_addr().unwrap(),
+                        TcpClientConfig::default(),
+                        handler.clone(),
+                    )
+                    .unwrap();
+                    client.start(&event_loop).unwrap();
+                    client.send(b"ping").unwrap();
+                    client
+                })
+                .collect();
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    handler.received.lock().len() == BATCH * 4
+                }),
+                "{mode}: batch {batch}: {} of {} echoed bytes",
+                handler.received.lock().len(),
+                BATCH * 4
+            );
+            for client in &clients[..BATCH / 2] {
+                client.disconnect().unwrap();
+            }
+            drop(clients);
+            assert!(
+                wait_until(Duration::from_secs(10), || server.connection_count() == 0),
+                "{mode}: batch {batch}: {} connections left",
+                server.connection_count()
+            );
+            assert_eq!(handler.disconnects.load(Ordering::SeqCst), BATCH, "{mode}");
+        }
+
+        let after = open_fds();
+        assert!(
+            after.abs_diff(fds) <= 2,
+            "{mode}: {fds} fds before, {after} after"
+        );
+        assert_eq!(event_loop.pending_timers(), timers, "{mode}: timers left");
+        assert_eq!(
+            echo.disconnected.lock().len(),
+            CYCLES + 1,
+            "{mode}: server disconnects"
+        );
+
+        server.stop().unwrap();
+        stop_loop(&event_loop, runner);
+        drop((server, echo, event_loop));
+        assert!(
+            weak_loop.upgrade().is_none(),
+            "{mode}: something still holds the event loop"
+        );
+    }
+}
+
+#[test]
+fn server_stop_closes_live_connections() {
+    let _serial = serial();
+    const LIVE: usize = 100;
+
+    for (mode, event_loop) in pool_and_direct() {
+        let (server, echo) = echo_server(&event_loop);
+        let runner = spawn_loop(&event_loop);
+
+        let handler = Client::default();
+        let clients: Vec<_> = (0..LIVE)
+            .map(|_| {
+                let mut client = TcpClient::connect(
+                    server.local_addr().unwrap(),
+                    TcpClientConfig::default(),
+                    handler.clone(),
+                )
+                .unwrap();
+                client.start(&event_loop).unwrap();
+                client
+            })
+            .collect();
+        assert!(
+            wait_until(Duration::from_secs(10), || echo.connected.lock().len()
+                == LIVE),
+            "{mode}: {} of {LIVE} accepted",
+            echo.connected.lock().len()
+        );
+
+        server.stop().unwrap();
+        assert_eq!(server.connection_count(), 0, "{mode}");
+        assert_eq!(
+            echo.disconnected.lock().len(),
+            LIVE,
+            "{mode}: server disconnects"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                handler.disconnects.load(Ordering::SeqCst) == LIVE
+            }),
+            "{mode}: {} of {LIVE} clients saw the close",
+            handler.disconnects.load(Ordering::SeqCst)
+        );
+        server.stop().unwrap();
+        assert_eq!(echo.disconnected.lock().len(), LIVE, "{mode}: second stop");
+
+        let late = Client::default();
+        let late_client = TcpClient::connect(
+            server.local_addr().unwrap(),
+            TcpClientConfig::default(),
+            late.clone(),
+        );
+        if let Ok(mut late_client) = late_client {
+            late_client.start(&event_loop).unwrap();
+            assert!(
+                !wait_until(Duration::from_millis(300), || late
+                    .connects
+                    .load(Ordering::SeqCst)
+                    > 0),
+                "{mode}: a stopped server accepted a connection"
+            );
+        }
+        assert!(Arc::clone(&server)
+            .start(&event_loop, event_loop.alloc_token())
+            .is_err());
+
+        stop_loop(&event_loop, runner);
+        drop((clients, server));
+    }
+}
+
+#[test]
+fn dropping_a_client_closes_its_connection() {
+    let _serial = serial();
+    for (mode, event_loop) in pool_and_direct() {
+        let (server, echo) = echo_server(&event_loop);
+        let runner = spawn_loop(&event_loop);
+        let (client, handler) = connected_client(&event_loop, &server);
+        let sender = client.sender();
+        assert!(wait_until(Duration::from_secs(5), || server
+            .connection_count()
+            == 1));
+
+        drop(client);
+        assert_eq!(handler.disconnects.load(Ordering::SeqCst), 1, "{mode}");
+        assert!(
+            wait_until(Duration::from_secs(5), || server.connection_count() == 0),
+            "{mode}: server still sees the dropped client"
+        );
+        assert_eq!(echo.disconnected.lock().len(), 1, "{mode}");
+        assert!(sender.send(b"x").is_err(), "{mode}");
+
+        stop_loop(&event_loop, runner);
+        drop(server);
+    }
+}
+
+#[test]
+fn stalled_connection_closed_by_a_caller_timer() {
+    let _serial = serial();
+    use mill_net::testing::{ChaosConfig, ChaosProxy};
+    use std::time::Instant;
+
+    for (mode, event_loop) in pool_and_direct() {
+        let (server, _echo) = echo_server(&event_loop);
+        let proxy = ChaosProxy::start(
+            server.local_addr().unwrap(),
+            ChaosConfig {
+                stall_after: Some(10),
+                ..ChaosConfig::default()
+            },
+        )
+        .unwrap();
+        let runner = spawn_loop(&event_loop);
+        let timers = event_loop.pending_timers();
+
+        let handler = Client::default();
+        let mut client =
+            TcpClient::connect(proxy.addr(), TcpClientConfig::default(), handler.clone()).unwrap();
+        client.start(&event_loop).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || handler
+            .connects
+            .load(Ordering::SeqCst)
+            == 1));
+
+        client.send(&[1; 100]).unwrap();
+        let sender = client.sender();
+        let started = Instant::now();
+        event_loop.schedule_once(Duration::from_millis(300), move || sender.close());
+
+        assert!(
+            wait_until(Duration::from_secs(5), || handler
+                .disconnects
+                .load(Ordering::SeqCst)
+                == 1),
+            "{mode}: the deadline did not close the stalled connection"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2),
+            "{mode}: closed after {elapsed:?}"
+        );
+        assert!(handler.received.lock().len() <= 10, "{mode}");
+        assert!(wait_until(Duration::from_secs(1), || event_loop
+            .pending_timers()
+            == timers));
+
+        stop_loop(&event_loop, runner);
+        drop((client, proxy, server));
     }
 }

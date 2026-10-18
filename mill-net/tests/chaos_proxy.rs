@@ -206,22 +206,6 @@ fn splits_writes_into_chunks() {
     }
 }
 
-#[cfg(not(unix))]
-#[test]
-fn reset_after_is_rejected_without_so_linger() {
-    let _serial = serial();
-    let upstream: SocketAddr = "127.0.0.1:9".parse().unwrap();
-    let err = ChaosProxy::start(
-        upstream,
-        ChaosConfig {
-            reset_after: Some(1),
-            ..ChaosConfig::default()
-        },
-    )
-    .unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-}
-
 #[test]
 fn split_writes_of_zero_are_rejected() {
     let _serial = serial();
@@ -395,7 +379,6 @@ fn stall_keeps_socket_open() {
     );
 }
 
-#[cfg(unix)]
 fn read_until_reset(stream: &mut TcpStream) -> Vec<u8> {
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
@@ -409,7 +392,6 @@ fn read_until_reset(stream: &mut TcpStream) -> Vec<u8> {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn reset_after_n_bytes() {
     let _serial = serial();

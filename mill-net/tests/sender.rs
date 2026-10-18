@@ -424,7 +424,6 @@ fn peer_close_with_queued_data_disconnects_once() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn reset_mid_frame_is_an_error() {
     use mill_net::testing::{ChaosConfig, ChaosProxy};

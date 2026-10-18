@@ -1,16 +1,18 @@
 use parking_lot::Mutex;
+use std::any::Any;
 #[cfg(feature = "unstable-mpmc")]
 use std::sync::mpmc as channel;
 #[cfg(not(feature = "unstable-mpmc"))]
 use std::sync::mpsc as channel;
 use std::sync::Arc;
-const IO_BUFFER_SIZE: usize = 8192;
 
 #[derive(Clone)]
 pub struct ObjectPool<T> {
     sender: channel::Sender<T>,
     receiver: Arc<Mutex<channel::Receiver<T>>>,
     create_fn: Arc<dyn Fn() -> T + Send + Sync>,
+    /// For `Vec<u8>` pools: the length `create_fn` gives, restored on every `acquire`.
+    buffer_len: Option<usize>,
 }
 
 impl<T: Send + 'static> ObjectPool<T> {
@@ -20,7 +22,12 @@ impl<T: Send + 'static> ObjectPool<T> {
     {
         let (sender, receiver) = channel::channel();
 
-        for _ in 0..initial_size {
+        let first = create_fn();
+        let buffer_len = (&first as &dyn Any).downcast_ref::<Vec<u8>>().map(Vec::len);
+        if initial_size > 0 {
+            sender.send(first).expect("Failed to initialize ObjectPool");
+        }
+        for _ in 1..initial_size {
             sender
                 .send(create_fn())
                 .expect("Failed to initialize ObjectPool");
@@ -30,6 +37,7 @@ impl<T: Send + 'static> ObjectPool<T> {
             sender,
             receiver: Arc::new(Mutex::new(receiver)),
             create_fn: Arc::new(create_fn),
+            buffer_len,
         }
     }
 
@@ -45,9 +53,12 @@ impl<T: Send + 'static> ObjectPool<T> {
             }
         };
 
-        if let Some(vec) = (&mut object as &mut dyn std::any::Any).downcast_mut::<Vec<u8>>() {
+        if let (Some(len), Some(vec)) = (
+            self.buffer_len,
+            (&mut object as &mut dyn Any).downcast_mut::<Vec<u8>>(),
+        ) {
             vec.clear();
-            vec.resize(IO_BUFFER_SIZE, 0);
+            vec.resize(len, 0);
         }
 
         PooledObject {
@@ -79,5 +90,24 @@ impl<T> Drop for PooledObject<T> {
         if let Some(object) = self.object.take() {
             let _ = self.pool_sender.send(object);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire_keeps_the_length_create_fn_gives() {
+        for len in [512, 8192, 65536] {
+            let pool = ObjectPool::new(2, move || vec![0u8; len]);
+            for _ in 0..4 {
+                let mut buffer = pool.acquire();
+                assert_eq!(buffer.as_ref().len(), len);
+                buffer.as_mut().truncate(3);
+            }
+        }
+        let empty_start = ObjectPool::new(0, || vec![0u8; 100]);
+        assert_eq!(empty_start.acquire().as_ref().len(), 100);
     }
 }

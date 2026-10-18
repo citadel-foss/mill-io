@@ -138,6 +138,8 @@ pub(crate) struct Shared<H: NetworkHandler> {
     pub(crate) ctx: ServerContext,
     pub(crate) conns: LockfreeMap<ConnectionId, Arc<Conn<H>>>,
     pub(crate) count: AtomicUsize,
+    /// Set by `TcpServer::stop`; no connection may be added after it.
+    pub(crate) stopped: AtomicBool,
     pub(crate) buffer_pool: ObjectPool<Vec<u8>>,
     pub(crate) event_loop: OnceLock<Weak<EventLoop>>,
 }
@@ -151,6 +153,7 @@ impl<H: NetworkHandler> Shared<H> {
                 ctx: ServerContext { ops },
                 conns: LockfreeMap::new(),
                 count: AtomicUsize::new(0),
+                stopped: AtomicBool::new(false),
                 buffer_pool,
                 event_loop: OnceLock::new(),
             }
@@ -611,6 +614,11 @@ impl<H: NetworkHandler> Conn<H> {
             shared.report(Some(self.id), NetworkError::Io(Box::new(error)));
         }
         self.shutdown(true);
+    }
+
+    pub(crate) fn set_keepalive(&self, idle: Duration) -> io::Result<()> {
+        self.with_stream(|stream| super::sockopt::set_keepalive(stream, Some(idle)))
+            .unwrap_or(Ok(()))
     }
 
     pub(crate) fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {

@@ -18,6 +18,7 @@ mill-io.workspace = true
 mio.workspace = true
 lock_freedom.workspace = true
 parking_lot.workspace = true
+socket2 = "0.6"
 
 [features]
 testing = []
@@ -31,18 +32,7 @@ tokio = { version = "1", features = ["full"] }
 async-std = { version = "1", features = ["attributes"] }
 smol = "2"
 sha2 = "0.10"
-
-[[example]]
-name = "tcp_echo_server"
-required-features = ["tcp"]
-
-[[example]]
-name = "tcp_http_server"
-required-features = ["tcp"]
-
-[[example]]
-name = "tcp_jsonrpc_server"
-required-features = ["tcp"]
+socket2 = { version = "0.6", features = ["all"] }
 
 [[bench]]
 name = "tcp_benchmarks"

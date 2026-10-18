@@ -167,6 +167,8 @@ pub struct TcpClientConfig {
     pub high_watermark: usize,
     /// Queued outbound bytes at or below which `on_drained` fires after a refused send
     pub low_watermark: usize,
+    /// SO_KEEPALIVE with this idle time before the first probe; `None` leaves it off
+    pub keep_alive: Option<std::time::Duration>,
     /// Enable TCP_NODELAY
     pub nodelay: bool,
 }
@@ -177,6 +179,7 @@ impl Default for TcpClientConfig {
             connect_timeout: std::time::Duration::from_secs(10),
             high_watermark: DEFAULT_HIGH_WATERMARK,
             low_watermark: DEFAULT_LOW_WATERMARK,
+            keep_alive: None,
             nodelay: true,
         }
     }
