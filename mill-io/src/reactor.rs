@@ -156,8 +156,10 @@ impl Reactor {
             }
             Ok(())
         } else {
-            // SLOW PATH: Dispatch to thread pool
-            self.pool.exec(move || {
+            // SLOW PATH: Dispatch to thread pool. Routing by token keeps one
+            // source's events on one worker, so they never run concurrently or
+            // out of poll order.
+            self.pool.exec_keyed(token.0, move || {
                 let entry = registry.get(&token);
                 if let Some(entry) = entry {
                     let interest = entry.1.interest;
