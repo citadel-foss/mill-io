@@ -484,6 +484,11 @@ impl EventLoop {
         self.reactor.handler_panics()
     }
 
+    /// Number of timer callback panics caught since creation.
+    pub fn timer_panics(&self) -> u64 {
+        self.reactor.timer_wheel.panics()
+    }
+
     /// Returns metrics for the compute-intensive thread pool.
     pub fn get_compute_metrics(&self) -> std::sync::Arc<ComputePoolMetrics> {
         self.reactor.get_compute_metrics()
@@ -493,6 +498,10 @@ impl EventLoop {
     ///
     /// The callback runs on the reactor thread during timer processing.
     /// Keep callbacks fast to avoid blocking the event loop.
+    ///
+    /// Huge delays saturate: `Duration::MAX` never fires but can still be
+    /// cancelled. A panicking callback is caught and counted in
+    /// [`timer_panics`](Self::timer_panics).
     ///
     /// ## Example
     ///
@@ -517,6 +526,11 @@ impl EventLoop {
 
     /// Schedule a repeating timer that fires every `interval`.
     /// The first firing happens after one `interval` elapses.
+    ///
+    /// Intervals below 1 ms, including zero, are clamped to one tick, and huge
+    /// ones saturate as in [`schedule_once`](Self::schedule_once). A panicking
+    /// callback is caught and counted in [`timer_panics`](Self::timer_panics);
+    /// the timer stays scheduled until cancelled.
     ///
     /// ## Example
     ///
