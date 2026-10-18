@@ -13,6 +13,7 @@
 use super::{CoreAuth, CoreConfig};
 use crate::engine::{backoff_delay, expired, jitter_factor, round_up_to_ms};
 use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime, Stats};
+use crate::layer::{Dialer, Hop};
 use crate::proto::http::{self, Response, ResponseParser};
 use crate::proto::jsonrpc;
 use crate::ChainError;
@@ -24,7 +25,7 @@ use serde_json::Value;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
@@ -193,7 +194,9 @@ struct State {
 
 pub(crate) struct CoreRpc {
     me: Weak<CoreRpc>,
+    /// The first hop: the proxy if one is set, else the node.
     addr: SocketAddr,
+    dialer: Dialer,
     host: String,
     wallet_path: Option<String>,
     options: EngineOptions,
@@ -247,8 +250,8 @@ impl NetworkHandler for Events {
     }
 }
 
-/// Splits `http://host:port` into the `Host` header value and an address to connect to.
-fn parse_url(url: &str) -> Result<(String, SocketAddr), ChainError> {
+/// Splits `http://host:port` into the `Host` header value, the host and the port.
+fn parse_url(url: &str) -> Result<(String, String, u16), ChainError> {
     let scheme_ok = url
         .get(..7)
         .is_some_and(|s| s.eq_ignore_ascii_case("http://"));
@@ -267,12 +270,13 @@ fn parse_url(url: &str) -> Result<(String, SocketAddr), ChainError> {
     if !has_port {
         return Err(ChainError::Unsupported("rpc_url must name a port"));
     }
-    let addr = authority
-        .to_socket_addrs()
-        .map_err(|e| ChainError::Transport(format!("cannot resolve {}: {}", authority, e)))?
-        .next()
-        .ok_or_else(|| ChainError::Transport(format!("{} has no address", authority)))?;
-    Ok((authority.to_string(), addr))
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or(ChainError::Unsupported("rpc_url must name a port"))?;
+    let port = port
+        .parse()
+        .map_err(|_| ChainError::Transport(format!("invalid port in {}", authority)))?;
+    Ok((authority.to_string(), host.to_string(), port))
 }
 
 /// Percent-encodes a wallet name for use as a path segment.
@@ -302,12 +306,23 @@ impl CoreRpc {
         event_loop: Arc<EventLoop>,
         events: EventSink,
     ) -> Result<Arc<Self>, ChainError> {
-        let (host, addr) = parse_url(&config.rpc_url)?;
+        let (authority, host, port) = parse_url(&config.rpc_url)?;
+        let dialer = Dialer::new(&host, port, &config.transport)?;
+        // Resolved here, on the caller's thread: through a proxy only the proxy's name is.
+        let addr = match dialer.hop() {
+            Hop::Connect(addr) => addr,
+            Hop::Resolve(name, port) => (dialer.resolver())(&name, port)
+                .map_err(|e| ChainError::Transport(format!("cannot resolve {}: {}", name, e)))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| ChainError::Transport(format!("{} has no address", name)))?,
+        };
         let seed = RandomState::new().build_hasher().finish() | 1;
         Ok(Arc::new_cyclic(|me| CoreRpc {
             me: me.clone(),
             addr,
-            host,
+            dialer,
+            host: authority,
             wallet_path: config.wallet.as_deref().map(wallet_path),
             options,
             rpc_connections: config.rpc_connections.max(1),
@@ -455,7 +470,30 @@ impl CoreRpc {
             Some(timer) => pending.timer = Some(timer),
             None => {
                 self.finish(&mut st, &event_loop, id, Err(ChainError::Timeout));
+                self.drop_unwanted_handshakes(&mut st);
                 self.dispatch(&mut st, &event_loop);
+            }
+        }
+    }
+
+    /// A layer handshake gets as long as the calls waiting on it: once a lane has no call
+    /// left, its connections still handshaking are closed.
+    fn drop_unwanted_handshakes(&self, st: &mut State) {
+        if self.dialer.handshake_timeout().is_none() {
+            return;
+        }
+        for lane in Lane::ALL {
+            if !st.queues[lane.index()].is_empty() {
+                continue;
+            }
+            let stalled: Vec<ConnectionId> = st
+                .conns
+                .iter()
+                .filter(|(_, c)| c.lane == lane && c.sender.is_none())
+                .map(|(&id, _)| id)
+                .collect();
+            for id in stalled {
+                self.drop_conn(st, id);
             }
         }
     }
@@ -526,6 +564,7 @@ impl CoreRpc {
             rpc: self.me.clone(),
         };
         let started = TcpClient::connect(self.addr, config, handler)
+            .and_then(|client| self.dialer.add_layers(client))
             .and_then(|mut client| client.start(event_loop).map(|()| client));
         match started {
             Ok(client) => {
@@ -992,6 +1031,11 @@ impl Runtime for CoreRpc {
     fn inject_events(&self, n: usize) {
         self.lock().events.inject(n, &self.stats.resyncs);
     }
+
+    #[cfg(feature = "testing")]
+    fn dns_lookups(&self) -> u64 {
+        self.dialer.dns_lookups()
+    }
 }
 
 #[cfg(test)]
@@ -1000,13 +1044,13 @@ mod tests {
 
     #[test]
     fn urls_need_http_a_host_and_a_port() {
-        let (host, addr) = parse_url("http://127.0.0.1:18443").unwrap();
-        assert_eq!(host, "127.0.0.1:18443");
-        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 18443)));
+        let (authority, host, port) = parse_url("http://127.0.0.1:18443").unwrap();
+        assert_eq!(authority, "127.0.0.1:18443");
+        assert_eq!((host.as_str(), port), ("127.0.0.1", 18443));
         assert_eq!(parse_url("HTTP://127.0.0.1:1/").unwrap().0, "127.0.0.1:1");
-        let (host, addr) = parse_url("http://[::1]:8332").unwrap();
-        assert_eq!(host, "[::1]:8332");
-        assert!(addr.is_ipv6());
+        let (authority, host, port) = parse_url("http://[::1]:8332").unwrap();
+        assert_eq!(authority, "[::1]:8332");
+        assert_eq!((host.as_str(), port), ("[::1]", 8332));
         assert_eq!(
             parse_url("http://localhost:8332").unwrap().0,
             "localhost:8332"

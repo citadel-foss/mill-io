@@ -4,6 +4,7 @@ mod rpc;
 
 pub(crate) use rpc::CoreRpc;
 
+use crate::layer::TransportConfig;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,6 +29,9 @@ pub struct CoreConfig {
     pub max_body_bytes: usize,
     /// ZMQ notifications. Unused so far.
     pub zmq: ZmqConfig,
+    /// How the RPC server is reached; the default is a direct TCP connection. Through a
+    /// SOCKS5 proxy, the `rpc_url` host is resolved by the proxy.
+    pub transport: TransportConfig,
 }
 
 impl CoreConfig {
@@ -46,7 +50,7 @@ impl CoreConfig {
 
 impl Default for CoreConfig {
     /// `http://127.0.0.1:8332` with an empty user and password, no wallet, 4 connections,
-    /// a 30 s request timeout and a 32 MiB body cap.
+    /// a 30 s request timeout, a 32 MiB body cap and a direct connection.
     fn default() -> Self {
         Self {
             rpc_url: "http://127.0.0.1:8332".to_string(),
@@ -59,6 +63,7 @@ impl Default for CoreConfig {
             request_timeout: Duration::from_secs(30),
             max_body_bytes: 32 * 1024 * 1024,
             zmq: ZmqConfig::default(),
+            transport: TransportConfig::default(),
         }
     }
 }
