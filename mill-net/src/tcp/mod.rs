@@ -93,9 +93,104 @@ use std::io;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, RwLock, Weak,
 };
+
+/// Most bytes one readable event reads before the rest is re-posted to the loop.
+pub const MAX_READ_PER_EVENT: usize = 64 * 1024;
+
+/// What one read pass ended on.
+enum ReadPass {
+    /// The socket returned WouldBlock.
+    Drained,
+    /// `MAX_READ_PER_EVENT` bytes were read; the socket may hold more.
+    Capped,
+    /// The peer closed its side.
+    Eof,
+    /// The stream is gone or the handler asked to stop.
+    Stopped,
+    Failed(io::Error),
+}
+
+/// Makes one thread at a time the reader of a connection without blocking the others.
+///
+/// Under edge-triggered polling a readiness edge that finds the socket busy must not be
+/// dropped: it is recorded in `pending`, and the current reader runs another pass for it.
+#[derive(Default)]
+struct ReadDrive {
+    active: AtomicBool,
+    pending: AtomicBool,
+}
+
+impl ReadDrive {
+    /// Records an edge; true if the caller became the reader.
+    fn begin(&self) -> bool {
+        self.pending.store(true, Ordering::SeqCst);
+        self.try_own()
+    }
+
+    /// Gives up the reader role; true if a recorded edge made the caller the reader again.
+    fn release(&self) -> bool {
+        self.active.store(false, Ordering::SeqCst);
+        self.pending.load(Ordering::SeqCst) && self.try_own()
+    }
+
+    /// Gives up the reader role without looking for recorded edges.
+    fn yield_now(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    fn try_own(&self) -> bool {
+        loop {
+            if self
+                .active
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return false;
+            }
+            if self.pending.swap(false, Ordering::SeqCst) {
+                return true;
+            }
+            self.active.store(false, Ordering::SeqCst);
+            if !self.pending.load(Ordering::SeqCst) {
+                return false;
+            }
+        }
+    }
+}
+
+/// Reads until WouldBlock, EOF or `MAX_READ_PER_EVENT` bytes, passing each chunk to `deliver`.
+///
+/// Edge-triggered polling raises no new event for bytes left in the socket, so a pass that
+/// stops early ends in `Capped`, and the caller must re-post the rest.
+fn read_pass(
+    buffer: &mut [u8],
+    mut read: impl FnMut(&mut [u8]) -> Option<io::Result<usize>>,
+    mut deliver: impl FnMut(&[u8]) -> bool,
+) -> ReadPass {
+    let mut total = 0;
+    loop {
+        let want = buffer.len().min(MAX_READ_PER_EVENT - total);
+        match read(&mut buffer[..want]) {
+            None => return ReadPass::Stopped,
+            Some(Ok(0)) => return ReadPass::Eof,
+            Some(Ok(n)) => {
+                if !deliver(&buffer[..n]) {
+                    return ReadPass::Stopped;
+                }
+                total += n;
+                if total >= MAX_READ_PER_EVENT {
+                    return ReadPass::Capped;
+                }
+            }
+            Some(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => return ReadPass::Drained,
+            Some(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+            Some(Err(e)) => return ReadPass::Failed(e),
+        }
+    }
+}
 
 /// Context for network handlers to interact with the server.
 pub struct ServerContext {
@@ -354,7 +449,7 @@ impl<H: NetworkHandler> EventHandler for TcpListenerHandler<H> {
 
                     let stream_arc = Arc::new(Mutex::new(stream));
 
-                    let conn_handler = TcpConnectionHandler {
+                    let conn_handler = ConnectionEvents(Arc::new(TcpConnectionHandler {
                         conn_id,
                         stream: stream_arc.clone(),
                         connections: self.connections.clone(),
@@ -363,7 +458,8 @@ impl<H: NetworkHandler> EventHandler for TcpListenerHandler<H> {
                         event_loop: self.event_loop.clone(),
                         connection_counter: self.connection_counter.clone(),
                         context: self.context.clone(),
-                    };
+                        drive: ReadDrive::default(),
+                    }));
 
                     let event_loop = if let Some(arc) = self.event_loop.upgrade() {
                         arc
@@ -437,25 +533,28 @@ struct TcpConnectionHandler<H: NetworkHandler> {
     event_loop: Weak<EventLoop>,
     connection_counter: Arc<AtomicUsize>,
     context: Arc<ServerContext>,
+    drive: ReadDrive,
 }
 
 unsafe impl<H: NetworkHandler> Send for TcpConnectionHandler<H> {}
 unsafe impl<H: NetworkHandler> Sync for TcpConnectionHandler<H> {}
 
-impl<H: NetworkHandler> EventHandler for TcpConnectionHandler<H> {
-    fn handle_event(&self, event: &Event) {
-        let is_readable = event.is_readable();
-        let is_writable = event.is_writable();
+/// Registered with the loop; shared so a capped read can re-post itself.
+struct ConnectionEvents<H: NetworkHandler>(Arc<TcpConnectionHandler<H>>);
 
-        if is_readable {
-            self.handle_read();
+impl<H: NetworkHandler> EventHandler for ConnectionEvents<H> {
+    fn handle_event(&self, event: &Event) {
+        let conn = &self.0;
+
+        if event.is_readable() {
+            TcpConnectionHandler::handle_read(conn);
         }
 
-        if is_writable {
-            if let Err(e) = self.handler.on_writable(&self.context, self.conn_id) {
-                self.handler.on_error(
-                    &self.context,
-                    Some(self.conn_id),
+        if event.is_writable() {
+            if let Err(e) = conn.handler.on_writable(&conn.context, conn.conn_id) {
+                conn.handler.on_error(
+                    &conn.context,
+                    Some(conn.conn_id),
                     NetworkError::HandlerError(format!("on_writable: {}", e)),
                 );
             }
@@ -464,44 +563,61 @@ impl<H: NetworkHandler> EventHandler for TcpConnectionHandler<H> {
 }
 
 impl<H: NetworkHandler> TcpConnectionHandler<H> {
-    fn handle_read(&self) {
-        let mut buffer: PooledObject<Vec<u8>> = self.buffer_pool.acquire();
-
-        let read_result = {
-            let mut stream = self.stream.lock();
-            stream.read(buffer.as_mut())
-        };
-
-        match read_result {
-            Ok(0) => {
-                // connection closed
-                self.disconnect();
+    fn handle_read(this: &Arc<Self>) {
+        if !this.drive.begin() {
+            return;
+        }
+        loop {
+            match this.read_pass() {
+                ReadPass::Drained => {
+                    if !this.drive.release() {
+                        return;
+                    }
+                }
+                ReadPass::Capped => {
+                    this.drive.yield_now();
+                    let Some(event_loop) = this.event_loop.upgrade() else {
+                        return;
+                    };
+                    let conn = Arc::clone(this);
+                    // A failed wake-up still leaves the closure queued for the next poll.
+                    let _ = event_loop.post(move || Self::handle_read(&conn));
+                    return;
+                }
+                ReadPass::Eof | ReadPass::Stopped => {
+                    this.disconnect();
+                    return;
+                }
+                ReadPass::Failed(e) => {
+                    this.handler.on_error(
+                        &this.context,
+                        Some(this.conn_id),
+                        NetworkError::Io(Box::new(e)),
+                    );
+                    this.disconnect();
+                    return;
+                }
             }
-            Ok(n) => {
-                if let Err(e) =
-                    self.handler
-                        .on_data(&self.context, self.conn_id, &buffer.as_ref()[..n])
-                {
+        }
+    }
+
+    fn read_pass(&self) -> ReadPass {
+        let mut buffer: PooledObject<Vec<u8>> = self.buffer_pool.acquire();
+        read_pass(
+            buffer.as_mut(),
+            |buf| Some(self.stream.lock().read(buf)),
+            |data| match self.handler.on_data(&self.context, self.conn_id, data) {
+                Ok(()) => true,
+                Err(e) => {
                     self.handler.on_error(
                         &self.context,
                         Some(self.conn_id),
                         NetworkError::HandlerError(format!("on_data: {}", e)),
                     );
-                    self.disconnect();
+                    false
                 }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // expected for non-blocking I/O
-            }
-            Err(e) => {
-                self.handler.on_error(
-                    &self.context,
-                    Some(self.conn_id),
-                    NetworkError::Io(Box::new(e)),
-                );
-                self.disconnect();
-            }
-        }
+            },
+        )
     }
 
     fn disconnect(&self) {
@@ -557,14 +673,15 @@ impl<H: NetworkHandler> TcpClient<H> {
         *self.context.event_loop.write().unwrap() = Some(event_loop.clone());
         *self.context.server.write().unwrap() = None;
 
-        let handler = TcpClientHandler {
+        let handler = ClientEvents(Arc::new(TcpClientHandler {
             conn_id: self.conn_id,
             stream: self.stream.clone(),
             handler: self.handler.clone(),
             buffer_pool: self.buffer_pool.clone(),
             event_loop: Arc::downgrade(event_loop),
             context: self.context.clone(),
-        };
+            drive: ReadDrive::default(),
+        }));
 
         let mut stream_guard = self.stream.lock();
         let stream = stream_guard
@@ -605,18 +722,23 @@ struct TcpClientHandler<H: NetworkHandler> {
     buffer_pool: ObjectPool<Vec<u8>>,
     event_loop: Weak<EventLoop>,
     context: Arc<ServerContext>,
+    drive: ReadDrive,
 }
 
-impl<H: NetworkHandler> EventHandler for TcpClientHandler<H> {
+/// Registered with the loop; shared so a capped read can re-post itself.
+struct ClientEvents<H: NetworkHandler>(Arc<TcpClientHandler<H>>);
+
+impl<H: NetworkHandler> EventHandler for ClientEvents<H> {
     fn handle_event(&self, event: &Event) {
+        let client = &self.0;
         if event.is_readable() {
-            self.handle_read();
+            TcpClientHandler::handle_read(client);
         }
         if event.is_writable() {
-            if let Err(e) = self.handler.on_writable(&self.context, self.conn_id) {
-                self.handler.on_error(
-                    &self.context,
-                    Some(self.conn_id),
+            if let Err(e) = client.handler.on_writable(&client.context, client.conn_id) {
+                client.handler.on_error(
+                    &client.context,
+                    Some(client.conn_id),
                     NetworkError::HandlerError(format!("on_writable: {}", e)),
                 );
             }
@@ -625,63 +747,81 @@ impl<H: NetworkHandler> EventHandler for TcpClientHandler<H> {
 }
 
 impl<H: NetworkHandler> TcpClientHandler<H> {
-    fn handle_read(&self) {
+    fn handle_read(this: &Arc<Self>) {
+        if !this.drive.begin() {
+            return;
+        }
+        loop {
+            match this.read_pass() {
+                ReadPass::Drained => {
+                    if !this.drive.release() {
+                        return;
+                    }
+                }
+                ReadPass::Capped => {
+                    this.drive.yield_now();
+                    let Some(event_loop) = this.event_loop.upgrade() else {
+                        return;
+                    };
+                    let client = Arc::clone(this);
+                    // A failed wake-up still leaves the closure queued for the next poll.
+                    let _ = event_loop.post(move || Self::handle_read(&client));
+                    return;
+                }
+                ReadPass::Eof => {
+                    let _ = this
+                        .handler
+                        .on_event(&this.context, NetworkEvent::ConnectionClosed(this.conn_id));
+                    this.disconnect();
+                    return;
+                }
+                ReadPass::Stopped => {
+                    this.disconnect();
+                    return;
+                }
+                ReadPass::Failed(e) => {
+                    this.handler.on_error(
+                        &this.context,
+                        Some(this.conn_id),
+                        NetworkError::Io(Box::new(e)),
+                    );
+                    this.disconnect();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn read_pass(&self) -> ReadPass {
         let mut buffer: PooledObject<Vec<u8>> = self.buffer_pool.acquire();
-
-        let read_result = {
-            let mut stream_guard = self.stream.lock();
-            if let Some(stream) = stream_guard.as_mut() {
-                stream.read(buffer.as_mut())
-            } else {
-                return;
-            }
-        };
-
-        match read_result {
-            Ok(0) => {
-                // connection closed by remote peer (server)
-                let _ = self
-                    .handler
-                    .on_event(&self.context, NetworkEvent::ConnectionClosed(self.conn_id));
-                self.disconnect();
-            }
-            Ok(n) => {
-                if let Err(e) =
-                    self.handler
-                        .on_data(&self.context, self.conn_id, &buffer.as_ref()[..n])
-                {
+        read_pass(
+            buffer.as_mut(),
+            |buf| self.stream.lock().as_mut().map(|stream| stream.read(buf)),
+            |data| match self.handler.on_data(&self.context, self.conn_id, data) {
+                Ok(()) => true,
+                Err(e) => {
                     self.handler.on_error(
                         &self.context,
                         Some(self.conn_id),
                         NetworkError::HandlerError(format!("on_data: {}", e)),
                     );
-                    self.disconnect();
+                    false
                 }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // expected for non-blocking I/O
-            }
-            Err(e) => {
-                self.handler.on_error(
-                    &self.context,
-                    Some(self.conn_id),
-                    NetworkError::Io(Box::new(e)),
-                );
-                self.disconnect();
-            }
-        }
+            },
+        )
     }
 
     fn disconnect(&self) {
         let mut stream_guard = self.stream.lock();
 
-        if let Some(stream) = stream_guard.as_mut() {
-            if let Some(event_loop) = self.event_loop.upgrade() {
-                let _ = event_loop.deregister(stream, Token(self.conn_id.as_u64() as usize));
-            }
+        let Some(mut stream) = stream_guard.take() else {
+            return;
+        };
+        if let Some(event_loop) = self.event_loop.upgrade() {
+            let _ = event_loop.deregister(&mut stream, Token(self.conn_id.as_u64() as usize));
         }
-
-        *stream_guard = None;
+        drop(stream);
+        drop(stream_guard);
 
         if let Err(e) = self.handler.on_disconnect(&self.context, self.conn_id) {
             self.handler.on_error(
