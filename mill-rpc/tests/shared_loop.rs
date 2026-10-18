@@ -1,3 +1,7 @@
+// The mill-net 3.x client sends before connect completes and reads once per event,
+// so this test runs on Linux only until mill-net 4.0.
+#![cfg(target_os = "linux")]
+
 use mill_io::EventLoop;
 use mill_rpc::prelude::*;
 use std::{
