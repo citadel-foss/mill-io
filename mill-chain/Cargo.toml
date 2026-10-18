@@ -15,3 +15,12 @@ categories = ["network-programming", "cryptography::cryptocurrencies"]
 
 [dependencies]
 bitcoin = { version = "0.32", features = ["serde"] }
+crossbeam-channel = "0.5"
+log = "0.4"
+mill-io.workspace = true
+mill-net.workspace = true
+serde_json = "1"
+
+[features]
+# Enables the test backend, `ChainConfig::RawLineJsonRpc`.
+testing = []
