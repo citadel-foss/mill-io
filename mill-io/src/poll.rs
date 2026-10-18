@@ -1,7 +1,13 @@
 // TODO: add custom error module and use it here
 use lock_freedom::map::Map;
 use mio::{Events, Interest, Poll, Token};
-use std::sync::{Arc, RwLock};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
+};
 
 use crate::{
     error::Result,
@@ -10,18 +16,26 @@ use crate::{
 
 type Registry = Arc<Map<Token, HandlerEntry>>;
 
+/// The token of the loop's internal waker. [`PollHandle::register`] rejects it.
+pub const WAKER_TOKEN: Token = Token(0);
+
+/// The first token [`PollHandle::alloc_token`] hands out. Allocated tokens use the
+/// upper half of the token space so they miss small hand-picked ones.
+pub const FIRST_ALLOCATED_TOKEN: Token = Token(usize::MAX / 2 + 1);
+
 pub struct PollHandle {
     poller: Arc<RwLock<mio::Poll>>,
     mio_registry: mio::Registry,
     registery: Registry,
     waker: Arc<mio::Waker>,
+    next_token: AtomicUsize,
 }
 
 impl PollHandle {
     pub fn new() -> Result<Self> {
         let poll = Poll::new()?;
         let mio_registry = poll.registry().try_clone()?;
-        let waker = mio::Waker::new(&mio_registry, Token(0))?;
+        let waker = mio::Waker::new(&mio_registry, WAKER_TOKEN)?;
         let poller = Arc::new(RwLock::new(poll));
         let registery: Registry = Arc::new(Map::new());
         Ok(PollHandle {
@@ -29,7 +43,23 @@ impl PollHandle {
             mio_registry,
             registery,
             waker: Arc::new(waker),
+            next_token: AtomicUsize::new(FIRST_ALLOCATED_TOKEN.0),
         })
+    }
+
+    /// Returns a token that is not [`WAKER_TOKEN`] and never returned before.
+    ///
+    /// # Panics
+    ///
+    /// If the upper half of the token space is used up.
+    pub fn alloc_token(&self) -> Token {
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        // Past `usize::MAX` the counter wraps to 0, so a value below the range means it is spent.
+        assert!(
+            token >= FIRST_ALLOCATED_TOKEN.0,
+            "mill-io: allocatable token space exhausted"
+        );
+        Token(token)
     }
 
     pub fn register<H, S>(
@@ -43,6 +73,13 @@ impl PollHandle {
         H: EventHandler + Send + Sync + 'static,
         S: mio::event::Source + ?Sized,
     {
+        if token == WAKER_TOKEN {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Token(0) is reserved for the event loop's waker",
+            )));
+        }
+
         let handler_entry = HandlerEntry::new(handler, interest);
 
         src.register(&self.mio_registry, token, interest)?;

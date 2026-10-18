@@ -1,6 +1,6 @@
 use crate::{
     error::Result,
-    poll::PollHandle,
+    poll::{PollHandle, WAKER_TOKEN},
     thread_pool::{ComputePoolMetrics, ComputeThreadPool, TaskPriority, ThreadPool},
     timer_wheel::TimerWheel,
 };
@@ -135,6 +135,9 @@ impl Reactor {
 
     pub fn dispatch_event(&self, event: Event) -> Result<()> {
         let token = event.token();
+        if token == WAKER_TOKEN {
+            return Ok(());
+        }
         let is_readable = event.is_readable();
         let is_writable = event.is_writable();
 

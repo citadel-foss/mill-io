@@ -163,7 +163,7 @@ pub mod prelude {
 /// let addr: SocketAddr = "127.0.0.1:0".parse()?;
 /// let mut listener = TcpListener::bind(addr)?;
 ///
-/// event_loop.register(&mut listener, Token(0), Interest::READABLE, MyHandler)?;
+/// event_loop.register(&mut listener, Token(1), Interest::READABLE, MyHandler)?;
 /// event_loop.run()?; // Blocks until stopped
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -270,15 +270,19 @@ impl EventLoop {
     /// ## Errors
     ///
     /// Returns an error if:
+    /// - The token is `Token(0)`, which is reserved for the loop's internal waker
     /// - The token is already in use
     /// - The source cannot be registered with the underlying poll mechanism
     /// - The handler registry is full
+    ///
+    /// Use [`alloc_token`](Self::alloc_token), or pick tokens below
+    /// [`poll::FIRST_ALLOCATED_TOKEN`] so they cannot meet allocated ones.
     ///
     /// ## Example
     ///
     /// ```rust,no_run
     /// use mill_io::{EventLoop, EventHandler};
-    /// use mio::{net::TcpListener, Interest, Token, event::Event};
+    /// use mio::{net::TcpListener, Interest, event::Event};
     /// use std::net::SocketAddr;
     ///
     /// struct ConnectionHandler;
@@ -294,7 +298,7 @@ impl EventLoop {
     ///
     ///     event_loop.register(
     ///         &mut listener,
-    ///         Token(0),
+    ///         event_loop.alloc_token(),
     ///         Interest::READABLE,
     ///         ConnectionHandler
     ///     )?;
@@ -317,6 +321,16 @@ impl EventLoop {
             .register(source, token, interests, handler)
     }
 
+    /// Returns a token that is not `Token(0)` and that this loop never returned
+    /// before, taken from [`poll::FIRST_ALLOCATED_TOKEN`] upward.
+    ///
+    /// ## Panics
+    ///
+    /// If the upper half of the token space is used up.
+    pub fn alloc_token(&self) -> Token {
+        self.reactor.poll_handle.alloc_token()
+    }
+
     /// Deregisters an I/O source from the event loop.
     ///
     /// Removes the source from the polling mechanism and clears its associated handler.
@@ -337,7 +351,7 @@ impl EventLoop {
     ///
     /// ```rust,no_run
     /// use mill_io::{EventLoop, EventHandler};
-    /// use mio::{net::TcpListener, Interest, Token, event::Event};
+    /// use mio::{net::TcpListener, Interest, event::Event};
     /// use std::net::SocketAddr;
     ///
     /// struct Handler;
@@ -349,7 +363,7 @@ impl EventLoop {
     ///     let event_loop = EventLoop::default();
     ///     let addr: SocketAddr = "127.0.0.1:0".parse()?;
     ///     let mut listener = TcpListener::bind(addr)?;
-    ///     let token = Token(0);
+    ///     let token = event_loop.alloc_token();
     ///
     ///     // Register
     ///     event_loop.register(&mut listener, token, Interest::READABLE, Handler)?;
