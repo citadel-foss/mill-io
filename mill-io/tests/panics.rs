@@ -155,3 +155,152 @@ fn handler_panic_keeps_loop_running_direct() {
     let event_loop = Arc::new(EventLoop::new_low_latency(1024, 10).unwrap());
     check_panic_keeps_loop_running(event_loop);
 }
+
+#[test]
+fn stop_never_panics() {
+    for event_loop in [
+        Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
+        Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
+    ] {
+        event_loop.stop();
+        event_loop.stop();
+        assert_eq!(
+            run_within(&event_loop, Duration::from_secs(1)),
+            Some(Ok(()))
+        );
+
+        let started = Arc::new(AtomicBool::new(false));
+        {
+            let started = Arc::clone(&started);
+            event_loop
+                .post(move || started.store(true, Ordering::SeqCst))
+                .unwrap();
+        }
+        let runner = spawn_loop(&event_loop);
+        assert!(
+            wait_until(Duration::from_secs(1), || started.load(Ordering::SeqCst)),
+            "the loop did not start"
+        );
+        event_loop.stop();
+        event_loop.stop();
+        {
+            let el = Arc::clone(&event_loop);
+            // The loop may already have stopped; a queued closure is fine.
+            let _ = event_loop.post(move || el.stop());
+        }
+        assert_eq!(runner.join().expect("run() panicked"), Ok(()));
+
+        event_loop.stop();
+        event_loop.stop();
+        assert_eq!(
+            run_within(&event_loop, Duration::from_secs(1)),
+            Some(Ok(()))
+        );
+    }
+}
+
+/// Runs `run()` on a helper thread and waits up to `timeout` for it to return.
+/// On timeout it stops the loop again so the helper can exit, and returns None.
+fn run_within(event_loop: &Arc<EventLoop>, timeout: Duration) -> Option<Result<(), String>> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let el = Arc::clone(event_loop);
+    let runner = thread::spawn(move || {
+        let _ = done_tx.send(el.run().map_err(|e| e.to_string()));
+    });
+    let result = done_rx.recv_timeout(timeout).ok();
+    if result.is_none() {
+        event_loop.stop();
+    }
+    runner.join().expect("run() panicked");
+    result
+}
+
+#[test]
+fn stop_before_run_returns_promptly() {
+    for event_loop in [
+        Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
+        Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
+    ] {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let el = Arc::clone(&event_loop);
+        let runner = thread::spawn(move || {
+            el.stop();
+            let _ = done_tx.send(el.run().map_err(|e| e.to_string()));
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            event_loop.stop();
+        }
+        runner.join().expect("run() panicked");
+        assert_eq!(
+            result.ok(),
+            Some(Ok(())),
+            "run() after stop() on the same thread did not return within 1 s"
+        );
+    }
+}
+
+#[test]
+fn stop_right_after_spawn_never_hangs() {
+    const ROUNDS: usize = 500;
+
+    for (mode, event_loop) in [
+        ("pool", Arc::new(EventLoop::new(2, 1024, 10).unwrap())),
+        (
+            "direct",
+            Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
+        ),
+    ] {
+        let mut hung = 0;
+        for _ in 0..ROUNDS {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let el = Arc::clone(&event_loop);
+            let runner = thread::spawn(move || {
+                let _ = done_tx.send(el.run().map_err(|e| e.to_string()));
+            });
+            event_loop.stop();
+            if done_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+                hung += 1;
+                event_loop.stop();
+            }
+            runner.join().expect("run() panicked");
+        }
+        assert_eq!(
+            hung, 0,
+            "{mode}: {hung} of {ROUNDS} runs ignored a stop() made right after spawning"
+        );
+    }
+}
+
+#[test]
+fn run_after_consumed_stop_runs_again() {
+    for event_loop in [
+        Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
+        Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
+    ] {
+        event_loop.stop();
+        assert_eq!(
+            run_within(&event_loop, Duration::from_secs(1)),
+            Some(Ok(()))
+        );
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let runner = spawn_loop(&event_loop);
+        {
+            let ticks = Arc::clone(&ticks);
+            event_loop.schedule_repeating(Duration::from_millis(1), move || {
+                ticks.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert!(
+            wait_until(Duration::from_secs(1), || ticks.load(Ordering::SeqCst) >= 5),
+            "the second run() did not keep running"
+        );
+        assert!(
+            !runner.is_finished(),
+            "the second run() returned without a new stop()"
+        );
+        event_loop.stop();
+        assert_eq!(runner.join().expect("run() panicked"), Ok(()));
+    }
+}
