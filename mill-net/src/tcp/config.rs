@@ -161,6 +161,8 @@ impl Default for TcpServerConfigBuilder {
 /// Configuration for [`TcpClient`](super::TcpClient).
 #[derive(Clone, Debug)]
 pub struct TcpClientConfig {
+    /// How long the TCP handshake may take before the connect fails with `TimedOut`
+    pub connect_timeout: std::time::Duration,
     /// Queued outbound bytes at or above which sends get `SendError::Backpressure`
     pub high_watermark: usize,
     /// Queued outbound bytes at or below which `on_drained` fires after a refused send
@@ -172,6 +174,7 @@ pub struct TcpClientConfig {
 impl Default for TcpClientConfig {
     fn default() -> Self {
         Self {
+            connect_timeout: std::time::Duration::from_secs(10),
             high_watermark: DEFAULT_HIGH_WATERMARK,
             low_watermark: DEFAULT_LOW_WATERMARK,
             nodelay: true,

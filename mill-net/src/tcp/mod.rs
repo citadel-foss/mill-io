@@ -242,7 +242,7 @@ impl<H: NetworkHandler> ListenerEvents<H> {
             high: self.config.high_watermark,
             low: self.config.low_watermark,
         };
-        let conn = Conn::new(conn_id, stream, Arc::downgrade(shared), marks, true);
+        let conn = Conn::new(conn_id, stream, Arc::downgrade(shared), marks, false);
         shared.conns.insert(conn_id, conn.clone());
 
         let _ = shared.handler.on_event(
@@ -276,7 +276,10 @@ pub struct TcpClient<H: NetworkHandler> {
 }
 
 impl<H: NetworkHandler> TcpClient<H> {
-    /// Starts connecting to `addr`.
+    /// Starts a non-blocking connect to `addr`.
+    ///
+    /// Fails only on errors detected at once. A refused or timed-out connect is reported
+    /// later through `on_error(Some(id), ..)`, without `on_connect` or `on_disconnect`.
     pub fn connect(addr: SocketAddr, config: TcpClientConfig, handler: H) -> Result<Self> {
         let stream = TcpStream::connect(addr)?;
         let shared = Shared::new(handler, ObjectPool::new(2, || vec![0; 8192]));
@@ -297,27 +300,32 @@ impl<H: NetworkHandler> TcpClient<H> {
     }
 
     /// Registers the connection with `event_loop` under a token from
-    /// [`EventLoop::alloc_token`].
+    /// [`EventLoop::alloc_token`] and starts the connect deadline.
+    ///
+    /// `on_connect` fires on the loop once the handshake completes.
     pub fn start(&mut self, event_loop: &Arc<EventLoop>) -> Result<()> {
         self.shared.bind(event_loop)?;
         if self.conn.is_closed() {
             return Err(Box::new(NetworkError::ConnectionNotFound(self.conn.id())));
         }
 
-        let token = event_loop.alloc_token();
-        Conn::register(
-            &self.conn,
-            event_loop,
-            token,
-            Interest::READABLE | Interest::WRITABLE,
-        )?;
         if let Err(e) = self.conn.set_nodelay(self.config.nodelay) {
             self.shared.report(
                 Some(self.conn.id()),
                 NetworkError::Configuration(format!("Failed to set TCP_NODELAY: {}", e)),
             );
         }
-        self.conn.connect_handler(&self.shared);
+        Conn::arm_connect_timer(&self.conn, event_loop, self.config.connect_timeout);
+        let token = event_loop.alloc_token();
+        if let Err(e) = Conn::register(
+            &self.conn,
+            event_loop,
+            token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            self.conn.shutdown(false);
+            return Err(e);
+        }
 
         Ok(())
     }
