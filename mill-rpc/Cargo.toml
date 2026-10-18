@@ -27,6 +27,10 @@ mio = { version = "1", features = ["os-poll", "net"] }
 env_logger = "0.11"
 criterion = { version = "0.5", features = ["html_reports"] }
 serde_cbor = "0.11"
+mill-net = { path = "../mill-net", features = ["testing"] }
+rand = "0.8"
+mill-rpc-core = { path = "mill-rpc-core" }
+socket2 = "0.6"
 
 [[example]]
 name = "calculator_server"
