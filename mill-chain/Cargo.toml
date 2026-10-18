@@ -14,6 +14,7 @@ keywords = ["bitcoin", "electrum", "json-rpc", "mill-io", "event-loop"]
 categories = ["network-programming", "cryptography::cryptocurrencies"]
 
 [dependencies]
+base64 = "0.22"
 bitcoin = { version = "0.32", features = ["serde"] }
 crossbeam-channel = "0.5"
 log = "0.4"
@@ -21,10 +22,18 @@ mill-io.workspace = true
 mill-net.workspace = true
 serde_json = "1"
 
+[dev-dependencies]
+mill-net = { workspace = true, features = ["testing"] }
+proptest = "1"
+
 [features]
 # Enables the test backend (`ChainConfig::RawLineJsonRpc`) and the `testing` module.
 testing = []
 
 [[test]]
 name = "engine"
+required-features = ["testing"]
+
+[[test]]
+name = "http"
 required-features = ["testing"]
