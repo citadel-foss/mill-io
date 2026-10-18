@@ -9,7 +9,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Barrier,
+        mpsc, Arc, Barrier,
     },
     thread,
     time::{Duration, Instant},
@@ -51,7 +51,7 @@ fn bench_compute_priority_ordering(c: &mut Criterion) {
 
     group.bench_function("priority_enforcement", |b| {
         b.iter(|| {
-            let event_loop = EventLoop::new(1, 1024, 100).unwrap(); // Single thread
+            let event_loop = EventLoop::new(1, 1024, 100).unwrap();
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));
             let barrier = Arc::new(Barrier::new(2));
 
@@ -72,21 +72,25 @@ fn bench_compute_priority_ordering(c: &mut Criterion) {
                 TaskPriority::Normal,
             ];
 
-            let completion = Arc::new(Barrier::new(5)); // 4 tasks + main
+            // A rendezvous between the tasks would need one compute worker per task.
+            let (done_tx, done_rx) = mpsc::channel();
 
             for (i, &priority) in priorities.iter().enumerate() {
                 let o = order.clone();
-                let c = completion.clone();
+                let done = done_tx.clone();
                 event_loop.spawn_compute_with_priority(
                     move || {
                         o.lock().unwrap().push((i, priority));
-                        c.wait();
+                        let _ = done.send(());
                     },
                     priority,
                 );
             }
 
-            completion.wait();
+            drop(done_tx);
+            for _ in 0..priorities.len() {
+                done_rx.recv().unwrap();
+            }
         });
     });
 
