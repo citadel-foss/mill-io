@@ -18,6 +18,8 @@ mod engine;
 mod error;
 #[cfg_attr(not(feature = "testing"), allow(dead_code))]
 mod proto;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod types;
 
 pub use client::{ChainClient, ChainConfig, ChainHandle, MillChain};

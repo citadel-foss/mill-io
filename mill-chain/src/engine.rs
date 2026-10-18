@@ -161,6 +161,9 @@ pub(crate) struct State {
     rng: u64,
     connected_before: bool,
     events: Option<Sender<ChainEvent>>,
+    events_capacity: usize,
+    /// A `Resync` is the last item on the events channel and has not been read yet.
+    resync_pending: bool,
     scratch: Vec<u8>,
 }
 
@@ -271,6 +274,8 @@ impl Engine {
                 rng: seed,
                 connected_before: false,
                 events: Some(events),
+                events_capacity: endpoint.events_capacity,
+                resync_pending: false,
                 scratch: Vec::new(),
             }),
             stats: Stats::default(),
@@ -739,6 +744,48 @@ impl Engine {
             }
         });
         st.link = Link::Backoff(timer);
+    }
+
+    /// Puts `event` on the events channel. When it is full, drops the event and leaves a
+    /// single `Resync` instead; nothing more is sent until the consumer has read it.
+    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
+    fn emit(&self, st: &mut State, event: ChainEvent) {
+        let Some(events) = &st.events else {
+            return;
+        };
+        if st.resync_pending {
+            // Nothing is sent behind the `Resync`, so an empty channel means it was read.
+            if !events.is_empty() {
+                return;
+            }
+            st.resync_pending = false;
+        }
+        let event = if events.len() < st.events_capacity {
+            event
+        } else {
+            st.resync_pending = true;
+            ChainEvent::Resync {
+                reason: "event channel overflowed".to_string(),
+            }
+        };
+        let is_resync = matches!(event, ChainEvent::Resync { .. });
+        if events.try_send(event).is_ok() && is_resync {
+            self.stats.resyncs.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Emits `n` placeholder events from the loop thread.
+    #[cfg(feature = "testing")]
+    pub(crate) fn inject_events(&self, n: usize) {
+        use bitcoin::hashes::Hash;
+        let mut st = self.lock();
+        for height in 0..n as u64 {
+            let event = ChainEvent::BlockDisconnected {
+                height,
+                hash: bitcoin::BlockHash::all_zeros(),
+            };
+            self.emit(&mut st, event);
+        }
     }
 }
 
