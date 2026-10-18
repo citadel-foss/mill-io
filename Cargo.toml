@@ -5,6 +5,7 @@ members = [
     "mill-rpc",
     "mill-rpc/mill-rpc-core",
     "mill-rpc/mill-rpc-macros",
+    "mill-chain",
 ]
 resolver = "2"
 

@@ -1,0 +1,17 @@
+[package]
+name = "mill-chain"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bitcoin chain backends (Bitcoin Core, Electrum) on the mill-io event loop, with a blocking facade."
+documentation = "https://docs.rs/mill-chain"
+homepage = "https://github.com/citadel-tech/mill-io"
+repository = "https://github.com/citadel-tech/mill-io"
+readme = "README.md"
+keywords = ["bitcoin", "electrum", "json-rpc", "mill-io", "event-loop"]
+categories = ["network-programming", "cryptography::cryptocurrencies"]
+
+[dependencies]
+bitcoin = { version = "0.32", features = ["serde"] }
