@@ -7,7 +7,6 @@ use mill_io::EventLoop;
 use mill_net::tcp::traits::{ConnectionId, NetworkHandler};
 use mill_net::tcp::{ServerContext, TcpClient};
 use mill_rpc_core::protocol::{self, Frame, MessageType};
-use mio::Token;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,7 +54,7 @@ impl RpcClient {
             .map_err(|e| RpcError::unavailable(format!("Connect failed: {}", e)))?;
 
         tcp_client
-            .start(event_loop, Token(usize::MAX - 1))
+            .start(event_loop, event_loop.alloc_token())
             .map_err(|e| RpcError::unavailable(format!("Client start failed: {}", e)))?;
 
         Ok(Arc::new(Self {
