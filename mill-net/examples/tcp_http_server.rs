@@ -2,7 +2,6 @@ use mill_io::error::Result;
 use mill_io::EventLoop;
 use mill_net::errors::{NetworkError, NetworkEvent};
 use mill_net::tcp::{config::TcpServerConfig, traits::*, ConnectionId, ServerContext, TcpServer};
-use mio::Token;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -168,7 +167,7 @@ fn main() -> Result<()> {
     let handler = HttpHandler;
     let server = Arc::new(TcpServer::new(config.clone(), handler)?);
 
-    server.start(&event_loop, Token(0))?;
+    server.start(&event_loop, event_loop.alloc_token())?;
 
     let addr = format!("http://{}", config.address);
     println!("HTTP Server starting on {}", addr);

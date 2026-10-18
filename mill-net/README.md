@@ -55,7 +55,7 @@ fn main() -> Result<()> {
         .build();
 
     let server = Arc::new(TcpServer::new(config, EchoHandler)?);
-    server.start(&event_loop, mio::Token(0))?;
+    server.start(&event_loop, event_loop.alloc_token())?;
     
     event_loop.run()?;
     Ok(())
