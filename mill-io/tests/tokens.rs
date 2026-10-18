@@ -2,10 +2,11 @@ use mill_io::{EventHandler, EventLoop};
 use mio::{event::Event, net::TcpListener, Interest, Token};
 use std::{
     collections::HashSet,
+    io::{ErrorKind, Read},
     net::TcpStream as StdTcpStream,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -140,12 +141,25 @@ fn tcp_pair() -> (mio::net::TcpStream, StdTcpStream) {
 struct CountKinds {
     readable: Arc<AtomicUsize>,
     writable: Arc<AtomicUsize>,
+    stream: Arc<Mutex<mio::net::TcpStream>>,
 }
 
 impl EventHandler for CountKinds {
     fn handle_event(&self, event: &Event) {
         if event.is_readable() {
             self.readable.fetch_add(1, Ordering::SeqCst);
+            // Windows (IOCP) re-arms readable readiness only after a read through
+            // the registered stream returns WouldBlock.
+            let mut stream = self.stream.lock().unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("read failed: {e}"),
+                }
+            }
         }
         if event.is_writable() {
             self.writable.fetch_add(1, Ordering::SeqCst);
@@ -159,18 +173,20 @@ fn reregister_adds_writable_interest() {
         Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
         Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
     ] {
-        let (mut stream, mut peer) = tcp_pair();
+        let (stream, mut peer) = tcp_pair();
+        let stream = Arc::new(Mutex::new(stream));
         let readable = Arc::new(AtomicUsize::new(0));
         let writable = Arc::new(AtomicUsize::new(0));
         let token = event_loop.alloc_token();
         event_loop
             .register(
-                &mut stream,
+                &mut *stream.lock().unwrap(),
                 token,
                 Interest::READABLE,
                 CountKinds {
                     readable: Arc::clone(&readable),
                     writable: Arc::clone(&writable),
+                    stream: Arc::clone(&stream),
                 },
             )
             .unwrap();
@@ -187,7 +203,11 @@ fn reregister_adds_writable_interest() {
 
         // The socket is writable, so asking for WRITABLE yields an event.
         event_loop
-            .reregister(&mut stream, token, Interest::READABLE | Interest::WRITABLE)
+            .reregister(
+                &mut *stream.lock().unwrap(),
+                token,
+                Interest::READABLE | Interest::WRITABLE,
+            )
             .unwrap();
         assert!(
             wait_until(Duration::from_secs(1), || writable.load(Ordering::SeqCst)
@@ -343,32 +363,40 @@ fn reregister_to_writable_never_loses_the_edge() {
             thread::spawn(move || event_loop.run().map_err(|e| e.to_string()))
         };
         for round in 0..ROUNDS {
-            let (mut stream, _peer) = tcp_pair();
+            let (stream, _peer) = tcp_pair();
+            let stream = Arc::new(Mutex::new(stream));
             let readable = Arc::new(AtomicUsize::new(0));
             let writable = Arc::new(AtomicUsize::new(0));
             let token = event_loop.alloc_token();
             event_loop
                 .register(
-                    &mut stream,
+                    &mut *stream.lock().unwrap(),
                     token,
                     Interest::READABLE,
                     CountKinds {
                         readable: Arc::clone(&readable),
                         writable: Arc::clone(&writable),
+                        stream: Arc::clone(&stream),
                     },
                 )
                 .unwrap();
             // The socket is already writable, so this raises the only writable
             // edge it will ever get.
             event_loop
-                .reregister(&mut stream, token, Interest::READABLE | Interest::WRITABLE)
+                .reregister(
+                    &mut *stream.lock().unwrap(),
+                    token,
+                    Interest::READABLE | Interest::WRITABLE,
+                )
                 .unwrap();
             assert!(
                 wait_until(Duration::from_secs(1), || writable.load(Ordering::SeqCst)
                     > 0),
                 "{mode}: round {round}: the writable edge raised by reregister was lost"
             );
-            event_loop.deregister(&mut stream, token).unwrap();
+            event_loop
+                .deregister(&mut *stream.lock().unwrap(), token)
+                .unwrap();
         }
         event_loop.stop();
         assert_eq!(runner.join().unwrap(), Ok(()));
