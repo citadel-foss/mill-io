@@ -202,13 +202,29 @@ fn backpressure_drained_backpressure_cycle() {
         for round in 0..2 {
             // Accepted although it is far above the high watermark: the queue was below it.
             sender.send(&vec![round as u8; BIG]).unwrap();
+            let mut sent = BIG;
+            // The kernel may take the whole frame (Windows accepts any send while its buffer
+            // is below SO_SNDBUF), so keep sending until the queue itself refuses.
+            let chunk = vec![round as u8; 64 * 1024];
+            loop {
+                match sender.send(&chunk) {
+                    Ok(()) => sent += chunk.len(),
+                    Err(SendError::Backpressure) => break,
+                    Err(e) => panic!("{mode}: round {round}: {e}"),
+                }
+                assert!(
+                    sent < 1024 * 1024 * 1024,
+                    "{mode}: round {round}: 1 GiB accepted without a Backpressure"
+                );
+            }
             assert!(
                 matches!(sender.send(b"x"), Err(SendError::Backpressure)),
                 "{mode}: round {round}: a send above the high watermark was queued"
             );
             assert_eq!(drains.get(), round, "{mode}: drained before the peer read");
 
-            while read_total < BIG * (round + 1) {
+            let target = read_total + sent;
+            while read_total < target {
                 read_total += peer.read(&mut buf).unwrap();
             }
             assert!(
