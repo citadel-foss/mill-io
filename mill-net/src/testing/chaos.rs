@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 const BUF_SIZE: usize = 64 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const WRITE_POLL: Duration = Duration::from_millis(50);
+const SOCKET_POLL: Duration = Duration::from_millis(50);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 
 /// What a [`ChaosProxy`] does to the bytes it forwards; every knob is off by default.
@@ -208,7 +208,8 @@ fn run_connection(shared: &Shared, conn: Arc<Conn>) {
 
 fn configure(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(WRITE_POLL));
+    let _ = stream.set_read_timeout(Some(SOCKET_POLL));
+    let _ = stream.set_write_timeout(Some(SOCKET_POLL));
 }
 
 /// The sockets close when the last `Arc<Conn>` is dropped, which is after both pumps return.
@@ -236,8 +237,9 @@ impl Conn {
         *self.closing.lock()
     }
 
-    // Pumps never hold `closing` across I/O. Shutting the sockets down wakes pumps blocked in
-    // `read`; pumps blocked in `write` see `closing` when their write timeout fires.
+    // Pumps never hold `closing` across I/O, and see it when their read or write timeout
+    // fires. Shutting the sockets down also wakes a blocked `read` on Unix, but not on
+    // Windows.
     fn close(&self) {
         *self.closing.lock() = true;
         self.closing_cv.notify_all();
@@ -351,6 +353,17 @@ fn pump(conn: &Conn, dir: Direction, cfg: &ChaosConfig) {
             }
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if conn.is_closing() {
+                    return;
+                }
+                continue;
+            }
             Err(_) => {
                 conn.fail();
                 return;

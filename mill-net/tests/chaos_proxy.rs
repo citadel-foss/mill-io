@@ -99,7 +99,7 @@ fn read_until_closed(stream: &mut TcpStream) {
         match stream.read(&mut buf) {
             Ok(0) => return,
             Ok(_) => continue,
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return,
+            Err(e) if is_reset(&e) => return,
             Err(e) => panic!("expected the connection to close, got {e}"),
         }
     }
@@ -379,6 +379,14 @@ fn stall_keeps_socket_open() {
     );
 }
 
+/// A peer's RST: Windows reports it as `ConnectionAborted` as well as `ConnectionReset`.
+fn is_reset(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+    )
+}
+
 fn read_until_reset(stream: &mut TcpStream) -> Vec<u8> {
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
@@ -386,7 +394,7 @@ fn read_until_reset(stream: &mut TcpStream) -> Vec<u8> {
         match stream.read(&mut buf) {
             Ok(0) => panic!("EOF after {} bytes, expected a reset", data.len()),
             Ok(n) => data.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return data,
+            Err(e) if is_reset(&e) => return data,
             Err(e) => panic!("expected a reset after {} bytes, got {e}", data.len()),
         }
     }
@@ -406,10 +414,10 @@ fn reset_after_n_bytes() {
     let proxy = ChaosProxy::start(upstream, cfg.clone()).unwrap();
     let mut client = connect(&proxy);
     if let Err(e) = client.write_all(&sent) {
-        assert_eq!(e.kind(), io::ErrorKind::ConnectionReset, "{e}");
+        assert!(is_reset(&e), "{e}");
     } else {
         let err = client.read(&mut [0u8; 1]).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+        assert!(is_reset(&err), "{err}");
     }
     let received = server.join().unwrap().pop().unwrap();
     assert!(
@@ -424,7 +432,7 @@ fn reset_after_n_bytes() {
         serve(1, move |mut stream| {
             let _ = stream.write_all(&sent);
             let err = stream.read(&mut [0u8; 1]).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+            assert!(is_reset(&err), "{err}");
         })
     };
     let proxy = ChaosProxy::start(upstream, cfg).unwrap();
