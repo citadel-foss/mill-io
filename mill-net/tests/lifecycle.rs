@@ -282,15 +282,24 @@ fn ten_thousand_cycles_leave_nothing_behind() {
                 handler.received.lock().len(),
                 BATCH * 4
             );
+            // The server closes first, so TIME_WAIT lands on its side. Client-side
+            // TIME_WAITs from 20k cycles would use up macOS's 16k ephemeral ports.
+            for client in &clients {
+                client.send(b"close").unwrap();
+            }
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    server.connection_count() == 0
+                        && handler.disconnects.load(Ordering::SeqCst) == BATCH
+                }),
+                "{mode}: batch {batch}: {} connections left, {} of {BATCH} clients closed",
+                server.connection_count(),
+                handler.disconnects.load(Ordering::SeqCst)
+            );
             for client in &clients[..BATCH / 2] {
                 client.disconnect().unwrap();
             }
             drop(clients);
-            assert!(
-                wait_until(Duration::from_secs(10), || server.connection_count() == 0),
-                "{mode}: batch {batch}: {} connections left",
-                server.connection_count()
-            );
             assert_eq!(handler.disconnects.load(Ordering::SeqCst), BATCH, "{mode}");
         }
 
