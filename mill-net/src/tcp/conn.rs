@@ -634,6 +634,11 @@ impl<H: NetworkHandler> Conn<H> {
             .unwrap_or(Ok(()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn nodelay(&self) -> Option<bool> {
+        self.with_stream(|stream| stream.nodelay().ok()).flatten()
+    }
+
     fn with_stream<T>(&self, f: impl FnOnce(&TcpStream) -> T) -> Option<T> {
         self.stream.read().as_ref().map(f)
     }

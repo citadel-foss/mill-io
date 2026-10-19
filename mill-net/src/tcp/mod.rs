@@ -555,4 +555,64 @@ mod tests {
 
         event_loop.stop();
     }
+
+    #[test]
+    fn nodelay_is_set_on_clients_and_accepted_connections() {
+        for event_loop in [
+            Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
+            Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
+        ] {
+            let connected = Arc::new((Mutex::new(0), Condvar::new()));
+            let on_connect = |connected: &Arc<(Mutex<i32>, Condvar)>| {
+                let connected = Arc::clone(connected);
+                move || {
+                    let (count, cvar) = &*connected;
+                    *count.lock().unwrap() += 1;
+                    cvar.notify_all();
+                }
+            };
+            let config = TcpServerConfig::builder()
+                .address("127.0.0.1:0".parse().unwrap())
+                .build();
+            let server = Arc::new(
+                TcpServer::new(
+                    config,
+                    TestHandler::new().with_on_connect(on_connect(&connected)),
+                )
+                .unwrap(),
+            );
+            Arc::clone(&server)
+                .start(&event_loop, event_loop.alloc_token())
+                .unwrap();
+            let mut client = TcpClient::connect(
+                server.local_addr().unwrap(),
+                TcpClientConfig::default(),
+                TestHandler::new().with_on_connect(on_connect(&connected)),
+            )
+            .unwrap();
+            client.start(&event_loop).unwrap();
+            let el = Arc::clone(&event_loop);
+            let runner = thread::spawn(move || el.run().unwrap());
+
+            let (count, cvar) = &*connected;
+            let guard = cvar
+                .wait_timeout_while(count.lock().unwrap(), Duration::from_secs(5), |n| *n < 2)
+                .unwrap()
+                .0;
+            assert_eq!(*guard, 2, "client and server did not both connect");
+            drop(guard);
+
+            assert_eq!(client.conn.nodelay(), Some(true), "client");
+            let accepted: Vec<_> = server
+                .shared
+                .conns
+                .iter()
+                .map(|e| e.val().nodelay())
+                .collect();
+            assert_eq!(accepted, vec![Some(true)], "accepted connection");
+
+            event_loop.stop();
+            runner.join().unwrap();
+        }
+    }
 }
