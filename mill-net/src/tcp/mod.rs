@@ -371,15 +371,8 @@ impl<H: NetworkHandler> TcpClient<H> {
 
         self.conn.set_connect_opts(ConnectOpts {
             nodelay: self.config.nodelay,
+            keep_alive: self.config.keep_alive,
         });
-        if let Some(idle) = self.config.keep_alive {
-            if let Err(e) = self.conn.set_keepalive(idle) {
-                self.shared.report(
-                    Some(self.conn.id()),
-                    NetworkError::Configuration(format!("Failed to set SO_KEEPALIVE: {}", e)),
-                );
-            }
-        }
         Conn::arm_connect_timer(&self.conn, event_loop, self.config.connect_timeout);
         let token = event_loop.alloc_token();
         if let Err(e) = Conn::register(

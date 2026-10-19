@@ -607,6 +607,14 @@ impl<H: NetworkHandler> Conn<H> {
                 NetworkError::Configuration(format!("Failed to set TCP_NODELAY: {}", e)),
             );
         }
+        if let Some(idle) = opts.keep_alive {
+            if let Err(e) = self.set_keepalive(idle) {
+                shared.report(
+                    Some(self.id),
+                    NetworkError::Configuration(format!("Failed to set SO_KEEPALIVE: {}", e)),
+                );
+            }
+        }
     }
 
     fn fail(&self, error: io::Error) {
@@ -825,6 +833,7 @@ impl<H: NetworkHandler> Conn<H> {
 /// Client socket options that wait for the connect to complete.
 pub(crate) struct ConnectOpts {
     pub(crate) nodelay: bool,
+    pub(crate) keep_alive: Option<Duration>,
 }
 
 /// The error behind a connect that ended in EOF without `SO_ERROR` set.
