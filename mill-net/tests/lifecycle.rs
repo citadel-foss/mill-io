@@ -467,3 +467,35 @@ fn stalled_connection_closed_by_a_caller_timer() {
         drop((client, proxy, server));
     }
 }
+
+#[test]
+fn server_keeps_running_after_its_handle_drops() {
+    let _serial = serial();
+    for (mode, event_loop) in pool_and_direct() {
+        let echo = Echo::default();
+        let config = TcpServerConfig::builder()
+            .address("127.0.0.1:0".parse().unwrap())
+            .build();
+        let server = Arc::new(TcpServer::new(config, echo).unwrap());
+        let addr = server.local_addr().unwrap();
+        // As the crate docs and examples do: `start` takes the only handle.
+        server.start(&event_loop, event_loop.alloc_token()).unwrap();
+        let runner = spawn_loop(&event_loop);
+
+        let handler = Client::default();
+        let mut client =
+            TcpClient::connect(addr, TcpClientConfig::default(), handler.clone()).unwrap();
+        client.start(&event_loop).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || handler
+                .connects
+                .load(Ordering::SeqCst)
+                == 1),
+            "{mode}: the server stopped when its handle was dropped"
+        );
+        assert!(round_trip(&client, &handler, b"still serving"), "{mode}");
+
+        stop_loop(&event_loop, runner);
+        drop(client);
+    }
+}

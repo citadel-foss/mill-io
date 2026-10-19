@@ -114,7 +114,8 @@ impl ServerContext {
 
 /// High-level TCP server
 ///
-/// Dropping it has the same effect as [`stop`](Self::stop).
+/// A started server runs until [`stop`](Self::stop), or until its event loop is gone;
+/// dropping the handle passed to [`start`](Self::start) does not stop it.
 pub struct TcpServer<H: NetworkHandler> {
     shared: Arc<Shared<H>>,
     listener: Arc<Mutex<Option<TcpListener>>>,
@@ -204,12 +205,6 @@ impl<H: NetworkHandler> TcpServer<H> {
     /// Get active connection count
     pub fn connection_count(&self) -> usize {
         self.shared.count.load(Ordering::SeqCst)
-    }
-}
-
-impl<H: NetworkHandler> Drop for TcpServer<H> {
-    fn drop(&mut self) {
-        let _ = self.stop();
     }
 }
 
