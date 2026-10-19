@@ -134,6 +134,38 @@ fn send_retrying(sender: &ConnSender, frame: &[u8], drains: &Drains) {
     }
 }
 
+/// The kernel's view of the test's connection (`ss -tnim`), for a failure message.
+#[cfg(target_os = "linux")]
+fn socket_report(port: u16) -> String {
+    let Ok(out) = std::process::Command::new("ss")
+        .args(["-tnimH", "state", "established"])
+        .output()
+    else {
+        return "ss unavailable".to_string();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut report = String::new();
+    let mut keep = false;
+    for line in text.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            let port = format!(":{port}");
+            keep = line
+                .split_whitespace()
+                .any(|column| column.ends_with(&port));
+        }
+        if keep {
+            report.push_str(line.trim());
+            report.push('\n');
+        }
+    }
+    report
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_report(_port: u16) -> String {
+    String::new()
+}
+
 #[test]
 fn conn_sender_from_threads_and_timers() {
     const THREADS: u32 = 8;
@@ -205,10 +237,11 @@ fn conn_sender_from_threads_and_timers() {
         let stalled_at = (!all_arrived).then(|| {
             // Tells a slow machine from a stall in the failure message.
             let at_deadline = frames.load(Ordering::SeqCst);
+            let sockets = socket_report(server.local_addr().unwrap().port());
             wait_until(Duration::from_secs(30), || {
                 frames.load(Ordering::SeqCst) >= TOTAL
             });
-            (at_deadline, frames.load(Ordering::SeqCst))
+            (at_deadline, frames.load(Ordering::SeqCst), sockets)
         });
         event_loop.cancel_timer(timer);
         let state = state.lock();
@@ -218,9 +251,9 @@ fn conn_sender_from_threads_and_timers() {
             state.errors.len(),
             state.errors[0]
         );
-        if let Some((at_deadline, later)) = stalled_at {
+        if let Some((at_deadline, later, sockets)) = stalled_at {
             panic!(
-                "{mode}: {at_deadline} of {TOTAL} frames arrived within 30 s, {later} after 30 s more ({})",
+                "{mode}: {at_deadline} of {TOTAL} frames arrived within 30 s, {later} after 30 s more ({}); sockets at the deadline:\n{sockets}",
                 if later == at_deadline { "stalled" } else { "still moving" }
             );
         }
