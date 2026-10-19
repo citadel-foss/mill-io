@@ -95,11 +95,40 @@ impl NetworkHandler for FrameChecker {
     }
 }
 
-fn send_retrying(sender: &ConnSender, frame: &[u8]) {
+/// A sending side's handler: counts `on_drained` so refused senders can wait for it.
+#[derive(Clone, Default)]
+struct Drains {
+    count: Arc<(Mutex<u64>, parking_lot::Condvar)>,
+}
+
+impl NetworkHandler for Drains {
+    fn on_data(&self, _ctx: &ServerContext, _conn: ConnectionId, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_drained(&self, _ctx: &ServerContext, _conn: ConnectionId) -> Result<()> {
+        let (count, changed) = &*self.count;
+        *count.lock() += 1;
+        changed.notify_all();
+        Ok(())
+    }
+}
+
+/// Retries a refused frame once the queue drains. Spinning instead starves the threads
+/// that drain it of CPU on a busy machine.
+fn send_retrying(sender: &ConnSender, frame: &[u8], drains: &Drains) {
+    let (count, changed) = &*drains.count;
     loop {
+        let seen = *count.lock();
         match sender.send(frame) {
             Ok(()) => return,
-            Err(SendError::Backpressure) => thread::yield_now(),
+            Err(SendError::Backpressure) => {
+                let mut count = count.lock();
+                if *count == seen {
+                    // Bounded, in case the drain landed between the send and this lock.
+                    changed.wait_for(&mut count, Duration::from_millis(10));
+                }
+            }
             Err(e) => panic!("send failed: {e}"),
         }
     }
@@ -125,10 +154,11 @@ fn conn_sender_from_threads_and_timers() {
             .start(&event_loop, event_loop.alloc_token())
             .unwrap();
 
+        let drains = Drains::default();
         let mut client = TcpClient::connect(
             server.local_addr().unwrap(),
             TcpClientConfig::default(),
-            FrameChecker::default(),
+            drains.clone(),
         )
         .unwrap();
         client.start(&event_loop).unwrap();
@@ -147,18 +177,20 @@ fn conn_sender_from_threads_and_timers() {
         };
 
         let compute_sender = client.sender();
+        let compute_drains = drains.clone();
         event_loop.spawn_compute(move || {
             for seq in 0..COMPUTE_FRAMES {
-                send_retrying(&compute_sender, &frame(THREADS + 1, seq));
+                send_retrying(&compute_sender, &frame(THREADS + 1, seq), &compute_drains);
             }
         });
 
         let producers: Vec<_> = (0..THREADS)
             .map(|producer| {
                 let sender = client.sender();
+                let drains = drains.clone();
                 thread::spawn(move || {
                     for seq in 0..PER_THREAD {
-                        send_retrying(&sender, &frame(producer, seq));
+                        send_retrying(&sender, &frame(producer, seq), &drains);
                     }
                 })
             })
@@ -170,6 +202,14 @@ fn conn_sender_from_threads_and_timers() {
         let all_arrived = wait_until(Duration::from_secs(30), || {
             frames.load(Ordering::SeqCst) >= TOTAL
         });
+        let stalled_at = (!all_arrived).then(|| {
+            // Tells a slow machine from a stall in the failure message.
+            let at_deadline = frames.load(Ordering::SeqCst);
+            wait_until(Duration::from_secs(30), || {
+                frames.load(Ordering::SeqCst) >= TOTAL
+            });
+            (at_deadline, frames.load(Ordering::SeqCst))
+        });
         event_loop.cancel_timer(timer);
         let state = state.lock();
         assert!(
@@ -178,11 +218,12 @@ fn conn_sender_from_threads_and_timers() {
             state.errors.len(),
             state.errors[0]
         );
-        assert!(
-            all_arrived,
-            "{mode}: {} of {TOTAL} frames arrived",
-            frames.load(Ordering::SeqCst)
-        );
+        if let Some((at_deadline, later)) = stalled_at {
+            panic!(
+                "{mode}: {at_deadline} of {TOTAL} frames arrived within 30 s, {later} after 30 s more ({})",
+                if later == at_deadline { "stalled" } else { "still moving" }
+            );
+        }
         assert_eq!(timer_seq.load(Ordering::SeqCst), TIMER_FRAMES);
         drop(state);
 
