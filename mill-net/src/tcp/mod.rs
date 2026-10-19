@@ -62,7 +62,7 @@ pub use traits::*;
 
 use crate::errors::Result;
 use crate::errors::{NetworkError, NetworkEvent};
-use conn::{next_conn_id, Conn, ContextOps, Shared, Watermarks};
+use conn::{next_conn_id, Conn, ConnectOpts, ContextOps, Shared, Watermarks};
 use mill_io::{EventHandler, EventLoop, ObjectPool};
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
@@ -309,12 +309,9 @@ impl<H: NetworkHandler> TcpClient<H> {
             return Err(Box::new(NetworkError::ConnectionNotFound(self.conn.id())));
         }
 
-        if let Err(e) = self.conn.set_nodelay(self.config.nodelay) {
-            self.shared.report(
-                Some(self.conn.id()),
-                NetworkError::Configuration(format!("Failed to set TCP_NODELAY: {}", e)),
-            );
-        }
+        self.conn.set_connect_opts(ConnectOpts {
+            nodelay: self.config.nodelay,
+        });
         Conn::arm_connect_timer(&self.conn, event_loop, self.config.connect_timeout);
         let token = event_loop.alloc_token();
         if let Err(e) = Conn::register(

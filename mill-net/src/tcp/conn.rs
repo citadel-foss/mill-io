@@ -374,6 +374,7 @@ pub(crate) struct Conn<H: NetworkHandler> {
     /// An outbound connect that has not completed yet.
     connecting: AtomicBool,
     connect_timer: Mutex<Option<TimerId>>,
+    connect_opts: Mutex<Option<ConnectOpts>>,
     shared: Weak<Shared<H>>,
     me: Weak<Self>,
 }
@@ -405,6 +406,7 @@ impl<H: NetworkHandler> Conn<H> {
             connected: AtomicBool::new(false),
             connecting: AtomicBool::new(connecting),
             connect_timer: Mutex::new(None),
+            connect_opts: Mutex::new(None),
             shared,
             me: me.clone(),
         })
@@ -531,19 +533,27 @@ impl<H: NetworkHandler> Conn<H> {
         {
             return;
         }
+        // Closed before reporting, so a handler that sees the error gets `Closed` from
+        // its next send.
+        self.shutdown(false);
         if let Some(shared) = self.shared.upgrade() {
             shared.report(Some(self.id), NetworkError::Connect(Box::new(error)));
         }
-        self.shutdown(false);
     }
 
     /// Checks a pending connect on a readiness event. Under edge triggering the first
     /// writable (or error) event is the only signal that the handshake finished.
-    fn poll_connect(this: &Arc<Self>) {
+    fn poll_connect(this: &Arc<Self>, event: &Event) {
+        // kqueue reports a failed connect as EV_EOF, and `peer_addr` then says
+        // NotConnected just as it does mid-handshake, so the event decides.
+        let closed = event.is_error() || event.is_read_closed() || event.is_write_closed();
         let outcome = this.with_stream(|stream| match stream.take_error() {
             Ok(Some(e)) | Err(e) => Err(e),
             Ok(None) => match stream.peer_addr() {
                 Ok(_) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotConnected && closed => {
+                    Err(connect_error(stream))
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(false),
                 Err(e) => Err(e),
             },
@@ -569,12 +579,31 @@ impl<H: NetworkHandler> Conn<H> {
         if let Some(event_loop) = shared.event_loop() {
             this.cancel_connect_timer(&event_loop);
         }
+        this.apply_connect_opts(&shared);
         this.write.lock().can_write = true;
         if !this.connect_handler(&shared) {
             return;
         }
         Self::flush(this, true);
         Self::handle_read(this);
+    }
+
+    /// Socket options for a client, applied once its connect has completed: macOS fails
+    /// them with EINVAL on a socket whose connect was already refused.
+    pub(crate) fn set_connect_opts(&self, opts: ConnectOpts) {
+        *self.connect_opts.lock() = Some(opts);
+    }
+
+    fn apply_connect_opts(&self, shared: &Shared<H>) {
+        let Some(opts) = self.connect_opts.lock().take() else {
+            return;
+        };
+        if let Err(e) = self.set_nodelay(opts.nodelay) {
+            shared.report(
+                Some(self.id),
+                NetworkError::Configuration(format!("Failed to set TCP_NODELAY: {}", e)),
+            );
+        }
     }
 
     fn fail(&self, error: io::Error) {
@@ -785,6 +814,19 @@ impl<H: NetworkHandler> Conn<H> {
     }
 }
 
+/// Client socket options that wait for the connect to complete.
+pub(crate) struct ConnectOpts {
+    pub(crate) nodelay: bool,
+}
+
+/// The error behind a connect that ended in EOF without `SO_ERROR` set.
+fn connect_error(mut stream: &TcpStream) -> io::Error {
+    match stream.read(&mut [0u8; 1]) {
+        Err(e) if e.kind() != io::ErrorKind::WouldBlock => e,
+        _ => io::ErrorKind::ConnectionRefused.into(),
+    }
+}
+
 /// Writes as much of `frame` as the socket takes now; returns how much that was.
 fn write_now(mut stream: &TcpStream, frame: &[u8]) -> io::Result<usize> {
     let mut written = 0;
@@ -842,7 +884,7 @@ struct ConnEvents<H: NetworkHandler>(Arc<Conn<H>>);
 impl<H: NetworkHandler> EventHandler for ConnEvents<H> {
     fn handle_event(&self, event: &Event) {
         if self.0.connecting.load(Ordering::SeqCst) {
-            Conn::poll_connect(&self.0);
+            Conn::poll_connect(&self.0, event);
             return;
         }
         if event.is_readable() {

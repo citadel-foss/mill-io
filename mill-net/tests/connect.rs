@@ -65,11 +65,12 @@ mod backlog {
         fn listen(socket: c_int, backlog: c_int) -> c_int;
     }
 
-    /// Calling `listen` again on a listening socket changes its backlog.
-    pub fn shrink_to_zero(listener: &TcpListener) {
+    /// Calling `listen` again on a listening socket changes its backlog. 1, not 0: some
+    /// systems read 0 as "the default".
+    pub fn shrink_to_one(listener: &TcpListener) {
         // SAFETY: the fd belongs to `listener`, which is open for the whole call.
-        let rc = unsafe { listen(listener.as_raw_fd(), 0) };
-        assert_eq!(rc, 0, "listen(fd, 0) failed");
+        let rc = unsafe { listen(listener.as_raw_fd(), 1) };
+        assert_eq!(rc, 0, "listen(fd, 1) failed");
     }
 }
 
@@ -80,16 +81,30 @@ fn connect_timeout_is_enforced() {
 
     for (mode, event_loop) in pool_and_direct() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        backlog::shrink_to_zero(&listener);
+        backlog::shrink_to_one(&listener);
         let addr = listener.local_addr().unwrap();
+        // Fill the queue until the kernel starts dropping SYNs, however it counts the
+        // backlog; then the client's SYN is dropped too.
         let mut fillers = Vec::new();
-        for _ in 0..64 {
+        let mut black_hole = false;
+        while fillers.len() < 200 {
             match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
                 Ok(stream) => fillers.push(stream),
-                Err(_) => break,
+                Err(e) => {
+                    black_hole = e.kind() == io::ErrorKind::TimedOut;
+                    break;
+                }
             }
         }
-        assert!(!fillers.is_empty(), "{mode}: no filler connection got in");
+        if !black_hole && !cfg!(target_os = "linux") {
+            eprintln!(
+                "{mode}: skipped: after {} connections the listener still answered SYNs, \
+                 so this OS gives no way to stall a connect",
+                fillers.len()
+            );
+            continue;
+        }
+        assert!(black_hole, "{mode}: a full backlog did not drop SYNs");
 
         let recorder = Recorder::default();
         let errors = Arc::clone(&recorder.errors);
@@ -151,11 +166,19 @@ fn connect_refused_is_an_error() {
         let client = match TcpClient::connect(addr, TcpClientConfig::default(), recorder) {
             Ok(mut client) => {
                 client.start(&event_loop).unwrap();
+                let connect_error = || {
+                    errors
+                        .lock()
+                        .iter()
+                        .find(|(_, _, kind, _)| kind.is_some())
+                        .cloned()
+                };
                 assert!(
-                    wait_until(Duration::from_secs(2), || !errors.lock().is_empty()),
-                    "{mode}: refused connect reported no error"
+                    wait_until(Duration::from_secs(5), || connect_error().is_some()),
+                    "{mode}: refused connect reported no connect error: {:?}",
+                    errors.lock()
                 );
-                let (conn, message, _, _) = errors.lock()[0].clone();
+                let (conn, message, _, _) = connect_error().unwrap();
                 assert_eq!(conn, Some(client.id()), "{mode}: {message}");
                 assert!(matches!(client.send(b"x"), Err(SendError::Closed)));
                 Some(client)
