@@ -4,6 +4,7 @@
 //! Lock order, where more than one is held: `write` before `stream`. No lock is held while
 //! a handler callback runs, and `stream` is only held across non-blocking syscalls.
 
+use super::layer::{Layer, LayerStack};
 use super::{ConnectionId, NetworkHandler, ServerContext};
 use crate::errors::{NetworkError, NetworkEvent};
 use lock_freedom::map::Map as LockfreeMap;
@@ -202,12 +203,16 @@ struct WriteState {
     queue: VecDeque<Vec<u8>>,
     /// Bytes of `queue.front()` already written.
     offset: usize,
-    /// Bytes queued and not yet written.
+    /// Frames sent before the layers were ready, not yet encoded.
+    held: VecDeque<Vec<u8>>,
+    /// Bytes queued or held and not yet written.
     queued: usize,
     /// False until the socket may be written to.
     can_write: bool,
     /// Set when a send was refused; cleared when `on_drained` is due.
     backpressured: bool,
+    /// A frame was accepted; from then on the layer stack is fixed.
+    sent: bool,
 }
 
 impl WriteState {
@@ -219,7 +224,24 @@ impl WriteState {
         self.queue.push_back(bytes.to_vec());
     }
 
+    fn hold(&mut self, frame: &[u8]) {
+        self.queued += frame.len();
+        self.held.push_back(frame.to_vec());
+    }
+
+    /// Encodes the held frames, in order, onto the queue.
+    fn release_held(&mut self, stack: &mut LayerStack) -> io::Result<()> {
+        while let Some(frame) = self.held.pop_front() {
+            self.queued -= frame.len();
+            let mut wire = Vec::new();
+            stack.encode(&frame, &mut wire)?;
+            self.push(&wire);
+        }
+        Ok(())
+    }
+
     fn clear(&mut self) {
+        self.held.clear();
         self.queue.clear();
         self.offset = 0;
         self.queued = 0;
@@ -378,6 +400,8 @@ pub(crate) struct Conn<H: NetworkHandler> {
     connecting: AtomicBool,
     connect_timer: Mutex<Option<TimerId>>,
     connect_opts: Mutex<Option<ConnectOpts>>,
+    /// Empty for plain TCP, which then skips every layer step.
+    layers: OnceLock<Mutex<LayerStack>>,
     shared: Weak<Shared<H>>,
     me: Weak<Self>,
 }
@@ -389,7 +413,12 @@ impl<H: NetworkHandler> Conn<H> {
         shared: Weak<Shared<H>>,
         marks: Watermarks,
         connecting: bool,
+        layers: Vec<Box<dyn Layer>>,
     ) -> Arc<Self> {
+        let stack = OnceLock::new();
+        if !layers.is_empty() {
+            let _ = stack.set(Mutex::new(LayerStack::new(layers)));
+        }
         Arc::new_cyclic(|me| Self {
             id,
             token: AtomicUsize::new(0),
@@ -397,10 +426,12 @@ impl<H: NetworkHandler> Conn<H> {
             registered: AtomicBool::new(false),
             write: Mutex::new(WriteState {
                 queue: VecDeque::new(),
+                held: VecDeque::new(),
                 offset: 0,
                 queued: 0,
                 can_write: !connecting,
                 backpressured: false,
+                sent: false,
             }),
             marks,
             drive: ReadDrive::default(),
@@ -410,6 +441,7 @@ impl<H: NetworkHandler> Conn<H> {
             connecting: AtomicBool::new(connecting),
             connect_timer: Mutex::new(None),
             connect_opts: Mutex::new(None),
+            layers: stack,
             shared,
             me: me.clone(),
         })
@@ -421,6 +453,79 @@ impl<H: NetworkHandler> Conn<H> {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Adds a layer on top of the stack. False, and nothing added, once a frame was sent:
+    /// that frame would bypass the new layer.
+    pub(crate) fn add_layer(&self, layer: Box<dyn Layer>) -> bool {
+        let write = self.write.lock();
+        if write.sent {
+            return false;
+        }
+        let stack = self
+            .layers
+            .get_or_init(|| Mutex::new(LayerStack::new(Vec::new())));
+        stack.lock().push(layer);
+        drop(write);
+        true
+    }
+
+    /// Starts the layers once TCP is up. True if `on_connect` is due now.
+    pub(crate) fn start_layers(this: &Arc<Self>) -> bool {
+        let Some(stack) = this.layers.get() else {
+            return true;
+        };
+        let result = {
+            let mut write = this.write.lock();
+            let mut stack = stack.lock();
+            let mut wire = Vec::new();
+            stack
+                .advance(&mut wire)
+                .map(|()| write.push(&wire))
+                .and_then(|()| {
+                    if stack.take_ready() {
+                        write.release_held(&mut stack).map(|()| true)
+                    } else {
+                        Ok(false)
+                    }
+                })
+        };
+        match result {
+            Ok(ready) => {
+                Self::flush(this, false);
+                ready && !this.is_closed()
+            }
+            Err(e) => {
+                this.fail(e);
+                false
+            }
+        }
+    }
+
+    /// Runs a chunk read from the socket through the layers. Returns the bytes for
+    /// `on_data` and whether `on_connect` became due.
+    fn decode_layers(
+        &self,
+        stack: &Mutex<LayerStack>,
+        input: &[u8],
+    ) -> io::Result<(Vec<u8>, bool)> {
+        let mut write = self.write.lock();
+        let mut stack = stack.lock();
+        let mut app = Vec::new();
+        let mut wire = Vec::new();
+        stack.decode(input, &mut app, &mut wire)?;
+        write.push(&wire);
+        let ready = stack.take_ready();
+        if ready {
+            write.release_held(&mut stack)?;
+        }
+        drop(stack);
+        if write.can_write {
+            if let Some(result) = self.with_stream(|stream| write.flush(stream)) {
+                result?;
+            }
+        }
+        Ok((app, ready))
     }
 
     pub(crate) fn sender(this: &Arc<Self>) -> ConnSender {
@@ -584,7 +689,7 @@ impl<H: NetworkHandler> Conn<H> {
         }
         this.apply_connect_opts(&shared);
         this.write.lock().can_write = true;
-        if !this.connect_handler(&shared) {
+        if Self::start_layers(this) && !this.connect_handler(&shared) {
             return;
         }
         Self::flush(this, true);
@@ -710,7 +815,26 @@ impl<H: NetworkHandler> Conn<H> {
                 write.backpressured = true;
                 return Err(SendError::Backpressure);
             }
-            let result = if write.can_write && write.queue.is_empty() {
+            write.sent = true;
+            let result = if let Some(stack) = this.layers.get() {
+                let mut stack = stack.lock();
+                if stack.is_ready() {
+                    let mut wire = Vec::new();
+                    stack.encode(frame, &mut wire).and_then(|()| {
+                        drop(stack);
+                        write.push(&wire);
+                        if write.can_write {
+                            this.with_stream(|stream| write.flush(stream))
+                                .unwrap_or(Ok(()))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                } else {
+                    write.hold(frame);
+                    Ok(())
+                }
+            } else if write.can_write && write.queue.is_empty() {
                 this.with_stream(|stream| write_now(stream, frame))
                     .unwrap_or(Ok(0))
                     .map(|written| write.push(&frame[written..]))
@@ -765,6 +889,15 @@ impl<H: NetworkHandler> Conn<H> {
                     let _ = event_loop.post(move || Self::handle_read(&conn));
                     return;
                 }
+                // Before `on_connect` (a layer handshake still running) a close gets no
+                // `on_disconnect`, so it is reported as an error instead of passing unseen.
+                ReadPass::Eof if !this.connected.load(Ordering::SeqCst) => {
+                    this.fail(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "peer closed during the layer handshake",
+                    ));
+                    return;
+                }
                 ReadPass::Eof | ReadPass::Stopped => {
                     this.shutdown(true);
                     return;
@@ -799,12 +932,27 @@ impl<H: NetworkHandler> Conn<H> {
                 None => return ReadPass::Stopped,
                 Some(Ok(0)) => return ReadPass::Eof,
                 Some(Ok(n)) => {
-                    if let Err(e) = shared.handler.on_data(&shared.ctx, self.id, &buffer[..n]) {
-                        shared.report(
-                            Some(self.id),
-                            NetworkError::HandlerError(format!("on_data: {}", e)),
-                        );
-                        return ReadPass::Stopped;
+                    let decoded;
+                    let mut data = &buffer[..n];
+                    if let Some(stack) = self.layers.get() {
+                        let (app, ready) = match self.decode_layers(stack, data) {
+                            Ok(decoded) => decoded,
+                            Err(e) => return ReadPass::Failed(e),
+                        };
+                        if ready && !self.connect_handler(&shared) {
+                            return ReadPass::Stopped;
+                        }
+                        decoded = app;
+                        data = &decoded;
+                    }
+                    if !data.is_empty() {
+                        if let Err(e) = shared.handler.on_data(&shared.ctx, self.id, data) {
+                            shared.report(
+                                Some(self.id),
+                                NetworkError::HandlerError(format!("on_data: {}", e)),
+                            );
+                            return ReadPass::Stopped;
+                        }
                     }
                     total += n;
                     if total >= MAX_READ_PER_EVENT {

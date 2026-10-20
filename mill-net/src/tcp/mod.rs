@@ -54,11 +54,13 @@
 
 pub mod config;
 mod conn;
+pub mod layer;
 mod sockopt;
 pub mod traits;
 
 pub use config::{TcpClientConfig, TcpServerConfig};
 pub use conn::{ConnSender, SendError, MAX_READ_PER_EVENT};
+pub use layer::Layer;
 pub use traits::*;
 
 use crate::errors::Result;
@@ -72,6 +74,9 @@ use parking_lot::Mutex;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{atomic::Ordering, Arc, Weak};
+
+/// Builds one layer for each accepted connection.
+type LayerFactory = Arc<dyn Fn() -> Box<dyn Layer> + Send + Sync>;
 
 /// Context for network handlers to interact with the server or client that called them.
 pub struct ServerContext {
@@ -122,6 +127,7 @@ pub struct TcpServer<H: NetworkHandler> {
     listener_token: Mutex<Option<Token>>,
     local_addr: SocketAddr,
     config: TcpServerConfig,
+    layers: Vec<LayerFactory>,
 }
 
 impl<H: NetworkHandler> TcpServer<H> {
@@ -136,7 +142,18 @@ impl<H: NetworkHandler> TcpServer<H> {
             listener: Arc::new(Mutex::new(Some(listener))),
             listener_token: Mutex::new(None),
             config,
+            layers: Vec::new(),
         })
+    }
+
+    /// Adds a [`Layer`] above any added before, built by `factory` for each accepted
+    /// connection. Call before [`start`](Self::start).
+    pub fn with_layer<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn Layer> + Send + Sync + 'static,
+    {
+        self.layers.push(Arc::new(factory));
+        self
     }
 
     /// Get the local address the server is bound to
@@ -156,6 +173,7 @@ impl<H: NetworkHandler> TcpServer<H> {
             shared: self.shared.clone(),
             listener: self.listener.clone(),
             config: self.config.clone(),
+            layers: self.layers.clone(),
         };
 
         let mut listener = self.listener.lock();
@@ -213,6 +231,7 @@ struct ListenerEvents<H: NetworkHandler> {
     shared: Arc<Shared<H>>,
     listener: Arc<Mutex<Option<TcpListener>>>,
     config: TcpServerConfig,
+    layers: Vec<LayerFactory>,
 }
 
 impl<H: NetworkHandler> EventHandler for ListenerEvents<H> {
@@ -296,7 +315,15 @@ impl<H: NetworkHandler> ListenerEvents<H> {
             }
         }
 
-        let conn = Conn::new(conn_id, stream, Arc::downgrade(shared), marks, false);
+        let layers = self.layers.iter().map(|factory| factory()).collect();
+        let conn = Conn::new(
+            conn_id,
+            stream,
+            Arc::downgrade(shared),
+            marks,
+            false,
+            layers,
+        );
         shared.conns.insert(conn_id, conn.clone());
         if shared.stopped.load(Ordering::SeqCst) {
             conn.shutdown(false);
@@ -309,7 +336,8 @@ impl<H: NetworkHandler> ListenerEvents<H> {
         );
 
         // `on_connect` runs before the socket is registered, so it precedes any `on_data`.
-        if !conn.connect_handler(shared) {
+        // With a handshake to do, the read path runs it once the layers are ready.
+        if Conn::start_layers(&conn) && !conn.connect_handler(shared) {
             return;
         }
 
@@ -333,6 +361,7 @@ pub struct TcpClient<H: NetworkHandler> {
     shared: Arc<Shared<H>>,
     conn: Arc<Conn<H>>,
     config: TcpClientConfig,
+    started: bool,
 }
 
 impl<H: NetworkHandler> TcpClient<H> {
@@ -348,7 +377,14 @@ impl<H: NetworkHandler> TcpClient<H> {
             high: config.high_watermark,
             low: config.low_watermark,
         };
-        let conn = Conn::new(conn_id, stream, Arc::downgrade(&shared), marks, true);
+        let conn = Conn::new(
+            conn_id,
+            stream,
+            Arc::downgrade(&shared),
+            marks,
+            true,
+            Vec::new(),
+        );
         shared.conns.insert(conn_id, conn.clone());
         shared.count.fetch_add(1, Ordering::SeqCst);
 
@@ -356,7 +392,21 @@ impl<H: NetworkHandler> TcpClient<H> {
             shared,
             conn,
             config,
+            started: false,
         })
+    }
+
+    /// Adds a [`Layer`] above any added before.
+    ///
+    /// Fails with [`NetworkError::Configuration`] after [`start`](Self::start) or the
+    /// first send, which the new layer would have missed.
+    pub fn with_layer<L: Layer>(self, layer: L) -> Result<Self> {
+        if self.started || !self.conn.add_layer(Box::new(layer)) {
+            return Err(Box::new(NetworkError::Configuration(
+                "layers must be added before start() and the first send".to_string(),
+            )));
+        }
+        Ok(self)
     }
 
     /// Registers the connection with `event_loop` under a token from
@@ -365,6 +415,7 @@ impl<H: NetworkHandler> TcpClient<H> {
     /// `on_connect` fires on the loop once the handshake completes.
     pub fn start(&mut self, event_loop: &Arc<EventLoop>) -> Result<()> {
         self.shared.bind(event_loop)?;
+        self.started = true;
         if self.conn.is_closed() {
             return Err(Box::new(NetworkError::ConnectionNotFound(self.conn.id())));
         }
