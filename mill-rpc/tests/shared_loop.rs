@@ -1,11 +1,6 @@
 use mill_io::EventLoop;
 use mill_rpc::prelude::*;
-use std::{
-    net::{SocketAddr, TcpListener},
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
 
 mill_rpc::service! {
     service Arith {
@@ -21,24 +16,17 @@ impl arith::Service for Adder {
     }
 }
 
-fn free_local_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
 #[test]
 fn two_clients_share_one_loop() {
     const CALLS: u64 = 1000;
 
     let event_loop = Arc::new(EventLoop::new(4, 1024, 10).unwrap());
-    let addr = free_local_addr();
-    let _server = RpcServer::builder()
-        .bind(addr)
+    let server = RpcServer::builder()
+        .bind("127.0.0.1:0".parse().unwrap())
         .service(arith::server(Adder))
         .build(&event_loop)
         .unwrap();
+    let addr = server.local_addr().unwrap();
     let runner = {
         let event_loop = Arc::clone(&event_loop);
         thread::spawn(move || event_loop.run().map_err(|e| e.to_string()))
@@ -85,17 +73,16 @@ fn two_servers_share_one_loop() {
     const CALLS: u64 = 200;
 
     let event_loop = Arc::new(EventLoop::new(4, 1024, 10).unwrap());
-    let addrs = [free_local_addr(), free_local_addr()];
-    let _servers: Vec<RpcServer> = addrs
-        .iter()
-        .map(|addr| {
+    let servers: Vec<RpcServer> = (0..2)
+        .map(|_| {
             RpcServer::builder()
-                .bind(*addr)
+                .bind("127.0.0.1:0".parse().unwrap())
                 .service(arith::server(Adder))
                 .build(&event_loop)
                 .unwrap()
         })
         .collect();
+    let addrs: Vec<SocketAddr> = servers.iter().map(|s| s.local_addr().unwrap()).collect();
     let runner = {
         let event_loop = Arc::clone(&event_loop);
         thread::spawn(move || event_loop.run().map_err(|e| e.to_string()))
