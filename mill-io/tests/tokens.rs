@@ -3,7 +3,7 @@ use mio::{event::Event, net::TcpListener, Interest, Token};
 use std::{
     collections::HashSet,
     io::{ErrorKind, Read},
-    net::TcpStream as StdTcpStream,
+    net::{Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
@@ -130,8 +130,14 @@ fn alloc_token_is_unique() {
     assert_eq!(seen.len(), TOTAL);
 }
 
-fn tcp_pair() -> (mio::net::TcpStream, StdTcpStream) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+fn local_listener() -> StdTcpListener {
+    StdTcpListener::bind("127.0.0.1:0").unwrap()
+}
+
+/// Loops share one listener and close the accepted side first, so a round's TIME_WAIT
+/// sits on the listener's port. A listener per round, or a client that closes first,
+/// holds an ephemeral port per round, and Windows runners ran out (WSAENOBUFS).
+fn tcp_pair(listener: &StdTcpListener) -> (mio::net::TcpStream, StdTcpStream) {
     let peer = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (accepted, _) = listener.accept().unwrap();
     accepted.set_nonblocking(true).unwrap();
@@ -173,7 +179,8 @@ fn reregister_adds_writable_interest() {
         Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
         Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
     ] {
-        let (stream, mut peer) = tcp_pair();
+        let listener = local_listener();
+        let (stream, mut peer) = tcp_pair(&listener);
         let stream = Arc::new(Mutex::new(stream));
         let readable = Arc::new(AtomicUsize::new(0));
         let writable = Arc::new(AtomicUsize::new(0));
@@ -231,7 +238,8 @@ fn reregister_adds_writable_interest() {
 #[test]
 fn reregister_rejects_unknown_and_waker_tokens() {
     let event_loop = EventLoop::new(1, 64, 10).unwrap();
-    let (mut stream, _peer) = tcp_pair();
+    let listener = local_listener();
+    let (mut stream, _peer) = tcp_pair(&listener);
 
     let unknown = event_loop.alloc_token();
     assert!(event_loop
@@ -262,7 +270,8 @@ fn token_is_reusable_after_deregister() {
     let event_loop = Arc::new(EventLoop::new(2, 1024, 10).unwrap());
     let token = event_loop.alloc_token();
 
-    let (mut first, mut first_peer) = tcp_pair();
+    let listener = local_listener();
+    let (mut first, mut first_peer) = tcp_pair(&listener);
     let first_hits = Arc::new(AtomicUsize::new(0));
     event_loop
         .register(
@@ -274,7 +283,7 @@ fn token_is_reusable_after_deregister() {
         .unwrap();
     event_loop.deregister(&mut first, token).unwrap();
 
-    let (mut second, mut second_peer) = tcp_pair();
+    let (mut second, mut second_peer) = tcp_pair(&listener);
     let second_hits = Arc::new(AtomicUsize::new(0));
     event_loop
         .register(
@@ -321,8 +330,9 @@ fn register_with_pending_data_gets_event() {
             let event_loop = Arc::clone(&event_loop);
             thread::spawn(move || event_loop.run().map_err(|e| e.to_string()))
         };
+        let listener = local_listener();
         for round in 0..ROUNDS {
-            let (mut stream, mut peer) = tcp_pair();
+            let (mut stream, mut peer) = tcp_pair(&listener);
             std::io::Write::write_all(&mut peer, b"ready").unwrap();
             let hits = Arc::new(AtomicUsize::new(0));
             let token = event_loop.alloc_token();
@@ -341,6 +351,7 @@ fn register_with_pending_data_gets_event() {
                 "{mode}: round {round}: the readiness present at register() was lost"
             );
             event_loop.deregister(&mut stream, token).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
         }
         event_loop.stop();
         assert_eq!(runner.join().unwrap(), Ok(()));
@@ -362,8 +373,9 @@ fn reregister_to_writable_never_loses_the_edge() {
             let event_loop = Arc::clone(&event_loop);
             thread::spawn(move || event_loop.run().map_err(|e| e.to_string()))
         };
+        let listener = local_listener();
         for round in 0..ROUNDS {
-            let (stream, _peer) = tcp_pair();
+            let (stream, _peer) = tcp_pair(&listener);
             let stream = Arc::new(Mutex::new(stream));
             let readable = Arc::new(AtomicUsize::new(0));
             let writable = Arc::new(AtomicUsize::new(0));
@@ -394,9 +406,9 @@ fn reregister_to_writable_never_loses_the_edge() {
                     > 0),
                 "{mode}: round {round}: the writable edge raised by reregister was lost"
             );
-            event_loop
-                .deregister(&mut *stream.lock().unwrap(), token)
-                .unwrap();
+            let mut stream = stream.lock().unwrap();
+            event_loop.deregister(&mut *stream, token).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
         }
         event_loop.stop();
         assert_eq!(runner.join().unwrap(), Ok(()));
