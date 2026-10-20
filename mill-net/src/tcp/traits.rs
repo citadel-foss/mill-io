@@ -69,6 +69,13 @@ pub trait NetworkHandler: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Called once the outbound queue falls to the low watermark after a send was refused
+    /// with [`SendError::Backpressure`](super::SendError::Backpressure).
+    fn on_drained(&self, ctx: &ServerContext, conn: ConnectionId) -> Result<()> {
+        let _ = (ctx, conn);
+        Ok(())
+    }
+
     /// Called on errors
     fn on_error(&self, ctx: &ServerContext, conn_id: Option<ConnectionId>, error: NetworkError) {
         let _ = (ctx, conn_id, error);

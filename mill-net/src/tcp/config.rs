@@ -26,7 +26,16 @@ pub struct TcpServerConfig {
     pub no_delay: bool,
     /// SO_KEEPALIVE setting
     pub keep_alive: Option<std::time::Duration>,
+    /// Queued outbound bytes at or above which sends get `SendError::Backpressure`
+    pub high_watermark: usize,
+    /// Queued outbound bytes at or below which `on_drained` fires after a refused send
+    pub low_watermark: usize,
 }
+
+/// Default high watermark for servers and clients: 1 MiB.
+pub const DEFAULT_HIGH_WATERMARK: usize = 1024 * 1024;
+/// Default low watermark for servers and clients: 256 KiB.
+pub const DEFAULT_LOW_WATERMARK: usize = 256 * 1024;
 
 impl TcpServerConfig {
     /// Create a new builder for TcpServerConfig
@@ -43,6 +52,8 @@ impl Default for TcpServerConfig {
             max_connections: None,
             no_delay: true,
             keep_alive: Some(std::time::Duration::from_secs(60)),
+            high_watermark: DEFAULT_HIGH_WATERMARK,
+            low_watermark: DEFAULT_LOW_WATERMARK,
         }
     }
 }
@@ -57,6 +68,8 @@ pub struct TcpServerConfigBuilder {
     max_connections: Option<usize>,
     no_delay: Option<bool>,
     keep_alive: Option<Option<std::time::Duration>>,
+    high_watermark: Option<usize>,
+    low_watermark: Option<usize>,
 }
 
 impl TcpServerConfigBuilder {
@@ -68,6 +81,8 @@ impl TcpServerConfigBuilder {
             max_connections: None,
             no_delay: None,
             keep_alive: None,
+            high_watermark: None,
+            low_watermark: None,
         }
     }
 
@@ -101,6 +116,18 @@ impl TcpServerConfigBuilder {
         self
     }
 
+    /// Set the outbound queue's high watermark, in bytes
+    pub fn high_watermark(mut self, bytes: usize) -> Self {
+        self.high_watermark = Some(bytes);
+        self
+    }
+
+    /// Set the outbound queue's low watermark, in bytes
+    pub fn low_watermark(mut self, bytes: usize) -> Self {
+        self.low_watermark = Some(bytes);
+        self
+    }
+
     /// Build the TcpServerConfig
     pub fn build(self) -> TcpServerConfig {
         let default = TcpServerConfig::default();
@@ -110,6 +137,8 @@ impl TcpServerConfigBuilder {
             max_connections: self.max_connections.or(default.max_connections),
             no_delay: self.no_delay.unwrap_or(default.no_delay),
             keep_alive: self.keep_alive.unwrap_or(default.keep_alive),
+            high_watermark: self.high_watermark.unwrap_or(default.high_watermark),
+            low_watermark: self.low_watermark.unwrap_or(default.low_watermark),
         }
     }
 }
@@ -123,6 +152,29 @@ impl Default for TcpServerConfigBuilder {
             max_connections: default.max_connections,
             no_delay: Some(default.no_delay),
             keep_alive: Some(default.keep_alive),
+            high_watermark: Some(default.high_watermark),
+            low_watermark: Some(default.low_watermark),
+        }
+    }
+}
+
+/// Configuration for [`TcpClient`](super::TcpClient).
+#[derive(Clone, Debug)]
+pub struct TcpClientConfig {
+    /// Queued outbound bytes at or above which sends get `SendError::Backpressure`
+    pub high_watermark: usize,
+    /// Queued outbound bytes at or below which `on_drained` fires after a refused send
+    pub low_watermark: usize,
+    /// Enable TCP_NODELAY
+    pub nodelay: bool,
+}
+
+impl Default for TcpClientConfig {
+    fn default() -> Self {
+        Self {
+            high_watermark: DEFAULT_HIGH_WATERMARK,
+            low_watermark: DEFAULT_LOW_WATERMARK,
+            nodelay: true,
         }
     }
 }

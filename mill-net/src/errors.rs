@@ -1,4 +1,4 @@
-use crate::tcp::ConnectionId;
+use crate::tcp::{ConnectionId, SendError};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -16,6 +16,7 @@ pub enum NetworkError {
     HandlerError(String),
     EventLoopGone,
     ConnectionNotFound(ConnectionId),
+    Send(SendError),
     Other(String),
 }
 
@@ -35,6 +36,7 @@ impl fmt::Display for NetworkError {
             NetworkError::ConnectionNotFound(conn_id) => {
                 write!(f, "Connection not found: {:?}", conn_id)
             }
+            NetworkError::Send(e) => write!(f, "Send Error: {}", e),
             NetworkError::Other(msg) => write!(f, "Error: {}", msg),
         }
     }

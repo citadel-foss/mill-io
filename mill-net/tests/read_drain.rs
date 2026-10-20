@@ -1,54 +1,20 @@
-use mill_io::EventLoop;
 use mill_net::errors::Result;
 use mill_net::tcp::config::TcpServerConfig;
-use mill_net::tcp::{ConnectionId, NetworkHandler, ServerContext, TcpClient, TcpServer};
+use mill_net::tcp::{
+    ConnectionId, NetworkHandler, ServerContext, TcpClient, TcpClientConfig, TcpServer,
+};
 use parking_lot::Mutex;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
+
 const MESSAGE_LEN: usize = 4 * 1024 * 1024;
-
-fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
-fn pool_and_direct() -> [(&'static str, Arc<EventLoop>); 2] {
-    [
-        ("pool", Arc::new(EventLoop::new(2, 1024, 10).unwrap())),
-        (
-            "direct",
-            Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
-        ),
-    ]
-}
-
-fn spawn_loop(event_loop: &Arc<EventLoop>) -> JoinHandle<()> {
-    let event_loop = Arc::clone(event_loop);
-    thread::spawn(move || event_loop.run().unwrap())
-}
-
-fn stop_loop(event_loop: &EventLoop, runner: JoinHandle<()>) {
-    assert!(
-        wait_until(Duration::from_secs(5), || {
-            event_loop.stop();
-            runner.is_finished()
-        }),
-        "event loop did not stop"
-    );
-    runner.join().unwrap();
-}
 
 fn message() -> Vec<u8> {
     (0..MESSAGE_LEN).map(|i| (i % 251) as u8).collect()
@@ -84,8 +50,8 @@ fn single_4mb_message_without_followup() {
 
         let collector = Collector::default();
         let received = Arc::clone(&collector.received);
-        let mut client = TcpClient::connect(addr, collector).unwrap();
-        client.start(&event_loop, event_loop.alloc_token()).unwrap();
+        let mut client = TcpClient::connect(addr, TcpClientConfig::default(), collector).unwrap();
+        client.start(&event_loop).unwrap();
         let runner = spawn_loop(&event_loop);
 
         let started = Instant::now();

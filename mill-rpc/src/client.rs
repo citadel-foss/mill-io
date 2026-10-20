@@ -5,7 +5,7 @@
 use crate::{RpcError, RpcTransport};
 use mill_io::EventLoop;
 use mill_net::tcp::traits::{ConnectionId, NetworkHandler};
-use mill_net::tcp::{ServerContext, TcpClient};
+use mill_net::tcp::{ServerContext, TcpClient, TcpClientConfig};
 use mill_rpc_core::protocol::{self, Frame, MessageType};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -50,11 +50,11 @@ impl RpcClient {
             shared: shared.clone(),
         };
 
-        let mut tcp_client = TcpClient::connect(addr, handler)
+        let mut tcp_client = TcpClient::connect(addr, TcpClientConfig::default(), handler)
             .map_err(|e| RpcError::unavailable(format!("Connect failed: {}", e)))?;
 
         tcp_client
-            .start(event_loop, event_loop.alloc_token())
+            .start(event_loop)
             .map_err(|e| RpcError::unavailable(format!("Client start failed: {}", e)))?;
 
         Ok(Arc::new(Self {
