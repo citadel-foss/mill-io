@@ -116,6 +116,10 @@ fn small_window_client(addr: SocketAddr) -> TcpStream {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP)).unwrap();
     socket.set_recv_buffer_size(64 * 1024).unwrap();
+    // Set before connecting: macOS rejects socket options once the peer has reset it.
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     socket.connect(&addr.into()).unwrap();
     socket.into()
 }
@@ -214,9 +218,6 @@ fn slow_reader_gets_every_reply_in_order() {
     let stalled_at = written.load(Ordering::SeqCst);
     harness.assert_others_unaffected("during the stall");
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     for id in 1..=REQUESTS {
         let (reply_id, data) = read_reply(&mut stream)
             .unwrap_or_else(|e| panic!("reply {id} (writer stalled at {stalled_at}): {e}"));
@@ -244,9 +245,6 @@ fn stuck_reader_is_disconnected() {
     );
     harness.assert_others_unaffected("after a reader was stuck");
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     let mut replies = 0;
     let end = loop {
         match read_reply(&mut stream) {
@@ -291,9 +289,6 @@ fn requests_after_a_stall_are_not_dispatched_on_the_reactor() {
     );
     let dispatched_before_drain = calls.load(Ordering::SeqCst);
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     for id in 1..=REQUESTS {
         let (reply_id, _) = read_reply(&mut stream).unwrap();
         assert_eq!(reply_id, id as u64, "replies out of order");
