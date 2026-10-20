@@ -41,6 +41,8 @@ impl<T: Send + 'static> ObjectPool<T> {
         }
     }
 
+    /// Takes a free object, or makes one. A `Vec<u8>` comes back at its original length
+    /// with the bytes its last user left; only bytes added back to restore it are zero.
     pub fn acquire(&self) -> PooledObject<T> {
         let mut object = {
             let receiver = self.receiver.lock();
@@ -57,7 +59,6 @@ impl<T: Send + 'static> ObjectPool<T> {
             self.buffer_len,
             (&mut object as &mut dyn Any).downcast_mut::<Vec<u8>>(),
         ) {
-            vec.clear();
             vec.resize(len, 0);
         }
 
@@ -109,5 +110,17 @@ mod tests {
         }
         let empty_start = ObjectPool::new(0, || vec![0u8; 100]);
         assert_eq!(empty_start.acquire().as_ref().len(), 100);
+    }
+
+    #[test]
+    fn acquire_zeroes_only_the_bytes_it_adds_back() {
+        let pool = ObjectPool::new(1, || vec![0u8; 8]);
+        pool.acquire().as_mut().fill(7);
+        assert_eq!(pool.acquire().as_ref(), &[7; 8]);
+
+        let mut buffer = pool.acquire();
+        buffer.as_mut().truncate(3);
+        drop(buffer);
+        assert_eq!(pool.acquire().as_ref(), &[7, 7, 7, 0, 0, 0, 0, 0]);
     }
 }
