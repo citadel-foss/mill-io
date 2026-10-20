@@ -84,4 +84,8 @@ Bitcoin Core.
   mid-handshake is a dropped connection instead: queued calls wait for the reconnect.
 - A handshake lasts as long as the calls waiting on it: when the last one reaches its
   deadline (`ChainError::Timeout`), the half-open socket is closed. With no call waiting,
-  a proxied handshake is given up after 120 s.
+  a handshake is given up after 120 s through a proxy, 30 s for direct TLS.
+- With `tls` (the `tls` feature), the connection runs rustls with the ring provider,
+  over the proxy if one is set. `TlsVerify` picks WebPKI roots, a CA file, or a SHA-256
+  pin of the server's leaf certificate; `InsecureForTests` exists only with `testing`.
+  The name check is skipped for `.onion` hosts; the chain or pin is still checked.
