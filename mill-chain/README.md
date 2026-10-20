@@ -63,3 +63,25 @@ Every query returns `Result<_, ChainError>`.
   `retries`.
 - A call that ends while its request is in flight (deadline, cancel) closes that
   connection; bitcoind still finishes the request.
+
+## Transports
+
+`TransportConfig` says how a backend is reached; `CoreConfig::transport` sets it for
+Bitcoin Core.
+
+- Without a proxy, a backend given by hostname is resolved on the loop's compute pool,
+  never on the loop thread. Successive reconnects walk the resolved addresses. Core
+  resolves its first hop (the node, or the proxy) once, when the client starts.
+- With `socks5`, the hostname goes to the proxy as a SOCKS5 domain name (ATYP 3) and is
+  never resolved locally; `.onion` names work as given. The proxy itself is `host:port`
+  on any host, such as a Tor container at `10.21.22.10:9050`.
+- `isolate: true` sends a fresh random username and password on every connection, so
+  Tor builds a separate circuit for each one.
+- A handshake that fails after the peer was reached (the proxy refusing the request,
+  with each SOCKS5 and Tor reply code mapped to its own `Socks5Error` text) fails the
+  queued calls that have no retries left with `ChainError::Transport("handshake failed:
+  ...")`. Reconnecting goes on as usual. A peer that closes or resets the socket
+  mid-handshake is a dropped connection instead: queued calls wait for the reconnect.
+- A handshake lasts as long as the calls waiting on it: when the last one reaches its
+  deadline (`ChainError::Timeout`), the half-open socket is closed. With no call waiting,
+  a proxied handshake is given up after 120 s.

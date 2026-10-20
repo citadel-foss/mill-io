@@ -1,5 +1,5 @@
-//! Test tools: scriptable line-delimited JSON-RPC and HTTP JSON-RPC servers, and hooks that
-//! run code on a client's event loop thread.
+//! Test tools: scriptable line-delimited JSON-RPC and HTTP JSON-RPC servers, a recording
+//! SOCKS5 proxy, and hooks that run code on a client's event loop thread.
 
 use crate::{ChainClient, ChainError, ChainHandle};
 use serde_json::{json, Value};
@@ -7,7 +7,8 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -809,4 +810,240 @@ pub fn batch_raw(
     calls: &[(&str, Value)],
 ) -> Result<Vec<Result<Value, ChainError>>, ChainError> {
     handle.batch_raw(calls)
+}
+
+/// Hostnames `c` has resolved locally so far: the backend's on a direct connection, and a
+/// proxy given by name. Zero when a SOCKS5 proxy given as an IP address resolves for it.
+pub fn local_dns_lookups(c: &ChainClient) -> u64 {
+    c.engine().dns_lookups()
+}
+
+/// One CONNECT request a [`MockSocks5`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksConnect {
+    /// The request's address type: 1 for IPv4, 3 for a domain name, 4 for IPv6.
+    pub atyp: u8,
+    /// The address as sent: the domain name, or the IP address as text.
+    pub host: String,
+    /// The port asked for.
+    pub port: u16,
+    /// The username, when the client authenticated.
+    pub username: Option<String>,
+    /// The password, when the client authenticated.
+    pub password: Option<String>,
+}
+
+/// A SOCKS5 proxy that records every CONNECT and answers each with one reply code.
+///
+/// It picks username/password auth when offered (accepting any), else no auth, else
+/// refuses. With reply 0 it connects to the target, resolving domain names itself, and
+/// relays bytes both ways; a target it cannot reach gets 0x05. Any other reply code is
+/// sent as is and the connection closed. Dropping it closes every connection and joins
+/// its threads.
+pub struct MockSocks5 {
+    addr: SocketAddr,
+    shared: Arc<SocksShared>,
+    acceptor: Option<JoinHandle<()>>,
+}
+
+struct SocksShared {
+    reply: u8,
+    stopping: AtomicBool,
+    connects: Mutex<Vec<SocksConnect>>,
+    streams: Mutex<Vec<TcpStream>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl SocksShared {
+    fn track(&self, stream: &TcpStream) {
+        if let Ok(clone) = stream.try_clone() {
+            lock(&self.streams).push(clone);
+        }
+    }
+
+    fn spawn(&self, name: &str, f: impl FnOnce() + Send + 'static) {
+        if let Ok(thread) = thread::Builder::new().name(name.to_string()).spawn(f) {
+            lock(&self.threads).push(thread);
+        }
+    }
+}
+
+impl MockSocks5 {
+    /// Starts a proxy on an ephemeral 127.0.0.1 port that answers every CONNECT with
+    /// `reply`.
+    pub fn start(reply: u8) -> io::Result<Self> {
+        Self::start_on(SocketAddr::from(([127, 0, 0, 1], 0)), reply)
+    }
+
+    /// Starts a proxy listening on `addr`, such as a non-loopback interface.
+    pub fn start_on(addr: SocketAddr, reply: u8) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        let addr = listener.local_addr()?;
+        let shared = Arc::new(SocksShared {
+            reply,
+            stopping: AtomicBool::new(false),
+            connects: Mutex::new(Vec::new()),
+            streams: Mutex::new(Vec::new()),
+            threads: Mutex::new(Vec::new()),
+        });
+        let accept_shared = Arc::clone(&shared);
+        let acceptor = thread::Builder::new()
+            .name("mock-socks-accept".to_string())
+            .spawn(move || socks_accept_loop(&listener, &accept_shared))?;
+        Ok(Self {
+            addr,
+            shared,
+            acceptor: Some(acceptor),
+        })
+    }
+
+    /// The address it listens on.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Every CONNECT so far, in arrival order, recorded before it was answered.
+    pub fn connects(&self) -> Vec<SocksConnect> {
+        lock(&self.shared.connects).clone()
+    }
+}
+
+impl Drop for MockSocks5 {
+    fn drop(&mut self) {
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+        loop {
+            for stream in lock(&self.shared.streams).drain(..) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            let threads: Vec<_> = lock(&self.shared.threads).drain(..).collect();
+            if threads.is_empty() {
+                break;
+            }
+            for thread in threads {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl fmt::Debug for MockSocks5 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockSocks5")
+            .field("addr", &self.addr)
+            .field("reply", &self.shared.reply)
+            .finish_non_exhaustive()
+    }
+}
+
+fn socks_accept_loop(listener: &TcpListener, shared: &Arc<SocksShared>) {
+    for stream in listener.incoming() {
+        if shared.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(stream) = stream else {
+            continue;
+        };
+        shared.track(&stream);
+        let conn_shared = Arc::clone(shared);
+        shared.spawn("mock-socks-conn", move || {
+            let _ = socks_serve(stream, &conn_shared);
+        });
+    }
+}
+
+fn read_exact_vec(stream: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0; n];
+    stream.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_string(stream: &mut TcpStream) -> io::Result<String> {
+    let len = read_exact_vec(stream, 1)?[0];
+    let bytes = read_exact_vec(stream, usize::from(len))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn socks_serve(mut client: TcpStream, shared: &Arc<SocksShared>) -> io::Result<()> {
+    client.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let head = read_exact_vec(&mut client, 2)?;
+    let methods = read_exact_vec(&mut client, usize::from(head[1]))?;
+    let method = if methods.contains(&2) {
+        2
+    } else if methods.contains(&0) {
+        0
+    } else {
+        0xFF
+    };
+    client.write_all(&[5, method])?;
+    if method == 0xFF {
+        return Ok(());
+    }
+    let (mut username, mut password) = (None, None);
+    if method == 2 {
+        let _version = read_exact_vec(&mut client, 1)?;
+        let user = read_string(&mut client)?;
+        let pass = read_string(&mut client)?;
+        username = Some(user);
+        password = Some(pass);
+        client.write_all(&[1, 0])?;
+    }
+    let request = read_exact_vec(&mut client, 4)?;
+    let atyp = request[3];
+    let host = match atyp {
+        1 => {
+            Ipv4Addr::from(<[u8; 4]>::try_from(read_exact_vec(&mut client, 4)?).unwrap_or_default())
+                .to_string()
+        }
+        4 => Ipv6Addr::from(
+            <[u8; 16]>::try_from(read_exact_vec(&mut client, 16)?).unwrap_or_default(),
+        )
+        .to_string(),
+        _ => read_string(&mut client)?,
+    };
+    let port_bytes = read_exact_vec(&mut client, 2)?;
+    let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+    lock(&shared.connects).push(SocksConnect {
+        atyp,
+        host: host.clone(),
+        port,
+        username,
+        password,
+    });
+
+    let mut reply = shared.reply;
+    let mut upstream = None;
+    if reply == 0 {
+        let target = match host.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => (host.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+                .unwrap_or_default(),
+        };
+        upstream = target
+            .iter()
+            .find_map(|addr| TcpStream::connect_timeout(addr, Duration::from_secs(5)).ok());
+        if upstream.is_none() {
+            reply = 5;
+        }
+    }
+    client.write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0])?;
+    let Some(upstream) = upstream else {
+        return Ok(());
+    };
+    client.set_read_timeout(None)?;
+    shared.track(&upstream);
+    let (mut from_client, mut to_upstream) = (client.try_clone()?, upstream.try_clone()?);
+    let (mut from_upstream, mut to_client) = (upstream, client);
+    shared.spawn("mock-socks-relay", move || {
+        let _ = io::copy(&mut from_upstream, &mut to_client);
+        let _ = to_client.shutdown(Shutdown::Both);
+    });
+    let _ = io::copy(&mut from_client, &mut to_upstream);
+    let _ = to_upstream.shutdown(Shutdown::Both);
+    Ok(())
 }
