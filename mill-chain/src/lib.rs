@@ -13,8 +13,14 @@
 
 pub use bitcoin;
 
+mod client;
+mod engine;
 mod error;
+#[cfg_attr(not(feature = "testing"), allow(dead_code))]
+mod proto;
 mod types;
 
+pub use client::{ChainClient, ChainConfig, ChainHandle, MillChain};
+pub use engine::{ClientStats, EngineOptions};
 pub use error::ChainError;
 pub use types::{BackendHealth, ChainEvent, FeeRate, HistoryItem, Tip, TxStatus, Utxo};
