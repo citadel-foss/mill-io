@@ -28,7 +28,8 @@ const LOOP_GRACE: Duration = Duration::from_secs(1);
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ChainConfig {
-    /// Line-delimited JSON-RPC over plain TCP, the protocol of the test server.
+    /// Line-delimited JSON-RPC over plain TCP, as [`MockServer`](crate::testing::MockServer)
+    /// speaks it.
     #[cfg(feature = "testing")]
     RawLineJsonRpc {
         /// The server's address.
@@ -154,6 +155,11 @@ impl ChainClient {
     /// Fails with [`ChainError::WouldDeadlock`] on the loop thread itself.
     pub fn shutdown(self) -> Result<(), ChainError> {
         self.inner.shutdown()
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn engine(&self) -> &Arc<Engine> {
+        &self.inner.engine
     }
 }
 
