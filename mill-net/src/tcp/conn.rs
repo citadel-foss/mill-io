@@ -7,7 +7,7 @@
 use super::{ConnectionId, NetworkHandler, ServerContext};
 use crate::errors::{NetworkError, NetworkEvent};
 use lock_freedom::map::Map as LockfreeMap;
-use mill_io::{EventHandler, EventLoop, ObjectPool, PooledObject};
+use mill_io::{EventHandler, EventLoop, ObjectPool, PooledObject, TimerId};
 use mio::event::Event;
 use mio::net::TcpStream;
 use mio::Token;
@@ -17,6 +17,7 @@ use std::fmt;
 use std::io::{self, IoSlice, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 
 /// Most bytes one readable event reads before the rest is re-posted to the loop.
 pub const MAX_READ_PER_EVENT: usize = 64 * 1024;
@@ -271,12 +272,8 @@ impl WriteState {
     }
 }
 
-/// A socket that is still connecting reports `NotConnected` until it is writable.
 fn is_would_block(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::NotConnected
-    )
+    e.kind() == io::ErrorKind::WouldBlock
 }
 
 /// What one read pass ended on.
@@ -374,6 +371,10 @@ pub(crate) struct Conn<H: NetworkHandler> {
     closed: AtomicBool,
     /// `on_connect` has run, so `on_disconnect` is owed.
     connected: AtomicBool,
+    /// An outbound connect that has not completed yet.
+    connecting: AtomicBool,
+    connect_timer: Mutex<Option<TimerId>>,
+    connect_opts: Mutex<Option<ConnectOpts>>,
     shared: Weak<Shared<H>>,
     me: Weak<Self>,
 }
@@ -384,7 +385,7 @@ impl<H: NetworkHandler> Conn<H> {
         stream: TcpStream,
         shared: Weak<Shared<H>>,
         marks: Watermarks,
-        can_write: bool,
+        connecting: bool,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             id,
@@ -395,7 +396,7 @@ impl<H: NetworkHandler> Conn<H> {
                 queue: VecDeque::new(),
                 offset: 0,
                 queued: 0,
-                can_write,
+                can_write: !connecting,
                 backpressured: false,
             }),
             marks,
@@ -403,6 +404,9 @@ impl<H: NetworkHandler> Conn<H> {
             reads_paused: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             connected: AtomicBool::new(false),
+            connecting: AtomicBool::new(connecting),
+            connect_timer: Mutex::new(None),
+            connect_opts: Mutex::new(None),
             shared,
             me: me.clone(),
         })
@@ -464,6 +468,9 @@ impl<H: NetworkHandler> Conn<H> {
         self.write.lock().clear();
 
         let shared = self.shared.upgrade();
+        if let Some(event_loop) = shared.as_ref().and_then(|s| s.event_loop()) {
+            self.cancel_connect_timer(&event_loop);
+        }
         let socket = {
             let mut stream = self.stream.write();
             let socket = stream.take();
@@ -495,6 +502,107 @@ impl<H: NetworkHandler> Conn<H> {
             let _ = shared
                 .handler
                 .on_event(&shared.ctx, NetworkEvent::ConnectionClosed(self.id));
+        }
+    }
+
+    /// Starts the connect deadline. Call before registering, so a connect that completes
+    /// at once finds the timer to cancel.
+    pub(crate) fn arm_connect_timer(this: &Arc<Self>, event_loop: &EventLoop, timeout: Duration) {
+        let conn = Arc::downgrade(this);
+        let id = event_loop.schedule_once(timeout, move || {
+            if let Some(conn) = conn.upgrade() {
+                conn.connect_failed(io::ErrorKind::TimedOut.into());
+            }
+        });
+        *this.connect_timer.lock() = Some(id);
+    }
+
+    fn cancel_connect_timer(&self, event_loop: &EventLoop) {
+        if let Some(id) = self.connect_timer.lock().take() {
+            event_loop.cancel_timer(id);
+        }
+    }
+
+    /// Ends a pending connect with `error`: `on_error`, and neither `on_connect` nor
+    /// `on_disconnect`.
+    fn connect_failed(&self, error: io::Error) {
+        if self
+            .connecting
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        // Closed before reporting, so a handler that sees the error gets `Closed` from
+        // its next send.
+        self.shutdown(false);
+        if let Some(shared) = self.shared.upgrade() {
+            shared.report(Some(self.id), NetworkError::Connect(Box::new(error)));
+        }
+    }
+
+    /// Checks a pending connect on a readiness event. Under edge triggering the first
+    /// writable (or error) event is the only signal that the handshake finished.
+    fn poll_connect(this: &Arc<Self>, event: &Event) {
+        // kqueue reports a failed connect as EV_EOF, and `peer_addr` then says
+        // NotConnected just as it does mid-handshake, so the event decides.
+        let closed = event.is_error() || event.is_read_closed() || event.is_write_closed();
+        let outcome = this.with_stream(|stream| match stream.take_error() {
+            Ok(Some(e)) | Err(e) => Err(e),
+            Ok(None) => match stream.peer_addr() {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotConnected && closed => {
+                    Err(connect_error(stream))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(false),
+                Err(e) => Err(e),
+            },
+        });
+        match outcome {
+            None | Some(Ok(false)) => {}
+            Some(Err(e)) => this.connect_failed(e),
+            Some(Ok(true)) => Self::connected(this),
+        }
+    }
+
+    fn connected(this: &Arc<Self>) {
+        if this
+            .connecting
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let Some(shared) = this.shared.upgrade() else {
+            return;
+        };
+        if let Some(event_loop) = shared.event_loop() {
+            this.cancel_connect_timer(&event_loop);
+        }
+        this.apply_connect_opts(&shared);
+        this.write.lock().can_write = true;
+        if !this.connect_handler(&shared) {
+            return;
+        }
+        Self::flush(this, true);
+        Self::handle_read(this);
+    }
+
+    /// Socket options for a client, applied once its connect has completed: macOS fails
+    /// them with EINVAL on a socket whose connect was already refused.
+    pub(crate) fn set_connect_opts(&self, opts: ConnectOpts) {
+        *self.connect_opts.lock() = Some(opts);
+    }
+
+    fn apply_connect_opts(&self, shared: &Shared<H>) {
+        let Some(opts) = self.connect_opts.lock().take() else {
+            return;
+        };
+        if let Err(e) = self.set_nodelay(opts.nodelay) {
+            shared.report(
+                Some(self.id),
+                NetworkError::Configuration(format!("Failed to set TCP_NODELAY: {}", e)),
+            );
         }
     }
 
@@ -706,6 +814,19 @@ impl<H: NetworkHandler> Conn<H> {
     }
 }
 
+/// Client socket options that wait for the connect to complete.
+pub(crate) struct ConnectOpts {
+    pub(crate) nodelay: bool,
+}
+
+/// The error behind a connect that ended in EOF without `SO_ERROR` set.
+fn connect_error(mut stream: &TcpStream) -> io::Error {
+    match stream.read(&mut [0u8; 1]) {
+        Err(e) if e.kind() != io::ErrorKind::WouldBlock => e,
+        _ => io::ErrorKind::ConnectionRefused.into(),
+    }
+}
+
 /// Writes as much of `frame` as the socket takes now; returns how much that was.
 fn write_now(mut stream: &TcpStream, frame: &[u8]) -> io::Result<usize> {
     let mut written = 0;
@@ -762,6 +883,10 @@ struct ConnEvents<H: NetworkHandler>(Arc<Conn<H>>);
 
 impl<H: NetworkHandler> EventHandler for ConnEvents<H> {
     fn handle_event(&self, event: &Event) {
+        if self.0.connecting.load(Ordering::SeqCst) {
+            Conn::poll_connect(&self.0, event);
+            return;
+        }
         if event.is_readable() {
             Conn::handle_read(&self.0);
         }
