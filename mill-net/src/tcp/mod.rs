@@ -294,14 +294,14 @@ impl<H: NetworkHandler> ListenerEvents<H> {
             return;
         };
 
+        let conn_id = next_conn_id();
         if let Err(e) = stream.set_nodelay(self.config.no_delay) {
             shared.report(
-                None,
+                Some(conn_id),
                 NetworkError::Configuration(format!("Failed to set TCP_NODELAY: {}", e)),
             );
         }
 
-        let conn_id = next_conn_id();
         let marks = Watermarks {
             high: self.config.high_watermark,
             low: self.config.low_watermark,
@@ -309,7 +309,7 @@ impl<H: NetworkHandler> ListenerEvents<H> {
         if let Some(idle) = self.config.keep_alive {
             if let Err(e) = sockopt::set_keepalive(&stream, Some(idle)) {
                 shared.report(
-                    None,
+                    Some(conn_id),
                     NetworkError::Configuration(format!("Failed to set SO_KEEPALIVE: {}", e)),
                 );
             }

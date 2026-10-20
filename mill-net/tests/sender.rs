@@ -273,10 +273,12 @@ struct Lifecycle {
     misbehaved: Arc<AtomicUsize>,
     errors: Arc<Mutex<Vec<Option<ConnectionId>>>>,
     received: Arc<AtomicUsize>,
+    ids: Arc<Mutex<Vec<ConnectionId>>>,
 }
 
 impl NetworkHandler for Lifecycle {
-    fn on_connect(&self, _ctx: &ServerContext, _conn: ConnectionId) -> Result<()> {
+    fn on_connect(&self, _ctx: &ServerContext, conn: ConnectionId) -> Result<()> {
+        self.ids.lock().push(conn);
         self.connects.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -506,6 +508,35 @@ fn reset_mid_frame_is_an_error() {
 
         stop_loop(&event_loop, runner);
         drop((proxy, server));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn accepted_socket_option_errors_name_the_connection() {
+    for (mode, event_loop) in pool_and_direct() {
+        let handler = Lifecycle::default();
+        let (ids, errors) = (Arc::clone(&handler.ids), Arc::clone(&handler.errors));
+        let config = TcpServerConfig::builder()
+            .address("127.0.0.1:0".parse().unwrap())
+            // Linux rejects a TCP_KEEPIDLE above 32767 s, so every accept fails this option.
+            .keep_alive(Some(Duration::MAX))
+            .build();
+        let server = Arc::new(TcpServer::new(config, handler).unwrap());
+        Arc::clone(&server)
+            .start(&event_loop, event_loop.alloc_token())
+            .unwrap();
+        let runner = spawn_loop(&event_loop);
+
+        let _peer = std::net::TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || ids.lock().len() == 1),
+            "{mode}"
+        );
+        let id = ids.lock()[0];
+        assert_eq!(*errors.lock(), vec![Some(id)], "{mode}");
+
+        stop_loop(&event_loop, runner);
     }
 }
 
