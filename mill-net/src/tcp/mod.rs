@@ -54,6 +54,7 @@
 
 pub mod config;
 mod conn;
+mod sockopt;
 pub mod traits;
 
 pub use config::{TcpClientConfig, TcpServerConfig};
@@ -112,9 +113,14 @@ impl ServerContext {
 }
 
 /// High-level TCP server
+///
+/// A started server runs until [`stop`](Self::stop), or until its event loop is gone;
+/// dropping the handle passed to [`start`](Self::start) does not stop it.
 pub struct TcpServer<H: NetworkHandler> {
     shared: Arc<Shared<H>>,
-    listener: Arc<Mutex<TcpListener>>,
+    listener: Arc<Mutex<Option<TcpListener>>>,
+    listener_token: Mutex<Option<Token>>,
+    local_addr: SocketAddr,
     config: TcpServerConfig,
 }
 
@@ -126,14 +132,16 @@ impl<H: NetworkHandler> TcpServer<H> {
 
         Ok(Self {
             shared,
-            listener: Arc::new(Mutex::new(listener)),
+            local_addr: listener.local_addr()?,
+            listener: Arc::new(Mutex::new(Some(listener))),
+            listener_token: Mutex::new(None),
             config,
         })
     }
 
     /// Get the local address the server is bound to
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.listener.lock().local_addr()?)
+        Ok(self.local_addr)
     }
 
     /// Start the server by registering with the event loop
@@ -150,13 +158,47 @@ impl<H: NetworkHandler> TcpServer<H> {
             config: self.config.clone(),
         };
 
+        let mut listener = self.listener.lock();
+        let Some(listener) = listener.as_mut() else {
+            return Err(Box::new(NetworkError::Configuration(
+                "server was stopped".to_string(),
+            )));
+        };
         event_loop.register(
-            &mut *self.listener.lock(),
+            listener,
             listener_token,
             Interest::READABLE,
             listener_handler,
         )?;
+        *self.listener_token.lock() = Some(listener_token);
 
+        Ok(())
+    }
+
+    /// Stops accepting, closes the listening socket, and closes every connection, firing
+    /// `on_disconnect` for each. Later calls do nothing.
+    pub fn stop(&self) -> Result<()> {
+        // Set before the connections are collected; `accept` checks it after inserting,
+        // so a connection accepted concurrently is closed by one side or the other.
+        self.shared.stopped.store(true, Ordering::SeqCst);
+
+        let listener = self.listener.lock().take();
+        let token = self.listener_token.lock().take();
+        if let (Some(mut listener), Some(token)) = (listener, token) {
+            if let Some(event_loop) = self.shared.event_loop() {
+                let _ = event_loop.deregister(&mut listener, token);
+            }
+        }
+
+        let conns: Vec<_> = self
+            .shared
+            .conns
+            .iter()
+            .map(|entry| entry.val().clone())
+            .collect();
+        for conn in conns {
+            conn.shutdown(true);
+        }
         Ok(())
     }
 
@@ -169,7 +211,7 @@ impl<H: NetworkHandler> TcpServer<H> {
 /// Registered with the loop for the listening socket.
 struct ListenerEvents<H: NetworkHandler> {
     shared: Arc<Shared<H>>,
-    listener: Arc<Mutex<TcpListener>>,
+    listener: Arc<Mutex<Option<TcpListener>>>,
     config: TcpServerConfig,
 }
 
@@ -180,7 +222,10 @@ impl<H: NetworkHandler> EventHandler for ListenerEvents<H> {
         }
 
         loop {
-            let accepted = self.listener.lock().accept();
+            let accepted = match self.listener.lock().as_ref() {
+                Some(listener) => listener.accept(),
+                None => return,
+            };
             match accepted {
                 Ok((stream, peer_addr)) => self.accept(stream, peer_addr),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -242,8 +287,21 @@ impl<H: NetworkHandler> ListenerEvents<H> {
             high: self.config.high_watermark,
             low: self.config.low_watermark,
         };
+        if let Some(idle) = self.config.keep_alive {
+            if let Err(e) = sockopt::set_keepalive(&stream, Some(idle)) {
+                shared.report(
+                    None,
+                    NetworkError::Configuration(format!("Failed to set SO_KEEPALIVE: {}", e)),
+                );
+            }
+        }
+
         let conn = Conn::new(conn_id, stream, Arc::downgrade(shared), marks, false);
         shared.conns.insert(conn_id, conn.clone());
+        if shared.stopped.load(Ordering::SeqCst) {
+            conn.shutdown(false);
+            return;
+        }
 
         let _ = shared.handler.on_event(
             &shared.ctx,
@@ -269,6 +327,8 @@ impl<H: NetworkHandler> ListenerEvents<H> {
 }
 
 /// High-level TCP client: one outbound connection.
+///
+/// Dropping it closes the connection, as [`disconnect`](Self::disconnect) does.
 pub struct TcpClient<H: NetworkHandler> {
     shared: Arc<Shared<H>>,
     conn: Arc<Conn<H>>,
@@ -311,6 +371,7 @@ impl<H: NetworkHandler> TcpClient<H> {
 
         self.conn.set_connect_opts(ConnectOpts {
             nodelay: self.config.nodelay,
+            keep_alive: self.config.keep_alive,
         });
         Conn::arm_connect_timer(&self.conn, event_loop, self.config.connect_timeout);
         let token = event_loop.alloc_token();
@@ -346,6 +407,12 @@ impl<H: NetworkHandler> TcpClient<H> {
     pub fn disconnect(&self) -> Result<()> {
         self.conn.shutdown(true);
         Ok(())
+    }
+}
+
+impl<H: NetworkHandler> Drop for TcpClient<H> {
+    fn drop(&mut self) {
+        self.conn.shutdown(true);
     }
 }
 
@@ -487,5 +554,65 @@ mod tests {
         assert_eq!(*data, msg);
 
         event_loop.stop();
+    }
+
+    #[test]
+    fn nodelay_is_set_on_clients_and_accepted_connections() {
+        for event_loop in [
+            Arc::new(EventLoop::new(2, 1024, 10).unwrap()),
+            Arc::new(EventLoop::new_low_latency(1024, 10).unwrap()),
+        ] {
+            let connected = Arc::new((Mutex::new(0), Condvar::new()));
+            let on_connect = |connected: &Arc<(Mutex<i32>, Condvar)>| {
+                let connected = Arc::clone(connected);
+                move || {
+                    let (count, cvar) = &*connected;
+                    *count.lock().unwrap() += 1;
+                    cvar.notify_all();
+                }
+            };
+            let config = TcpServerConfig::builder()
+                .address("127.0.0.1:0".parse().unwrap())
+                .build();
+            let server = Arc::new(
+                TcpServer::new(
+                    config,
+                    TestHandler::new().with_on_connect(on_connect(&connected)),
+                )
+                .unwrap(),
+            );
+            Arc::clone(&server)
+                .start(&event_loop, event_loop.alloc_token())
+                .unwrap();
+            let mut client = TcpClient::connect(
+                server.local_addr().unwrap(),
+                TcpClientConfig::default(),
+                TestHandler::new().with_on_connect(on_connect(&connected)),
+            )
+            .unwrap();
+            client.start(&event_loop).unwrap();
+            let el = Arc::clone(&event_loop);
+            let runner = thread::spawn(move || el.run().unwrap());
+
+            let (count, cvar) = &*connected;
+            let guard = cvar
+                .wait_timeout_while(count.lock().unwrap(), Duration::from_secs(5), |n| *n < 2)
+                .unwrap()
+                .0;
+            assert_eq!(*guard, 2, "client and server did not both connect");
+            drop(guard);
+
+            assert_eq!(client.conn.nodelay(), Some(true), "client");
+            let accepted: Vec<_> = server
+                .shared
+                .conns
+                .iter()
+                .map(|e| e.val().nodelay())
+                .collect();
+            assert_eq!(accepted, vec![Some(true)], "accepted connection");
+
+            event_loop.stop();
+            runner.join().unwrap();
+        }
     }
 }

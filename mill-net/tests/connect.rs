@@ -56,32 +56,15 @@ impl NetworkHandler for Recorder {
 }
 
 #[cfg(unix)]
-mod backlog {
-    use std::net::TcpListener;
-    use std::os::raw::c_int;
-    use std::os::unix::io::AsRawFd;
-
-    extern "C" {
-        fn listen(socket: c_int, backlog: c_int) -> c_int;
-    }
-
-    /// Calling `listen` again on a listening socket changes its backlog. 1, not 0: some
-    /// systems read 0 as "the default".
-    pub fn shrink_to_one(listener: &TcpListener) {
-        // SAFETY: the fd belongs to `listener`, which is open for the whole call.
-        let rc = unsafe { listen(listener.as_raw_fd(), 1) };
-        assert_eq!(rc, 0, "listen(fd, 1) failed");
-    }
-}
-
-#[cfg(unix)]
 #[test]
 fn connect_timeout_is_enforced() {
     use std::net::TcpStream;
 
     for (mode, event_loop) in pool_and_direct() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        backlog::shrink_to_one(&listener);
+        // Calling `listen` again on a listening socket changes its backlog. 1, not 0: some
+        // systems read 0 as "the default".
+        socket2::SockRef::from(&listener).listen(1).unwrap();
         let addr = listener.local_addr().unwrap();
         // Fill the queue until the kernel starts dropping SYNs, however it counts the
         // backlog; then the client's SYN is dropped too.

@@ -138,6 +138,8 @@ pub(crate) struct Shared<H: NetworkHandler> {
     pub(crate) ctx: ServerContext,
     pub(crate) conns: LockfreeMap<ConnectionId, Arc<Conn<H>>>,
     pub(crate) count: AtomicUsize,
+    /// Set by `TcpServer::stop`; no connection may be added after it.
+    pub(crate) stopped: AtomicBool,
     pub(crate) buffer_pool: ObjectPool<Vec<u8>>,
     pub(crate) event_loop: OnceLock<Weak<EventLoop>>,
 }
@@ -151,6 +153,7 @@ impl<H: NetworkHandler> Shared<H> {
                 ctx: ServerContext { ops },
                 conns: LockfreeMap::new(),
                 count: AtomicUsize::new(0),
+                stopped: AtomicBool::new(false),
                 buffer_pool,
                 event_loop: OnceLock::new(),
             }
@@ -604,6 +607,14 @@ impl<H: NetworkHandler> Conn<H> {
                 NetworkError::Configuration(format!("Failed to set TCP_NODELAY: {}", e)),
             );
         }
+        if let Some(idle) = opts.keep_alive {
+            if let Err(e) = self.set_keepalive(idle) {
+                shared.report(
+                    Some(self.id),
+                    NetworkError::Configuration(format!("Failed to set SO_KEEPALIVE: {}", e)),
+                );
+            }
+        }
     }
 
     fn fail(&self, error: io::Error) {
@@ -613,9 +624,19 @@ impl<H: NetworkHandler> Conn<H> {
         self.shutdown(true);
     }
 
+    pub(crate) fn set_keepalive(&self, idle: Duration) -> io::Result<()> {
+        self.with_stream(|stream| super::sockopt::set_keepalive(stream, Some(idle)))
+            .unwrap_or(Ok(()))
+    }
+
     pub(crate) fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.with_stream(|stream| stream.set_nodelay(nodelay))
             .unwrap_or(Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn nodelay(&self) -> Option<bool> {
+        self.with_stream(|stream| stream.nodelay().ok()).flatten()
     }
 
     fn with_stream<T>(&self, f: impl FnOnce(&TcpStream) -> T) -> Option<T> {
@@ -817,6 +838,7 @@ impl<H: NetworkHandler> Conn<H> {
 /// Client socket options that wait for the connect to complete.
 pub(crate) struct ConnectOpts {
     pub(crate) nodelay: bool,
+    pub(crate) keep_alive: Option<Duration>,
 }
 
 /// The error behind a connect that ended in EOF without `SO_ERROR` set.

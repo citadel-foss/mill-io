@@ -113,3 +113,59 @@ fn server_reads_4mb_without_followup() {
         drop(peer);
     }
 }
+
+#[derive(Clone, Default)]
+struct ChunkSizes {
+    largest: Arc<Mutex<usize>>,
+    total: Arc<Mutex<usize>>,
+}
+
+impl NetworkHandler for ChunkSizes {
+    fn on_data(&self, _ctx: &ServerContext, _conn: ConnectionId, data: &[u8]) -> Result<()> {
+        let mut largest = self.largest.lock();
+        *largest = (*largest).max(data.len());
+        *self.total.lock() += data.len();
+        Ok(())
+    }
+}
+
+#[test]
+fn buffer_size_sets_the_read_chunk() {
+    for buffer_size in [1024, 32 * 1024] {
+        let event_loop = Arc::new(mill_io::EventLoop::new(2, 1024, 10).unwrap());
+        let sizes = ChunkSizes::default();
+        let (largest, total) = (Arc::clone(&sizes.largest), Arc::clone(&sizes.total));
+        let config = TcpServerConfig::builder()
+            .address("127.0.0.1:0".parse().unwrap())
+            .buffer_size(buffer_size)
+            .build();
+        let server = Arc::new(TcpServer::new(config, sizes).unwrap());
+        let addr = server.local_addr().unwrap();
+        Arc::clone(&server)
+            .start(&event_loop, event_loop.alloc_token())
+            .unwrap();
+        let runner = spawn_loop(&event_loop);
+
+        let writer = thread::spawn(move || {
+            let mut peer = TcpStream::connect(addr).unwrap();
+            peer.write_all(&message()).unwrap();
+            peer
+        });
+        assert!(wait_until(Duration::from_secs(5), || *total.lock() == MESSAGE_LEN));
+        let largest = *largest.lock();
+        assert!(
+            largest <= buffer_size,
+            "a {largest}-byte chunk with buffer_size {buffer_size}"
+        );
+        if buffer_size > 8192 {
+            assert!(
+                largest > 8192,
+                "buffer_size {buffer_size} still read at most {largest} bytes at a time"
+            );
+        }
+
+        let peer = writer.join().unwrap();
+        stop_loop(&event_loop, runner);
+        drop((peer, server));
+    }
+}
