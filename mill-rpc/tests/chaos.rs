@@ -3,7 +3,7 @@ use mill_net::testing::{ChaosConfig, ChaosProxy};
 use mill_rpc::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -45,17 +45,14 @@ struct Harness {
 impl Harness {
     fn start() -> Self {
         let event_loop = Arc::new(EventLoop::new(4, 1024, 10).unwrap());
-        let addr = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
         let service = BytesImpl::default();
         let calls = Arc::clone(&service.calls);
         let server = RpcServer::builder()
-            .bind(addr)
+            .bind("127.0.0.1:0".parse().unwrap())
             .service(bytes::server(service))
             .build(&event_loop)
             .unwrap();
+        let addr = server.local_addr().unwrap();
         let runner = {
             let event_loop = Arc::clone(&event_loop);
             thread::spawn(move || event_loop.run().unwrap())

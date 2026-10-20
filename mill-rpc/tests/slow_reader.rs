@@ -3,7 +3,7 @@ use mill_rpc::prelude::*;
 use mill_rpc::{Frame, FrameHeader};
 use mill_rpc_core::protocol::HEADER_SIZE;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
@@ -62,16 +62,13 @@ impl Harness {
         service: impl FnOnce(&Arc<EventLoop>) -> S,
     ) -> Self {
         let event_loop = Arc::new(EventLoop::new(4, 1024, 10).unwrap());
-        let addr = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
         let server = RpcServer::builder()
-            .bind(addr)
+            .bind("127.0.0.1:0".parse().unwrap())
             .slow_reader_timeout(slow_reader_timeout)
             .service(bytes::server(service(&event_loop)))
             .build(&event_loop)
             .unwrap();
+        let addr = server.local_addr().unwrap();
         let runner = {
             let event_loop = Arc::clone(&event_loop);
             thread::spawn(move || event_loop.run().unwrap())

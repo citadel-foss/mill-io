@@ -25,13 +25,18 @@ struct RegisteredService {
 
 /// RPC Server that hosts one or more services.
 pub struct RpcServer {
-    _tcp_server: Arc<TcpServer<RpcServerHandler>>,
+    tcp_server: Arc<TcpServer<RpcServerHandler>>,
 }
 
 impl RpcServer {
     /// Create a builder for configuring the RPC server.
     pub fn builder() -> RpcServerBuilder {
         RpcServerBuilder::new()
+    }
+
+    /// The address the server is listening on, with the real port when it bound port 0.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.tcp_server.local_addr()
     }
 }
 
@@ -136,11 +141,9 @@ impl RpcServerBuilder {
             .clone()
             .start(event_loop, event_loop.alloc_token())?;
 
-        log::info!("Mill-RPC server listening on {}", addr);
+        log::info!("Mill-RPC server listening on {}", tcp_server.local_addr()?);
 
-        Ok(RpcServer {
-            _tcp_server: tcp_server,
-        })
+        Ok(RpcServer { tcp_server })
     }
 }
 
