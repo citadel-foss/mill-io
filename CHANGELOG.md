@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-10-20
+
+### Breaking
+
+- **mill-io**: `register()` rejects `Token(0)`, which is now reserved for the waker; take tokens from `EventLoop::alloc_token()` (#103)
+- **mill-io**: `stop()` is sticky and never panics: a stop called before `run()` makes that `run()` return at once, and each stop is consumed by one `run()` (#104)
+- **mill-net**: `TcpClient::connect` takes a `TcpClientConfig`, `TcpClient::start` allocates its own token, and `on_connect` fires only once the handshake completes (#110, #111)
+- **mill-net**: Sends go through a per-connection write queue and can fail with `NetworkError::Send(SendError::Backpressure)` above the high watermark (#110)
+- **mill-net**: Dropping a `TcpClient` closes its connection; a started `TcpServer` runs until `TcpServer::stop` (#112)
+- **mill-rpc**: Pending calls fail when the connection drops instead of waiting out their timeout (#114)
+
+### Added
+
+- **mill-io**: Timer wheel with `schedule_once`, `schedule_repeating`, `cancel_timer` and `pending_timers` (#86)
+- **mill-io**: `EventLoop::post()`, `is_reactor_thread()` and `reregister()` (#104)
+- **mill-io**: `EventLoop::handler_panics()` and `EventLoop::timer_panics()` count caught panics (#101, #107)
+- **mill-net**: `ConnSender` sends, closes and pauses reads from any thread, with `on_drained`, `pause_reads` and `resume_reads` (#110)
+- **mill-net**: Configurable high and low watermarks on `TcpServerConfig` and `TcpClientConfig` (#110)
+- **mill-net**: `TcpClientConfig::connect_timeout`, reported through `on_error` (#111)
+- **mill-net**: `TcpServer::stop` (#112)
+- **mill-net**: `Layer` trait for handshakes and byte transforms, added with `with_layer` (#113)
+- **mill-net**: `testing::ChaosProxy`, behind the `testing` feature, splits, throttles, stalls and resets TCP streams (#93, #94)
+- **mill-rpc**: `slow_reader_timeout`: replies to a slow reader wait for `on_drained`, and the connection closes after the timeout (#114)
+- CI enforces the MSRV, 1.74 (#88)
+
+### Fixed
+
+- **mill-io**: Timer deadlines saturate instead of wrapping, and zero-interval repeating timers no longer spin the reactor (#89, #90)
+- **mill-io**: Panics in timer callbacks and event handlers are caught and counted instead of killing the reactor or a worker (#91, #101)
+- **mill-io**: Compute pool shutdown no longer hangs in `drop`, and queue depth metrics no longer drift (#87, #96)
+- **mill-io**: Pool mode sends all events for a token to the same worker, so a connection's events stay in order (#102)
+- **mill-net**: Reads drain until `WouldBlock`, so large messages are no longer stuck until more bytes arrive (#109)
+- **mill-net**: Large or concurrent sends no longer tear frames on `WouldBlock` (#110)
+- **mill-net**: `keep_alive` and `buffer_size` are applied, and socket options go through `socket2` with no `unsafe` (#112)
+- **mill-rpc**: Several clients can share one event loop (#105)
+- **mill-rpc**: The server frames each connection separately, so a corrupt frame closes only that connection (#114)
+
 ## [3.0.0] - 2026-03-18
 
 ### Added
