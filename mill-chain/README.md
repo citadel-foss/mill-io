@@ -43,3 +43,23 @@ Every query returns `Result<_, ChainError>`.
 - `ChainClient::shutdown` fails every pending call with `ChainError::Shutdown`, closes the
   connection, joins the loop thread and disconnects the events channel. Dropping the last
   `ChainClient` does the same.
+
+## Bitcoin Core
+
+`ChainConfig::Core` talks to bitcoind's JSON-RPC server over HTTP/1.1.
+
+- Calls share a pool of keep-alive connections, at most `CoreConfig::rpc_connections`
+  (default 4; match it to `-rpcthreads`). Each connection carries one request at a time. A
+  503 (work queue full) is resent after a short backoff until the call's deadline,
+  without using up its `retries`, since the node never ran it.
+- `call_raw` goes to `/` and `wallet_call_raw` to `/wallet/<name>`. Error objects become
+  `ChainError::Server` with their code, whatever the HTTP status: raw calls do not read
+  `-5` as `NotFound`.
+- With cookie auth the cookie is read when first needed and again on a 401, so a node
+  restart needs no reconfiguration. A 401 that a fresh cookie does not fix is
+  `ChainError::Auth`.
+- `importdescriptors` and `rescanblockchain` take a long-call lane: one connection of their
+  own, no `request_timeout` (only the handle's deadline), and never resent, not even with
+  `retries`.
+- A call that ends while its request is in flight (deadline, cancel) closes that
+  connection; bitcoind still finishes the request.

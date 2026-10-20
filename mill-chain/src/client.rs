@@ -1,7 +1,10 @@
 //! The blocking facade: [`MillChain`] starts a client, [`ChainClient`] owns it and
 //! [`ChainHandle`] makes calls.
 
-use crate::engine::{Call, ClientStats, Endpoint, Engine, EngineOptions};
+use crate::backend::core::{CoreConfig, CoreRpc};
+use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime};
+#[cfg(feature = "testing")]
+use crate::engine::{Endpoint, Engine};
 #[cfg(feature = "testing")]
 use crate::proto::line::LineJsonRpc;
 use crate::{ChainError, ChainEvent};
@@ -37,19 +40,38 @@ pub enum ChainConfig {
         /// Events held for the consumer before they are replaced by one `Resync`.
         events_capacity: usize,
     },
+    /// Bitcoin Core's JSON-RPC server over HTTP/1.1.
+    Core(CoreConfig),
 }
 
-fn endpoint(config: ChainConfig) -> Endpoint {
+impl ChainConfig {
+    fn events_capacity(&self) -> usize {
+        match self {
+            #[cfg(feature = "testing")]
+            ChainConfig::RawLineJsonRpc {
+                events_capacity, ..
+            } => *events_capacity,
+            ChainConfig::Core(_) => CoreConfig::EVENTS_CAPACITY,
+        }
+    }
+}
+
+fn runtime(
+    config: ChainConfig,
+    options: EngineOptions,
+    event_loop: Arc<EventLoop>,
+    events: EventSink,
+) -> Result<Arc<dyn Runtime>, ChainError> {
     match config {
         #[cfg(feature = "testing")]
-        ChainConfig::RawLineJsonRpc {
-            addr,
-            events_capacity,
-        } => Endpoint {
-            addr,
-            codec: Box::new(LineJsonRpc::new()),
-            events_capacity,
-        },
+        ChainConfig::RawLineJsonRpc { addr, .. } => {
+            let endpoint = Endpoint {
+                addr,
+                codec: Box::new(LineJsonRpc::new()),
+            };
+            Ok(Engine::new(endpoint, options, event_loop, events))
+        }
+        ChainConfig::Core(core) => Ok(CoreRpc::new(core, options, event_loop, events)?),
     }
 }
 
@@ -71,12 +93,11 @@ impl MillChain {
         config: ChainConfig,
         options: EngineOptions,
     ) -> Result<ChainClient, ChainError> {
-        let endpoint = endpoint(config);
         let event_loop = EventLoop::new_low_latency(EVENTS_PER_POLL, POLL_TIMEOUT_MS)
             .map(Arc::new)
             .map_err(|e| ChainError::Transport(format!("cannot create the event loop: {}", e)))?;
-        let (events_tx, events_rx) = Engine::events_channel(endpoint.events_capacity);
-        let engine = Engine::new(endpoint, options, Arc::clone(&event_loop), events_tx);
+        let (events_tx, events_rx) = EventSink::channel(config.events_capacity());
+        let engine = runtime(config, options, Arc::clone(&event_loop), events_tx)?;
 
         let loop_engine = Arc::clone(&engine);
         let spawned = thread::Builder::new()
@@ -121,7 +142,7 @@ pub struct ChainClient {
 }
 
 struct Inner {
-    engine: Arc<Engine>,
+    engine: Arc<dyn Runtime>,
     thread: Mutex<Option<JoinHandle<()>>>,
     events: Receiver<ChainEvent>,
 }
@@ -129,7 +150,7 @@ struct Inner {
 impl ChainClient {
     /// A handle with the default deadline and retries, for making calls.
     pub fn handle(&self) -> ChainHandle {
-        let options = &self.inner.engine.options;
+        let options = self.inner.engine.options();
         ChainHandle {
             engine: Arc::clone(&self.inner.engine),
             deadline: options.default_deadline,
@@ -158,7 +179,7 @@ impl ChainClient {
     }
 
     #[cfg(feature = "testing")]
-    pub(crate) fn engine(&self) -> &Arc<Engine> {
+    pub(crate) fn engine(&self) -> &Arc<dyn Runtime> {
         &self.inner.engine
     }
 }
@@ -208,7 +229,7 @@ impl fmt::Debug for ChainClient {
 /// connection, and each carries its own deadline, retries and cancel flag.
 #[derive(Clone)]
 pub struct ChainHandle {
-    engine: Arc<Engine>,
+    engine: Arc<dyn Runtime>,
     deadline: Duration,
     retries: u8,
     cancel: Option<Arc<AtomicBool>>,
@@ -241,11 +262,48 @@ impl ChainHandle {
     /// Every JSON-RPC error object becomes [`ChainError::Server`]; codes are not
     /// interpreted. Blocks until the reply, the deadline, cancellation or shutdown.
     ///
+    /// On Bitcoin Core it goes to `/`. `importdescriptors` and `rescanblockchain` take the
+    /// long-call lane: their own connection, no `request_timeout`, and never resent.
+    ///
     /// # Panics
     ///
     /// In debug builds, when called on the client's own loop thread, where release builds
     /// return [`ChainError::WouldDeadlock`].
     pub fn call_raw(&self, method: &str, params: Value) -> Result<Value, ChainError> {
+        self.call(method, params, Route::Chain)
+    }
+
+    /// Like [`call_raw`](Self::call_raw), on Bitcoin Core's wallet endpoint
+    /// `/wallet/<name>` for [`CoreConfig::wallet`].
+    ///
+    /// Fails with [`ChainError::Unsupported`] on other backends, or when no wallet is
+    /// configured.
+    pub fn wallet_call_raw(&self, method: &str, params: Value) -> Result<Value, ChainError> {
+        self.call(method, params, Route::Wallet)
+    }
+
+    /// Sends `calls` as one JSON-RPC batch to Bitcoin Core's `/` and returns one result
+    /// per call, in order, whatever order the server answered in. Treated as idempotent
+    /// for retries; a batch holding a long-lane method takes the long-call lane.
+    ///
+    /// Fails with [`ChainError::Unsupported`] on other backends.
+    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
+    pub(crate) fn batch_raw(
+        &self,
+        calls: &[(&str, Value)],
+    ) -> Result<Vec<Result<Value, ChainError>>, ChainError> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests = calls
+            .iter()
+            .map(|(method, params)| serde_json::json!({"method": method, "params": params}))
+            .collect();
+        let replies = self.call("", Value::Array(requests), Route::ChainBatch)?;
+        crate::proto::jsonrpc::split_batch_reply(replies, calls.len())
+    }
+
+    fn call(&self, method: &str, params: Value, route: Route) -> Result<Value, ChainError> {
         if self.engine.is_loop_thread() {
             if cfg!(debug_assertions) {
                 panic!("mill-chain: blocking call on the event loop thread (WouldDeadlock)");
@@ -266,6 +324,7 @@ impl ChainHandle {
         let id = self.engine.submit(Call {
             method: method.to_string(),
             params,
+            route,
             deadline,
             retries: self.retries,
             cancel: self.cancel.clone(),

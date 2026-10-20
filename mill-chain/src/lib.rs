@@ -13,7 +13,9 @@
 
 pub use bitcoin;
 
+mod backend;
 mod client;
+#[cfg_attr(not(feature = "testing"), allow(dead_code))]
 mod engine;
 mod error;
 #[cfg_attr(not(feature = "testing"), allow(dead_code))]
@@ -22,6 +24,7 @@ mod proto;
 pub mod testing;
 mod types;
 
+pub use backend::core::{CoreAuth, CoreConfig, ZmqConfig};
 pub use client::{ChainClient, ChainConfig, ChainHandle, MillChain};
 pub use engine::{ClientStats, EngineOptions};
 pub use error::ChainError;

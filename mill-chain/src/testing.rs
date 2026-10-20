@@ -1,7 +1,7 @@
-//! Test tools: a scriptable line-delimited JSON-RPC server, and hooks that run code on a
-//! client's event loop thread.
+//! Test tools: scriptable line-delimited JSON-RPC and HTTP JSON-RPC servers, and hooks that
+//! run code on a client's event loop thread.
 
-use crate::ChainClient;
+use crate::{ChainClient, ChainError, ChainHandle};
 use serde_json::{json, Value};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
@@ -369,15 +369,17 @@ pub fn on_reactor<R: Send + 'static>(c: &ChainClient, f: impl FnOnce() -> R + Se
         return f();
     }
     let (tx, rx) = crossbeam_channel::bounded(1);
-    let posted = engine.post(move || match panic::catch_unwind(AssertUnwindSafe(f)) {
-        Ok(result) => {
-            let _ = tx.send(Ok(result));
+    let posted = engine.post(Box::new(move || {
+        match panic::catch_unwind(AssertUnwindSafe(f)) {
+            Ok(result) => {
+                let _ = tx.send(Ok(result));
+            }
+            Err(payload) => {
+                let _ = tx.send(Err(panic_message(&*payload)));
+                panic::resume_unwind(payload);
+            }
         }
-        Err(payload) => {
-            let _ = tx.send(Err(panic_message(&*payload)));
-            panic::resume_unwind(payload);
-        }
-    });
+    }));
     if posted.is_err() {
         panic!("on_reactor: the client is shut down");
     }
@@ -399,11 +401,412 @@ pub fn inject_events(c: &ChainClient, n: usize) {
     }
     let (tx, rx) = crossbeam_channel::bounded(1);
     let loop_engine = Arc::clone(engine);
-    let posted = engine.post(move || {
+    let posted = engine.post(Box::new(move || {
         loop_engine.inject_events(n);
         let _ = tx.send(());
-    });
+    }));
     if posted.is_ok() {
         let _ = rx.recv();
     }
+}
+
+/// One request a [`MockHttpServer`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    /// Which connection it came on, numbered from 0 in accept order.
+    pub conn: usize,
+    /// The request target, such as `/` or `/wallet/w`.
+    pub path: String,
+    /// The headers, in order, as sent.
+    pub headers: Vec<(String, String)>,
+    /// The body.
+    pub body: Vec<u8>,
+}
+
+impl HttpRequest {
+    /// The first header named `name`, ignoring case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The body as JSON.
+    pub fn json(&self) -> Option<Value> {
+        serde_json::from_slice(&self.body).ok()
+    }
+
+    /// The JSON-RPC method of a single request.
+    pub fn method(&self) -> Option<String> {
+        self.json()?.get("method")?.as_str().map(str::to_string)
+    }
+
+    /// The user and password of a Basic `Authorization` header.
+    pub fn basic_auth(&self) -> Option<(String, String)> {
+        use base64::Engine as _;
+        let encoded = self.header("authorization")?.strip_prefix("Basic ")?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        let (user, pass) = decoded.split_once(':')?;
+        Some((user.to_string(), pass.to_string()))
+    }
+}
+
+/// What a [`MockHttpServer`] answers one request with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpReply {
+    /// The status code.
+    pub status: u16,
+    /// Extra headers. `Content-Length` or `Transfer-Encoding` is added to match the body.
+    pub headers: Vec<(String, String)>,
+    /// The body.
+    pub body: Vec<u8>,
+    /// Send the body chunked, in chunks of at most this many bytes.
+    pub chunk_size: Option<usize>,
+    /// Wait this long before answering. Other connections are served meanwhile.
+    pub delay: Duration,
+    /// Send `Connection: close` and close the connection after the reply.
+    pub close: bool,
+    /// Close the connection without answering.
+    pub drop_connection: bool,
+}
+
+impl HttpReply {
+    /// A reply with `status` and `body`, sent at once with a `Content-Length`.
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.into(),
+            chunk_size: None,
+            delay: Duration::ZERO,
+            close: false,
+            drop_connection: false,
+        }
+    }
+
+    /// A JSON body with `status`.
+    pub fn json(status: u16, body: &Value) -> Self {
+        let mut reply = Self::new(status, body.to_string());
+        reply
+            .headers
+            .push(("Content-Type".into(), "application/json".into()));
+        reply
+    }
+
+    /// A 200 JSON-RPC reply to `request` carrying `result`.
+    pub fn result(request: &HttpRequest, result: Value) -> Self {
+        let id = request_id(request);
+        Self::json(200, &json!({"result": result, "error": null, "id": id}))
+    }
+
+    /// A JSON-RPC error reply to `request`, with status 500 as Bitcoin Core sends it.
+    pub fn error(request: &HttpRequest, code: i64, message: &str) -> Self {
+        let id = request_id(request);
+        let error = json!({"code": code, "message": message});
+        Self::json(500, &json!({"result": null, "error": error, "id": id}))
+    }
+
+    /// An empty body with `status`.
+    pub fn status(status: u16) -> Self {
+        Self::new(status, Vec::new())
+    }
+
+    /// Closes the connection without answering.
+    pub fn drop_connection() -> Self {
+        Self {
+            drop_connection: true,
+            ..Self::status(0)
+        }
+    }
+
+    /// Sends the body chunked, `size` bytes at most per chunk.
+    pub fn chunked(mut self, size: usize) -> Self {
+        self.chunk_size = Some(size.max(1));
+        self
+    }
+
+    /// Answers after `delay`.
+    pub fn after(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// Closes the connection after the reply, saying so in a `Connection: close` header.
+    pub fn closing(mut self) -> Self {
+        self.close = true;
+        self
+    }
+
+    /// Adds a header.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {} Mock\r\n", self.status).into_bytes();
+        for (name, value) in &self.headers {
+            out.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
+        }
+        if self.close {
+            out.extend_from_slice(b"Connection: close\r\n");
+        }
+        match self.chunk_size {
+            None => {
+                let length = format!("Content-Length: {}\r\n\r\n", self.body.len());
+                out.extend_from_slice(length.as_bytes());
+                out.extend_from_slice(&self.body);
+            }
+            Some(size) => {
+                out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                for chunk in self.body.chunks(size) {
+                    out.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                    out.extend_from_slice(chunk);
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.extend_from_slice(b"0\r\n\r\n");
+            }
+        }
+        out
+    }
+}
+
+fn request_id(request: &HttpRequest) -> Value {
+    request
+        .json()
+        .and_then(|body| body.get("id").cloned())
+        .unwrap_or(Value::Null)
+}
+
+type HttpScriptFn = dyn Fn(&HttpRequest) -> HttpReply + Send + Sync;
+
+/// Scriptable JSON-RPC-over-HTTP/1.1 server, standing in for Bitcoin Core.
+///
+/// It listens on 127.0.0.1, accepts any number of keep-alive connections and answers
+/// the requests on each one in order. Dropping it closes every connection and joins its
+/// threads.
+pub struct MockHttpServer {
+    addr: SocketAddr,
+    shared: Arc<HttpShared>,
+    acceptor: Option<JoinHandle<()>>,
+}
+
+struct HttpShared {
+    script: Box<HttpScriptFn>,
+    stopping: Mutex<bool>,
+    stopped: Condvar,
+    requests: Mutex<Vec<HttpRequest>>,
+    conns: Mutex<Vec<Arc<TcpStream>>>,
+    accepted: AtomicU64,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl MockHttpServer {
+    /// Starts a server on an ephemeral 127.0.0.1 port. `script` runs once per request,
+    /// after the request is logged.
+    pub fn start<F>(script: F) -> io::Result<Self>
+    where
+        F: Fn(&HttpRequest) -> HttpReply + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        let addr = listener.local_addr()?;
+        let shared = Arc::new(HttpShared {
+            script: Box::new(script),
+            stopping: Mutex::new(false),
+            stopped: Condvar::new(),
+            requests: Mutex::new(Vec::new()),
+            conns: Mutex::new(Vec::new()),
+            accepted: AtomicU64::new(0),
+            workers: Mutex::new(Vec::new()),
+        });
+        let accept_shared = Arc::clone(&shared);
+        let acceptor = thread::Builder::new()
+            .name("mock-http-accept".to_string())
+            .spawn(move || http_accept_loop(&listener, &accept_shared))?;
+        Ok(Self {
+            addr,
+            shared,
+            acceptor: Some(acceptor),
+        })
+    }
+
+    /// The address it listens on.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The `rpc_url` to reach it.
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Every request so far, in arrival order.
+    pub fn requests_seen(&self) -> Vec<HttpRequest> {
+        lock(&self.shared.requests).clone()
+    }
+
+    /// Connections accepted so far.
+    pub fn connection_count(&self) -> usize {
+        self.shared.accepted.load(Ordering::SeqCst) as usize
+    }
+
+    /// Closes every open connection, dropping replies not yet sent, and keeps listening.
+    pub fn restart(&self) {
+        for conn in lock(&self.shared.conns).drain(..) {
+            let _ = conn.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for MockHttpServer {
+    fn drop(&mut self) {
+        *lock(&self.shared.stopping) = true;
+        self.shared.stopped.notify_all();
+        let _ = TcpStream::connect(self.addr);
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+        self.restart();
+        for worker in lock(&self.shared.workers).drain(..).collect::<Vec<_>>() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl fmt::Debug for MockHttpServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockHttpServer")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+fn http_accept_loop(listener: &TcpListener, shared: &Arc<HttpShared>) {
+    for stream in listener.incoming() {
+        if *lock(&shared.stopping) {
+            return;
+        }
+        let Ok(stream) = stream else {
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let stream = Arc::new(stream);
+        let conn = shared.accepted.fetch_add(1, Ordering::SeqCst) as usize;
+        lock(&shared.conns).push(Arc::clone(&stream));
+        let worker_shared = Arc::clone(shared);
+        let spawned = thread::Builder::new()
+            .name("mock-http-conn".to_string())
+            .spawn(move || http_serve(conn, &stream, &worker_shared));
+        if let Ok(worker) = spawned {
+            lock(&shared.workers).push(worker);
+        }
+    }
+}
+
+fn http_serve(conn: usize, stream: &Arc<TcpStream>, shared: &HttpShared) {
+    let mut reader = BufReader::new(&**stream);
+    while let Some(request) = read_http_request(conn, &mut reader) {
+        lock(&shared.requests).push(request.clone());
+        let reply = (shared.script)(&request);
+        if reply.drop_connection {
+            break;
+        }
+        if !reply.delay.is_zero() && wait_stopping(shared, reply.delay) {
+            break;
+        }
+        if (&**stream).write_all(&reply.to_bytes()).is_err() || reply.close {
+            break;
+        }
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    lock(&shared.conns).retain(|other| !Arc::ptr_eq(other, stream));
+}
+
+/// Waits `delay` or until the server stops; true if it stopped.
+fn wait_stopping(shared: &HttpShared, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    let mut stopping = lock(&shared.stopping);
+    while !*stopping {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        stopping = shared
+            .stopped
+            .wait_timeout(stopping, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    *stopping
+}
+
+fn read_http_request(conn: usize, reader: &mut impl BufRead) -> Option<HttpRequest> {
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let path = line.split_whitespace().nth(1)?.to_string();
+    let mut headers = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let header = line.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        let (name, value) = header.split_once(':')?;
+        headers.push((name.to_string(), value.trim().to_string()));
+    }
+    let length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0);
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).ok()?;
+    Some(HttpRequest {
+        conn,
+        path,
+        headers,
+        body,
+    })
+}
+
+/// Parses one HTTP response from `reads`, fed to mill-chain's parser one read at a time,
+/// with the connection closing after the last. Returns its status and body.
+pub fn parse_http_response<'a>(
+    reads: impl IntoIterator<Item = &'a [u8]>,
+    max_body_bytes: usize,
+) -> Result<(u16, Vec<u8>), String> {
+    let mut parser = crate::proto::http::ResponseParser::new(max_body_bytes);
+    let mut responses = Vec::new();
+    for read in reads {
+        parser
+            .push(read, &mut responses)
+            .map_err(|e| e.to_string())?;
+        if !responses.is_empty() {
+            let response = responses.swap_remove(0);
+            return Ok((response.status, response.body));
+        }
+    }
+    match parser.finish() {
+        Ok(Some(response)) => Ok((response.status, response.body)),
+        Ok(None) => Err("no response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Sends `calls` as one JSON-RPC batch through `handle`, as typed queries do, and returns
+/// one result per call in request order. Bitcoin Core only.
+pub fn batch_raw(
+    handle: &ChainHandle,
+    calls: &[(&str, Value)],
+) -> Result<Vec<Result<Value, ChainError>>, ChainError> {
+    handle.batch_raw(calls)
 }
