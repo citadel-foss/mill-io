@@ -16,7 +16,9 @@ use mill_io::EventLoop;
 
 mod common;
 
-use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
+use common::{
+    pool_and_direct, socket_report, spawn_loop, stop_loop, wait_for_progress, wait_until,
+};
 
 /// Test-only layer: each side sends a one-byte key first, then XORs what it sends with its
 /// own key and what it receives with the peer's.
@@ -158,11 +160,12 @@ fn xor_layer_round_trip() {
             }
         }
 
-        assert!(
-            wait_until(Duration::from_secs(300), || received.lock().len() >= len),
-            "{mode}: {} of {len} bytes came back",
-            received.lock().len()
-        );
+        if let Err(stall) = wait_for_progress(len, || received.lock().len()) {
+            panic!(
+                "{mode}: echoed bytes stalled: {stall}; sockets:\n{}",
+                socket_report(server.local_addr().unwrap().port())
+            );
+        }
         assert!(
             *echo.received.lock() == data,
             "{mode}: server saw other bytes"

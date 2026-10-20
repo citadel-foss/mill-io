@@ -16,7 +16,7 @@ use mill_io::EventLoop;
 
 mod common;
 
-use common::wait_until;
+use common::{socket_report, wait_for_progress, wait_until, STALL_AFTER, TRANSFER_CAP};
 
 #[derive(Default)]
 struct Drains {
@@ -134,7 +134,7 @@ fn throttled_reader_receives_10mb_intact(event_loop: &Arc<EventLoop>) {
     let data = payload(TOTAL, 0x5eed);
     let expected = Sha256::digest(&data);
     let sender = client.sender();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let started = Instant::now();
     let mut backpressured = 0;
     for chunk in data.chunks(CHUNK) {
         loop {
@@ -143,9 +143,11 @@ fn throttled_reader_receives_10mb_intact(event_loop: &Arc<EventLoop>) {
                 Ok(()) => break,
                 Err(SendError::Backpressure) => {
                     backpressured += 1;
+                    let deadline = (Instant::now() + STALL_AFTER).min(started + TRANSFER_CAP);
                     assert!(
                         drains.wait_past(seen, deadline),
-                        "on_drained never fired after a Backpressure"
+                        "on_drained never fired after a Backpressure; sockets:\n{}",
+                        socket_report(server.local_addr().unwrap().port())
                     );
                 }
                 Err(e) => panic!("send failed: {e}"),
@@ -153,11 +155,12 @@ fn throttled_reader_receives_10mb_intact(event_loop: &Arc<EventLoop>) {
         }
     }
 
-    assert!(
-        wait_until(Duration::from_secs(60), || received.lock().1 >= TOTAL),
-        "server received {} of {TOTAL} bytes",
-        received.lock().1
-    );
+    if let Err(stall) = wait_for_progress(TOTAL, || received.lock().1) {
+        panic!(
+            "server bytes stalled: {stall}; sockets:\n{}",
+            socket_report(server.local_addr().unwrap().port())
+        );
+    }
     let (digest, len) = {
         let state = received.lock();
         (state.0.clone().finalize(), state.1)
@@ -184,12 +187,13 @@ fn backpressure_drained_backpressure_cycle(event_loop: &Arc<EventLoop>) {
     let mut client = TcpClient::connect(listener.local_addr().unwrap(), config, counter).unwrap();
     client.start(event_loop).unwrap();
     let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(STALL_AFTER)).unwrap();
+    let port = listener.local_addr().unwrap().port();
     assert!(wait_until(Duration::from_secs(5), || connected
         .load(Ordering::SeqCst)
         == 1));
 
     let sender = client.sender();
-    let deadline = Instant::now() + Duration::from_secs(30);
     let mut read_total = 0;
     let mut buf = vec![0; 1024 * 1024];
     for round in 0..2 {
@@ -218,10 +222,15 @@ fn backpressure_drained_backpressure_cycle(event_loop: &Arc<EventLoop>) {
 
         let target = read_total + sent;
         while read_total < target {
-            read_total += peer.read(&mut buf).unwrap();
+            read_total += peer.read(&mut buf).unwrap_or_else(|e| {
+                panic!(
+                    "round {round}: no bytes for {STALL_AFTER:?} at {read_total} of {target} ({e}); sockets:\n{}",
+                    socket_report(port)
+                )
+            });
         }
         assert!(
-            drains.wait_past(round, deadline),
+            drains.wait_past(round, Instant::now() + STALL_AFTER),
             "round {round}: no on_drained"
         );
     }

@@ -8,13 +8,13 @@ use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use mill_io::EventLoop;
 
 mod common;
 
-use common::{spawn_loop, stop_loop, wait_until};
+use common::{socket_report, spawn_loop, stop_loop, wait_for_progress};
 
 const MESSAGE_LEN: usize = 4 * 1024 * 1024;
 
@@ -55,15 +55,13 @@ fn single_4mb_message_without_followup(event_loop: &Arc<EventLoop>) {
     client.start(event_loop).unwrap();
 
     let started = Instant::now();
-    let complete = wait_until(Duration::from_secs(2), || {
-        received.lock().len() >= MESSAGE_LEN
-    });
+    if let Err(stall) = wait_for_progress(MESSAGE_LEN, || received.lock().len()) {
+        panic!(
+            "client bytes stalled: {stall}; sockets:\n{}",
+            socket_report(addr.port())
+        );
+    }
     let elapsed = started.elapsed();
-    let got = received.lock().len();
-    assert!(
-        complete,
-        "client received {got} of {MESSAGE_LEN} bytes within 2 s"
-    );
     assert!(
         *received.lock() == expected,
         "bytes differ after {elapsed:?}"
@@ -93,14 +91,12 @@ fn server_reads_4mb_without_followup(event_loop: &Arc<EventLoop>) {
         peer
     });
 
-    let complete = wait_until(Duration::from_secs(2), || {
-        received.lock().len() >= MESSAGE_LEN
-    });
-    let got = received.lock().len();
-    assert!(
-        complete,
-        "server received {got} of {MESSAGE_LEN} bytes within 2 s"
-    );
+    if let Err(stall) = wait_for_progress(MESSAGE_LEN, || received.lock().len()) {
+        panic!(
+            "server bytes stalled: {stall}; sockets:\n{}",
+            socket_report(addr.port())
+        );
+    }
     assert!(*received.lock() == expected, "bytes differ");
 
     let _peer = writer.join().unwrap();
@@ -143,7 +139,12 @@ fn buffer_size_sets_the_read_chunk() {
             peer.write_all(&message()).unwrap();
             peer
         });
-        assert!(wait_until(Duration::from_secs(5), || *total.lock() == MESSAGE_LEN));
+        if let Err(stall) = wait_for_progress(MESSAGE_LEN, || *total.lock()) {
+            panic!(
+                "buffer_size {buffer_size}: bytes stalled: {stall}; sockets:\n{}",
+                socket_report(addr.port())
+            );
+        }
         let largest = *largest.lock();
         assert!(
             largest <= buffer_size,
