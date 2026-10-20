@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0"
 authors = ["Citadel-tech", "Mohamed Emad"]
 license = "Apache-2.0"
 edition = "2021"
@@ -21,5 +21,5 @@ lock_freedom = "0.1.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 parking_lot = "0.12"
 
-mill-io = { path = "mill-io", version = "3.0.0" }
-mill-net = { path = "mill-net", version = "3.0.0" }
+mill-io = { path = "mill-io", version = "4.0.0" }
+mill-net = { path = "mill-net", version = "4.0.0" }

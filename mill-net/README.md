@@ -13,7 +13,7 @@ High-level networking components library built on top of [`mill-io`](../mill-io)
 
 ```toml
 [dependencies]
-mill-net = "2.0.1"
+mill-net = "4.0.0"
 ```
 
 ## Quick Start

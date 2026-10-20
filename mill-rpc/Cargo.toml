@@ -14,10 +14,10 @@ keywords = ["rpc", "mill-io", "event-loop", "networking", "services"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-mill-rpc-core = { path = "mill-rpc-core", version = "3.0.0" }
-mill-rpc-macros = { path = "mill-rpc-macros", version = "3.0.0" }
-mill-io = { path = "../mill-io", version = "3.0.0" }
-mill-net = { path = "../mill-net", version = "3.0.0" }
+mill-rpc-core = { path = "mill-rpc-core", version = "4.0.0" }
+mill-rpc-macros = { path = "mill-rpc-macros", version = "4.0.0" }
+mill-io = { path = "../mill-io", version = "4.0.0" }
+mill-net = { path = "../mill-net", version = "4.0.0" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 log = "0.4"

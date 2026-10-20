@@ -27,14 +27,14 @@ For the core event loop only:
 
 ```toml
 [dependencies]
-mill-io = "2.0.1"
+mill-io = "4.0.0"
 ```
 
 For high-level networking (includes mill-io as dependency):
 
 ```toml
 [dependencies]
-mill-net = "2.0.1"
+mill-net = "4.0.0"
 ```
 
 For the RPC framework (includes mill-io and mill-net):

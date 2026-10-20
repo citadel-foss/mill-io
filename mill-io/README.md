@@ -15,7 +15,7 @@ Core reactor-based event loop built on top of [`mio`](https://crates.io/crates/m
 
 ```toml
 [dependencies]
-mill-io = "2.0.1"
+mill-io = "4.0.0"
 ```
 
 ## Quick Start
