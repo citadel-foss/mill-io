@@ -1,0 +1,86 @@
+name: Tor
+
+# Blocking: these tests reach a real onion service, so they need live access to the
+# Tor network. Tor weather is absorbed by `--retries 2`, a fresh process per attempt.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  TOR_DIR: /tmp/tor-mill-chain
+
+jobs:
+  tor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install tor
+      run: sudo apt-get update && sudo apt-get install -y tor
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: tor-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+        restore-keys: |
+          tor-${{ runner.os }}-
+
+    - name: Build the Tor tests
+      run: cargo nextest run -p mill-chain --features testing --test tor --no-run
+
+    # Ubuntu's package starts its own tor; ours needs the ports and an empty control
+    # password. A stalled bootstrap is retried with a fresh data dir, which picks other
+    # directory mirrors and guards.
+    - name: Start tor
+      run: |
+        sudo systemctl stop tor@default.service tor.service || true
+        mkdir -p "$TOR_DIR"
+        cat > "$TOR_DIR/torrc" <<TORRC
+        SocksPort 9050
+        ControlPort 9051
+        HashedControlPassword $(tor --hash-password '' | tail -n 1)
+        DataDirectory $TOR_DIR/data
+        Log notice file $TOR_DIR/tor.log
+        TORRC
+        for attempt in 1 2 3; do
+          : > "$TOR_DIR/tor.log"
+          tor -f "$TOR_DIR/torrc" &
+          tor_pid=$!
+          for _ in $(seq 1 48); do
+            if grep -q "Bootstrapped 100%" "$TOR_DIR/tor.log"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "tor did not bootstrap on attempt $attempt" >&2
+          kill "$tor_pid" || true
+          wait "$tor_pid" || true
+          rm -rf "$TOR_DIR/data"
+        done
+        exit 1
+
+    - name: Run the Tor tests
+      env:
+        MILL_CHAIN_TOR_IT: "1"
+      run: cargo nextest run -p mill-chain --features testing --test tor --retries 2 --no-capture
+
+    - name: Dump the tor log
+      if: always()
+      run: cat "$TOR_DIR/tor.log" || true

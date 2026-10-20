@@ -56,3 +56,7 @@ required-features = ["testing"]
 [[test]]
 name = "tls"
 required-features = ["testing", "tls"]
+
+[[test]]
+name = "tor"
+required-features = ["testing"]
