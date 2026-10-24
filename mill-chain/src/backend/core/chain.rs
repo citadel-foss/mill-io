@@ -10,7 +10,7 @@ use crate::{ChainError, ChainHandle, FeeRate, Tip, TxStatus};
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::consensus::Decodable;
-use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, ScriptBuf};
+use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, SignedAmount};
 use bitcoin::{Transaction, Txid};
 use crossbeam_channel::RecvTimeoutError;
 use serde_json::{json, Value};
@@ -84,6 +84,11 @@ impl<'a> Query<'a> {
     pub(crate) fn chain(&self, method: &str, params: Value) -> Result<Value, ChainError> {
         self.handle
             .call_by(method, params, Route::Chain, self.deadline)
+    }
+
+    pub(crate) fn wallet(&self, method: &str, params: Value) -> Result<Value, ChainError> {
+        self.handle
+            .call_by(method, params, Route::Wallet, self.deadline)
     }
 
     /// One HTTP request carrying every call; one result per call, in order.
@@ -525,6 +530,12 @@ pub(crate) fn btc(value: &Value, what: &str) -> Result<Amount, ChainError> {
     Amount::from_btc(btc).map_err(|e| ChainError::Protocol(format!("{}: {}", what, e)))
 }
 
+/// A signed BTC amount, parsed as `bitcoincore-rpc` does.
+pub(crate) fn signed_btc(value: &Value, what: &str) -> Result<SignedAmount, ChainError> {
+    let btc = value.as_f64().ok_or_else(|| unexpected(what, value))?;
+    SignedAmount::from_btc(btc).map_err(|e| ChainError::Protocol(format!("{}: {}", what, e)))
+}
+
 pub(crate) fn script_hex(value: &Value, what: &str) -> Result<ScriptBuf, ChainError> {
     ScriptBuf::from_hex(as_str(value, what)?)
         .map_err(|e| ChainError::Protocol(format!("{}: {}", what, e)))
@@ -629,6 +640,10 @@ mod tests {
         );
         assert!(btc(&json!(-1.0), "a").is_err());
         assert!(btc(&json!("1.0"), "a").is_err());
+        assert_eq!(
+            signed_btc(&json!(-0.5), "a"),
+            Ok(SignedAmount::from_sat(-50_000_000))
+        );
     }
 
     #[test]
