@@ -1,0 +1,844 @@
+{
+  "bitcoind": "25.2",
+  "captures": [
+    {
+      "method": "createwallet",
+      "params": [
+        "watch",
+        true,
+        false,
+        null,
+        false,
+        true
+      ],
+      "result": {
+        "name": "watch"
+      }
+    },
+    {
+      "method": "listwallets",
+      "params": [],
+      "result": [
+        "default",
+        "keys",
+        "watch"
+      ]
+    },
+    {
+      "method": "listwalletdir",
+      "params": [],
+      "result": {
+        "wallets": [
+          {
+            "name": "watch"
+          },
+          {
+            "name": "spare"
+          },
+          {
+            "name": "keys"
+          },
+          {
+            "name": "default"
+          }
+        ]
+      }
+    },
+    {
+      "method": "loadwallet",
+      "params": [
+        "spare"
+      ],
+      "result": {
+        "name": "spare"
+      }
+    },
+    {
+      "method": "importdescriptors",
+      "params": [
+        [
+          {
+            "desc": "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl",
+            "timestamp": "now"
+          },
+          {
+            "desc": "wpkh([f93c0b6d/84'/1'/0']tpubDCkZowAADZqeG1MyMCTzAsUek4ptz7UHErzHydkN8FkqDvzmFZ2KyBBAYUzMXiXegLRmXMRn5bQzZAgya9WoXMvUx28Ps41fvhaAsEWy3FZ/1/*)#2q4pfwe5",
+            "range": [
+              0,
+              20
+            ],
+            "timestamp": "now"
+          },
+          {
+            "desc": "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#00000000",
+            "timestamp": "now"
+          }
+        ]
+      ],
+      "result": [
+        {
+          "success": true
+        },
+        {
+          "success": true
+        },
+        {
+          "error": {
+            "code": -5,
+            "message": "Provided checksum '00000000' does not match computed checksum 's84ppvcl'"
+          },
+          "success": false
+        }
+      ]
+    },
+    {
+      "method": "deriveaddresses",
+      "params": [
+        "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl"
+      ],
+      "result": [
+        "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp"
+      ]
+    },
+    {
+      "method": "deriveaddresses",
+      "params": [
+        "wpkh([f93c0b6d/84'/1'/0']tpubDCkZowAADZqeG1MyMCTzAsUek4ptz7UHErzHydkN8FkqDvzmFZ2KyBBAYUzMXiXegLRmXMRn5bQzZAgya9WoXMvUx28Ps41fvhaAsEWy3FZ/1/*)#2q4pfwe5",
+        [
+          0,
+          2
+        ]
+      ],
+      "result": [
+        "bcrt1qhjhkdkaa20m3wxtw36qxzjd2c6e6rw4drmfhe7",
+        "bcrt1q09g79n6eu20gss4m0u245ct92gyyqvskhwjfct",
+        "bcrt1q8aadc72jdmcn3qchgm22m94lgnz4gt4xyqz56x"
+      ]
+    },
+    {
+      "method": "getblockchaininfo",
+      "params": [],
+      "result": {
+        "bestblockhash": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        "blocks": 102,
+        "chain": "regtest",
+        "chainwork": "00000000000000000000000000000000000000000000000000000000000000ce",
+        "difficulty": 4.6565423739069247e-10,
+        "headers": 102,
+        "initialblockdownload": false,
+        "mediantime": 1792886220,
+        "pruned": false,
+        "size_on_disk": 30922,
+        "time": 1792886221,
+        "verificationprogress": 1,
+        "warnings": ""
+      }
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        102
+      ],
+      "result": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c"
+    },
+    {
+      "error": {
+        "code": -8,
+        "message": "Block height out of range"
+      },
+      "method": "getblockhash",
+      "params": [
+        103
+      ]
+    },
+    {
+      "method": "getblockheader",
+      "params": [
+        "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        false
+      ],
+      "result": "00000020ef26863fcc4bc08145bdb28336070b859dbd84966bbcdc0d40bfd13e1dacc563bf5aa97f7be601ca8d5d631c83ecba6cf29bb949023cbaf8fd1dee8a2ae762cecd45dd6affff7f2000000000"
+    },
+    {
+      "method": "getblockheader",
+      "params": [
+        "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        true
+      ],
+      "result": {
+        "bits": "207fffff",
+        "chainwork": "00000000000000000000000000000000000000000000000000000000000000ce",
+        "confirmations": 1,
+        "difficulty": 4.6565423739069247e-10,
+        "hash": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        "height": 102,
+        "mediantime": 1792886220,
+        "merkleroot": "ce62e72a8aee1dfdf8ba3c0249b99bf26cbaec831c635d8dca01e67b7fa95abf",
+        "nTx": 2,
+        "nonce": 0,
+        "previousblockhash": "63c5ac1d3ed1bf400ddcbc6b9684bd9d850b073683b2bd4581c04bcc3f8626ef",
+        "time": 1792886221,
+        "version": 536870912,
+        "versionHex": "20000000"
+      }
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        0
+      ],
+      "result": "00000020ef26863fcc4bc08145bdb28336070b859dbd84966bbcdc0d40bfd13e1dacc563bf5aa97f7be601ca8d5d631c83ecba6cf29bb949023cbaf8fd1dee8a2ae762cecd45dd6affff7f200000000002020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff03016600ffffffff0282f7052a0100000016001406d31d0f14b937fd4ee301ceaf27a7f8e6044b370000000000000000266a24aa21a9edfb405414a805499f4ec86b041454e1a3f2fef90b2c1d5f13727279b1de5779a9012000000000000000000000000000000000000000000000000000000000000000000000000002000000000101956aee6552c4907f87eb186fc685bb5d183a00ed96c4d5b79a45aeb40d2ed6500000000000fdffffff0200e1f5050000000016001480f532357ac55d5a6a96f2872d8ba65f7adcb75e7e0b1024010000001600147d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa40247304402207f4d78cfeb7cbfea3f75536806576def9d1b7ce01f07ae27e45e13e8837a4f560220667912c04961b80dbb096bdcee6d458881bfb8b446d6c8ef30526829cd75e2ec0121036b962dc4d50ec64036aeae49837c033f5b3c6b20d25486697532952d7ab1279465000000"
+    },
+    {
+      "method": "getrawtransaction",
+      "params": [
+        "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+        false
+      ],
+      "result": "02000000000101956aee6552c4907f87eb186fc685bb5d183a00ed96c4d5b79a45aeb40d2ed6500000000000fdffffff0200e1f5050000000016001480f532357ac55d5a6a96f2872d8ba65f7adcb75e7e0b1024010000001600147d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa40247304402207f4d78cfeb7cbfea3f75536806576def9d1b7ce01f07ae27e45e13e8837a4f560220667912c04961b80dbb096bdcee6d458881bfb8b446d6c8ef30526829cd75e2ec0121036b962dc4d50ec64036aeae49837c033f5b3c6b20d25486697532952d7ab1279465000000"
+    },
+    {
+      "method": "getrawtransaction",
+      "params": [
+        "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+        true
+      ],
+      "result": {
+        "blockhash": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        "blocktime": 1792886221,
+        "confirmations": 1,
+        "hash": "16013f56a004d82cff4f29b36ce146691336b17a8c57be99b258086e227c9e4c",
+        "hex": "02000000000101956aee6552c4907f87eb186fc685bb5d183a00ed96c4d5b79a45aeb40d2ed6500000000000fdffffff0200e1f5050000000016001480f532357ac55d5a6a96f2872d8ba65f7adcb75e7e0b1024010000001600147d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa40247304402207f4d78cfeb7cbfea3f75536806576def9d1b7ce01f07ae27e45e13e8837a4f560220667912c04961b80dbb096bdcee6d458881bfb8b446d6c8ef30526829cd75e2ec0121036b962dc4d50ec64036aeae49837c033f5b3c6b20d25486697532952d7ab1279465000000",
+        "locktime": 101,
+        "size": 222,
+        "time": 1792886221,
+        "txid": "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+        "version": 2,
+        "vin": [
+          {
+            "scriptSig": {
+              "asm": "",
+              "hex": ""
+            },
+            "sequence": 4294967293,
+            "txid": "50d62e0db4ae459ab7d5c496ed003a185dbb85c66f18eb877f90c45265ee6a95",
+            "txinwitness": [
+              "304402207f4d78cfeb7cbfea3f75536806576def9d1b7ce01f07ae27e45e13e8837a4f560220667912c04961b80dbb096bdcee6d458881bfb8b446d6c8ef30526829cd75e2ec01",
+              "036b962dc4d50ec64036aeae49837c033f5b3c6b20d25486697532952d7ab12794"
+            ],
+            "vout": 0
+          }
+        ],
+        "vout": [
+          {
+            "n": 0,
+            "scriptPubKey": {
+              "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+              "asm": "0 80f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+              "desc": "addr(bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp)#rjdzsxsv",
+              "hex": "001480f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 1.0
+          },
+          {
+            "n": 1,
+            "scriptPubKey": {
+              "address": "bcrt1q05flmqhs5l9lkm50cjrllf9us059k24y0098xh",
+              "asm": "0 7d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa4",
+              "desc": "addr(bcrt1q05flmqhs5l9lkm50cjrllf9us059k24y0098xh)#hqudfz6e",
+              "hex": "00147d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa4",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 48.9999859
+          }
+        ],
+        "vsize": 141,
+        "weight": 561
+      }
+    },
+    {
+      "error": {
+        "code": -5,
+        "message": "Transaction not in mempool"
+      },
+      "method": "getmempoolentry",
+      "params": [
+        "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb"
+      ]
+    },
+    {
+      "method": "getrawtransaction",
+      "params": [
+        "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2",
+        false
+      ],
+      "result": "02000000000101fbadc4e042059afa47611e5db61379c2d187fb572706be0aaefcd13279921f0d0100000000fdffffff0280c3c9010000000016001480f532357ac55d5a6a96f2872d8ba65f7adcb75e7c42462201000000160014c3a7b846dac0433d7db464c8a8ab968b6f190d7c024730440220387c1b65054956f9035f33bea619d80eca630921c54c4db3c272632b946352100220537db766758e2a2826278ec4a61aa698c8b5c974e05eccd274bc945a47b865c7012102bc0176784472c7708bd9877db68ae20014bf40af59e85f2e8f804eaefb2e239843000000"
+    },
+    {
+      "method": "getrawtransaction",
+      "params": [
+        "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2",
+        true
+      ],
+      "result": {
+        "hash": "0f098c36614a0a190216bd225262c1e8f8035026ab984f50c110b8b17a1b4a43",
+        "hex": "02000000000101fbadc4e042059afa47611e5db61379c2d187fb572706be0aaefcd13279921f0d0100000000fdffffff0280c3c9010000000016001480f532357ac55d5a6a96f2872d8ba65f7adcb75e7c42462201000000160014c3a7b846dac0433d7db464c8a8ab968b6f190d7c024730440220387c1b65054956f9035f33bea619d80eca630921c54c4db3c272632b946352100220537db766758e2a2826278ec4a61aa698c8b5c974e05eccd274bc945a47b865c7012102bc0176784472c7708bd9877db68ae20014bf40af59e85f2e8f804eaefb2e239843000000",
+        "locktime": 67,
+        "size": 222,
+        "txid": "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2",
+        "version": 2,
+        "vin": [
+          {
+            "scriptSig": {
+              "asm": "",
+              "hex": ""
+            },
+            "sequence": 4294967293,
+            "txid": "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+            "txinwitness": [
+              "30440220387c1b65054956f9035f33bea619d80eca630921c54c4db3c272632b946352100220537db766758e2a2826278ec4a61aa698c8b5c974e05eccd274bc945a47b865c701",
+              "02bc0176784472c7708bd9877db68ae20014bf40af59e85f2e8f804eaefb2e2398"
+            ],
+            "vout": 1
+          }
+        ],
+        "vout": [
+          {
+            "n": 0,
+            "scriptPubKey": {
+              "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+              "asm": "0 80f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+              "desc": "addr(bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp)#rjdzsxsv",
+              "hex": "001480f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 0.3
+          },
+          {
+            "n": 1,
+            "scriptPubKey": {
+              "address": "bcrt1qcwnms3k6cppn6ld5vny232uk3dh3jrtu5mfr77",
+              "asm": "0 c3a7b846dac0433d7db464c8a8ab968b6f190d7c",
+              "desc": "addr(bcrt1qcwnms3k6cppn6ld5vny232uk3dh3jrtu5mfr77)#y32puu9x",
+              "hex": "0014c3a7b846dac0433d7db464c8a8ab968b6f190d7c",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 48.6999718
+          }
+        ],
+        "vsize": 141,
+        "weight": 561
+      }
+    },
+    {
+      "method": "getmempoolentry",
+      "params": [
+        "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2"
+      ],
+      "result": {
+        "ancestorcount": 1,
+        "ancestorsize": 141,
+        "bip125-replaceable": true,
+        "depends": [],
+        "descendantcount": 1,
+        "descendantsize": 141,
+        "fees": {
+          "ancestor": 0.0000141,
+          "base": 0.0000141,
+          "descendant": 0.0000141,
+          "modified": 0.0000141
+        },
+        "height": 102,
+        "spentby": [],
+        "time": 1792886203,
+        "unbroadcast": true,
+        "vsize": 141,
+        "weight": 561,
+        "wtxid": "0f098c36614a0a190216bd225262c1e8f8035026ab984f50c110b8b17a1b4a43"
+      }
+    },
+    {
+      "error": {
+        "code": -5,
+        "message": "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+      },
+      "method": "getrawtransaction",
+      "params": [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        false
+      ]
+    },
+    {
+      "error": {
+        "code": -5,
+        "message": "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+      },
+      "method": "getrawtransaction",
+      "params": [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        true
+      ]
+    },
+    {
+      "error": {
+        "code": -5,
+        "message": "Transaction not in mempool"
+      },
+      "method": "getmempoolentry",
+      "params": [
+        "0000000000000000000000000000000000000000000000000000000000000000"
+      ]
+    },
+    {
+      "method": "gettxout",
+      "params": [
+        "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+        0,
+        true
+      ],
+      "result": {
+        "bestblock": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        "coinbase": false,
+        "confirmations": 1,
+        "scriptPubKey": {
+          "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+          "asm": "0 80f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+          "desc": "addr(bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp)#rjdzsxsv",
+          "hex": "001480f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+          "type": "witness_v0_keyhash"
+        },
+        "value": 1.0
+      }
+    },
+    {
+      "method": "gettxout",
+      "params": [
+        "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2",
+        0,
+        true
+      ],
+      "result": {
+        "bestblock": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        "coinbase": false,
+        "confirmations": 0,
+        "scriptPubKey": {
+          "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+          "asm": "0 80f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+          "desc": "addr(bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp)#rjdzsxsv",
+          "hex": "001480f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+          "type": "witness_v0_keyhash"
+        },
+        "value": 0.3
+      }
+    },
+    {
+      "method": "gettxout",
+      "params": [
+        "477480feed43271f409bd7e2edab618a021bd145b969b46c6a0ac1c5670b023f",
+        0,
+        true
+      ],
+      "result": {
+        "bestblock": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        "coinbase": true,
+        "confirmations": 1,
+        "scriptPubKey": {
+          "address": "bcrt1qqmf36rc5hyml6nhrq8827fa8lrnqgjehgdd7d4",
+          "asm": "0 06d31d0f14b937fd4ee301ceaf27a7f8e6044b37",
+          "desc": "addr(bcrt1qqmf36rc5hyml6nhrq8827fa8lrnqgjehgdd7d4)#de2mgg6f",
+          "hex": "001406d31d0f14b937fd4ee301ceaf27a7f8e6044b37",
+          "type": "witness_v0_keyhash"
+        },
+        "value": 50.0000141
+      }
+    },
+    {
+      "method": "gettxout",
+      "params": [
+        "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+        9,
+        true
+      ],
+      "result": null
+    },
+    {
+      "method": "getrawmempool",
+      "params": [
+        false
+      ],
+      "result": [
+        "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2"
+      ]
+    },
+    {
+      "method": "getblockcount",
+      "params": [],
+      "result": 102
+    },
+    {
+      "method": "gettxout",
+      "params": [
+        "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+        1,
+        false
+      ],
+      "result": {
+        "bestblock": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+        "coinbase": false,
+        "confirmations": 1,
+        "scriptPubKey": {
+          "address": "bcrt1q05flmqhs5l9lkm50cjrllf9us059k24y0098xh",
+          "asm": "0 7d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa4",
+          "desc": "addr(bcrt1q05flmqhs5l9lkm50cjrllf9us059k24y0098xh)#hqudfz6e",
+          "hex": "00147d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa4",
+          "type": "witness_v0_keyhash"
+        },
+        "value": 48.9999859
+      }
+    },
+    {
+      "method": "gettxspendingprevout",
+      "params": [
+        [
+          {
+            "txid": "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+            "vout": 1
+          }
+        ]
+      ],
+      "result": [
+        {
+          "spendingtxid": "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2",
+          "txid": "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+          "vout": 1
+        }
+      ]
+    },
+    {
+      "method": "sendrawtransaction",
+      "params": [
+        "02000000000101fbadc4e042059afa47611e5db61379c2d187fb572706be0aaefcd13279921f0d0100000000fdffffff0280c3c9010000000016001480f532357ac55d5a6a96f2872d8ba65f7adcb75e7c42462201000000160014c3a7b846dac0433d7db464c8a8ab968b6f190d7c024730440220387c1b65054956f9035f33bea619d80eca630921c54c4db3c272632b946352100220537db766758e2a2826278ec4a61aa698c8b5c974e05eccd274bc945a47b865c7012102bc0176784472c7708bd9877db68ae20014bf40af59e85f2e8f804eaefb2e239843000000"
+      ],
+      "result": "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2"
+    },
+    {
+      "error": {
+        "code": -27,
+        "message": "Transaction already in block chain"
+      },
+      "method": "sendrawtransaction",
+      "params": [
+        "02000000000101956aee6552c4907f87eb186fc685bb5d183a00ed96c4d5b79a45aeb40d2ed6500000000000fdffffff0200e1f5050000000016001480f532357ac55d5a6a96f2872d8ba65f7adcb75e7e0b1024010000001600147d13fd82f0a7cbfb6e8fc487ffa4bc83e85b2aa40247304402207f4d78cfeb7cbfea3f75536806576def9d1b7ce01f07ae27e45e13e8837a4f560220667912c04961b80dbb096bdcee6d458881bfb8b446d6c8ef30526829cd75e2ec0121036b962dc4d50ec64036aeae49837c033f5b3c6b20d25486697532952d7ab1279465000000"
+      ]
+    },
+    {
+      "method": "estimatesmartfee",
+      "params": [
+        6
+      ],
+      "result": {
+        "blocks": 0,
+        "errors": [
+          "Insufficient data or no feerate found"
+        ]
+      }
+    },
+    {
+      "method": "estimatesmartfee",
+      "params": [
+        2
+      ],
+      "result": {
+        "blocks": 2,
+        "feerate": 0.00012345
+      },
+      "synthetic": true
+    },
+    {
+      "method": "listunspent",
+      "params": [
+        0,
+        9999999
+      ],
+      "result": [
+        {
+          "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+          "amount": 0.3,
+          "ancestorcount": 1,
+          "ancestorfees": 1410,
+          "ancestorsize": 141,
+          "confirmations": 0,
+          "desc": "wpkh([80f53235]02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#0luzldkl",
+          "label": "",
+          "parent_descs": [
+            "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl"
+          ],
+          "safe": false,
+          "scriptPubKey": "001480f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+          "solvable": true,
+          "spendable": true,
+          "txid": "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2",
+          "vout": 0
+        },
+        {
+          "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+          "amount": 1.0,
+          "confirmations": 1,
+          "desc": "wpkh([80f53235]02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#0luzldkl",
+          "label": "",
+          "parent_descs": [
+            "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl"
+          ],
+          "safe": true,
+          "scriptPubKey": "001480f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+          "solvable": true,
+          "spendable": true,
+          "txid": "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+          "vout": 0
+        }
+      ]
+    },
+    {
+      "method": "listtransactions",
+      "params": [
+        "*",
+        10,
+        0,
+        true
+      ],
+      "result": [
+        {
+          "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+          "amount": 1.0,
+          "bip125-replaceable": "no",
+          "blockhash": "1efcc492a87d00955eee163b3f683b311cca600e399e504567fd4c322e61616c",
+          "blockheight": 102,
+          "blockindex": 1,
+          "blocktime": 1792886221,
+          "category": "receive",
+          "confirmations": 1,
+          "label": "",
+          "parent_descs": [
+            "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl"
+          ],
+          "time": 1792886203,
+          "timereceived": 1792886203,
+          "txid": "0d1f927932d1fcae0abe062757fb87d1c27913b65d1e6147fa9a0542e0c4adfb",
+          "vout": 0,
+          "walletconflicts": [],
+          "wtxid": "16013f56a004d82cff4f29b36ce146691336b17a8c57be99b258086e227c9e4c"
+        },
+        {
+          "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+          "amount": 0.3,
+          "bip125-replaceable": "yes",
+          "category": "receive",
+          "confirmations": 0,
+          "label": "",
+          "parent_descs": [
+            "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl"
+          ],
+          "time": 1792886203,
+          "timereceived": 1792886203,
+          "trusted": false,
+          "txid": "dbea864bf131d6e0342d2abde50c24f2b8c13637cd972c0432f72aed43c608c2",
+          "vout": 0,
+          "walletconflicts": [],
+          "wtxid": "0f098c36614a0a190216bd225262c1e8f8035026ab984f50c110b8b17a1b4a43"
+        }
+      ]
+    },
+    {
+      "method": "getaddressinfo",
+      "params": [
+        "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp"
+      ],
+      "result": {
+        "address": "bcrt1qsr6nydt6c4w4565k72rjmzaxtaaded67gh6glp",
+        "desc": "wpkh([80f53235]02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#0luzldkl",
+        "hdkeypath": "m",
+        "hdmasterfingerprint": "80f53235",
+        "hdseedid": "0000000000000000000000000000000000000000",
+        "ischange": false,
+        "ismine": true,
+        "isscript": false,
+        "iswatchonly": false,
+        "iswitness": true,
+        "labels": [
+          ""
+        ],
+        "parent_desc": "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl",
+        "pubkey": "02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807",
+        "scriptPubKey": "001480f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+        "solvable": true,
+        "timestamp": 1792886220,
+        "witness_program": "80f532357ac55d5a6a96f2872d8ba65f7adcb75e",
+        "witness_version": 0
+      }
+    },
+    {
+      "method": "rescanblockchain",
+      "params": [
+        102
+      ],
+      "result": {
+        "start_height": 102,
+        "stop_height": 102
+      }
+    },
+    {
+      "method": "getwalletinfo",
+      "params": [],
+      "result": {
+        "avoid_reuse": false,
+        "balance": 1.0,
+        "descriptors": true,
+        "external_signer": false,
+        "format": "sqlite",
+        "immature_balance": 0.0,
+        "keypoolsize": 0,
+        "keypoolsize_hd_internal": 0,
+        "paytxfee": 0.0,
+        "private_keys_enabled": false,
+        "scanning": false,
+        "txcount": 2,
+        "unconfirmed_balance": 0.3,
+        "walletname": "watch",
+        "walletversion": 169900
+      }
+    },
+    {
+      "method": "listdescriptors",
+      "params": [],
+      "result": {
+        "descriptors": [
+          {
+            "active": false,
+            "desc": "wpkh(02413301682d850fd96652f8dbc4ffa83975e7011e305e12c349d261adb76fe807)#s84ppvcl",
+            "timestamp": 1792886220
+          },
+          {
+            "active": false,
+            "desc": "wpkh([f93c0b6d/84'/1'/0']tpubDCkZowAADZqeG1MyMCTzAsUek4ptz7UHErzHydkN8FkqDvzmFZ2KyBBAYUzMXiXegLRmXMRn5bQzZAgya9WoXMvUx28Ps41fvhaAsEWy3FZ/1/*)#2q4pfwe5",
+            "next": 0,
+            "next_index": 0,
+            "range": [
+              0,
+              20
+            ],
+            "timestamp": 1792886220
+          }
+        ],
+        "wallet_name": "watch"
+      }
+    },
+    {
+      "method": "getwalletinfo",
+      "params": [],
+      "result": {
+        "descriptors": true,
+        "scanning": {
+          "duration": 12,
+          "progress": 0.25
+        },
+        "walletname": "watch"
+      },
+      "synthetic": true
+    },
+    {
+      "method": "getnetworkinfo",
+      "params": [],
+      "result": {
+        "connections": 0,
+        "connections_in": 0,
+        "connections_out": 0,
+        "incrementalfee": 0.00001,
+        "localaddresses": [],
+        "localrelay": true,
+        "localservices": "0000000000000409",
+        "localservicesnames": [
+          "NETWORK",
+          "WITNESS",
+          "NETWORK_LIMITED"
+        ],
+        "networkactive": true,
+        "networks": [
+          {
+            "limited": false,
+            "name": "ipv4",
+            "proxy": "",
+            "proxy_randomize_credentials": false,
+            "reachable": true
+          },
+          {
+            "limited": false,
+            "name": "ipv6",
+            "proxy": "",
+            "proxy_randomize_credentials": false,
+            "reachable": true
+          },
+          {
+            "limited": true,
+            "name": "onion",
+            "proxy": "",
+            "proxy_randomize_credentials": false,
+            "reachable": false
+          },
+          {
+            "limited": true,
+            "name": "i2p",
+            "proxy": "",
+            "proxy_randomize_credentials": false,
+            "reachable": false
+          },
+          {
+            "limited": true,
+            "name": "cjdns",
+            "proxy": "",
+            "proxy_randomize_credentials": false,
+            "reachable": false
+          }
+        ],
+        "protocolversion": 70016,
+        "relayfee": 0.00001,
+        "subversion": "/Satoshi:25.2.0/",
+        "timeoffset": 0,
+        "version": 250200,
+        "warnings": ""
+      }
+    },
+    {
+      "method": "getindexinfo",
+      "params": [],
+      "result": {
+        "txindex": {
+          "best_block_height": 102,
+          "synced": true
+        }
+      }
+    },
+    {
+      "method": "getzmqnotifications",
+      "params": [],
+      "result": [
+        {
+          "address": "tcp://127.0.0.1:39993",
+          "hwm": 1000,
+          "type": "pubrawblock"
+        },
+        {
+          "address": "tcp://0.0.0.0:36919",
+          "hwm": 1000,
+          "type": "pubrawtx"
+        },
+        {
+          "address": "tcp://0.0.0.0:45507",
+          "hwm": 1000,
+          "type": "pubsequence"
+        }
+      ]
+    }
+  ]
+}
