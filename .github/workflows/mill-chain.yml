@@ -1,6 +1,7 @@
 name: mill-chain
 
-# The mill-chain suites need the `testing` feature, and core_rpc needs a regtest bitcoind.
+# The mill-chain suites need the `testing` feature, and the Core suites need a regtest
+# bitcoind: the whole suite runs against 28.1, the Core suites against 25.2 as well.
 
 on:
   push:
@@ -13,7 +14,16 @@ env:
 
 jobs:
   test:
+    name: test (bitcoind ${{ matrix.bitcoind }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bitcoind: "28.1"
+            tests: ""
+          - bitcoind: "25.2"
+            tests: "--test core_parity --test core_rpc"
 
     steps:
     - uses: actions/checkout@v4
@@ -36,22 +46,24 @@ jobs:
         restore-keys: |
           mill-chain-${{ runner.os }}-
 
-    - name: Download and verify bitcoind 28.1
+    - name: Download and verify bitcoind ${{ matrix.bitcoind }}
+      env:
+        VERSION: ${{ matrix.bitcoind }}
       run: |
         mkdir -p "$RUNNER_TEMP/bitcoin-download"
         cd "$RUNNER_TEMP/bitcoin-download"
-        ARCHIVE=bitcoin-28.1-x86_64-linux-gnu.tar.gz
+        ARCHIVE=bitcoin-$VERSION-x86_64-linux-gnu.tar.gz
         GUIX_SIGS=https://raw.githubusercontent.com/bitcoin-core/guix.sigs/3b667ee3ebb3dcd9e1990cf03e38a0935eec1683
-        curl --fail --location --retry 3 "https://bitcoincore.org/bin/bitcoin-core-28.1/$ARCHIVE" -o "$ARCHIVE"
+        curl --fail --location --retry 3 "https://bitcoincore.org/bin/bitcoin-core-$VERSION/$ARCHIVE" -o "$ARCHIVE"
         curl --fail --location --retry 3 "$GUIX_SIGS/builder-keys/fanquake.gpg" -o fanquake.gpg
-        curl --fail --location --retry 3 "$GUIX_SIGS/28.1/fanquake/all.SHA256SUMS" -o SHA256SUMS
-        curl --fail --location --retry 3 "$GUIX_SIGS/28.1/fanquake/all.SHA256SUMS.asc" -o SHA256SUMS.asc
+        curl --fail --location --retry 3 "$GUIX_SIGS/$VERSION/fanquake/all.SHA256SUMS" -o SHA256SUMS
+        curl --fail --location --retry 3 "$GUIX_SIGS/$VERSION/fanquake/all.SHA256SUMS.asc" -o SHA256SUMS.asc
         mkdir -m 700 gnupg
         gpg --batch --homedir "$PWD/gnupg" --import fanquake.gpg
         gpg --batch --homedir "$PWD/gnupg" --verify SHA256SUMS.asc SHA256SUMS
         grep "  $ARCHIVE$" SHA256SUMS | sha256sum --check --strict
         tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP"
-        echo "BITCOIND_EXE=$RUNNER_TEMP/bitcoin-28.1/bin/bitcoind" >> "$GITHUB_ENV"
+        echo "BITCOIND_EXE=$RUNNER_TEMP/bitcoin-$VERSION/bin/bitcoind" >> "$GITHUB_ENV"
 
     - name: Run tests
-      run: cargo nextest run -p mill-chain --features testing --retries 0
+      run: cargo nextest run -p mill-chain --features testing --retries 0 ${{ matrix.tests }}
