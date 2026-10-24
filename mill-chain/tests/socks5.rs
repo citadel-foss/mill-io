@@ -40,6 +40,7 @@ fn via_proxy(proxy: SocketAddr, isolate: bool) -> TransportConfig {
             proxy: proxy.to_string(),
             isolate,
         }),
+        tls: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn proxy_host_is_not_hardcoded() {
             proxy: format!("{}:{}", ip, proxy.addr().port()),
             isolate: false,
         }),
+        tls: None,
     };
     let client = spawn("127.0.0.1", server.addr().port(), transport);
     assert_eq!(ping(&client), Ok(json!([1])));
@@ -276,6 +278,7 @@ fn malformed_proxy_is_refused_at_spawn() {
                 proxy: proxy.to_string(),
                 isolate: false,
             }),
+            tls: None,
         };
         let result = MillChain::spawn(ChainConfig::RawLineJsonRpcVia {
             host: "example.onion".into(),
