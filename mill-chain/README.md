@@ -36,6 +36,10 @@ Every query returns `Result<_, ChainError>`.
   `EngineOptions::reconnect_queue_limit`; a call that finds it full fails at once with
   `Transport("reconnect queue full")`. Reconnects back off exponentially from
   `backoff_initial` to `backoff_max`, with ±20% jitter.
+- Events arrive on a bounded channel. If the consumer falls behind and it fills, later
+  events are dropped and a single `ChainEvent::Resync` is queued in their place; nothing
+  more is queued until the consumer has read it. After a `Resync`, rebuild state from
+  queries.
 - `ChainClient::shutdown` fails every pending call with `ChainError::Shutdown`, closes the
   connection, joins the loop thread and disconnects the events channel. Dropping the last
   `ChainClient` does the same.
