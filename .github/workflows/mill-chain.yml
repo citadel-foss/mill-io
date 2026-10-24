@@ -1,0 +1,57 @@
+name: mill-chain
+
+# The mill-chain suites need the `testing` feature, and core_rpc needs a regtest bitcoind.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust stable
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: mill-chain-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          mill-chain-${{ runner.os }}-
+
+    - name: Download and verify bitcoind 28.1
+      run: |
+        mkdir -p "$RUNNER_TEMP/bitcoin-download"
+        cd "$RUNNER_TEMP/bitcoin-download"
+        ARCHIVE=bitcoin-28.1-x86_64-linux-gnu.tar.gz
+        GUIX_SIGS=https://raw.githubusercontent.com/bitcoin-core/guix.sigs/3b667ee3ebb3dcd9e1990cf03e38a0935eec1683
+        curl --fail --location --retry 3 "https://bitcoincore.org/bin/bitcoin-core-28.1/$ARCHIVE" -o "$ARCHIVE"
+        curl --fail --location --retry 3 "$GUIX_SIGS/builder-keys/fanquake.gpg" -o fanquake.gpg
+        curl --fail --location --retry 3 "$GUIX_SIGS/28.1/fanquake/all.SHA256SUMS" -o SHA256SUMS
+        curl --fail --location --retry 3 "$GUIX_SIGS/28.1/fanquake/all.SHA256SUMS.asc" -o SHA256SUMS.asc
+        mkdir -m 700 gnupg
+        gpg --batch --homedir "$PWD/gnupg" --import fanquake.gpg
+        gpg --batch --homedir "$PWD/gnupg" --verify SHA256SUMS.asc SHA256SUMS
+        grep "  $ARCHIVE$" SHA256SUMS | sha256sum --check --strict
+        tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP"
+        echo "BITCOIND_EXE=$RUNNER_TEMP/bitcoin-28.1/bin/bitcoind" >> "$GITHUB_ENV"
+
+    - name: Run tests
+      run: cargo nextest run -p mill-chain --features testing --retries 0
