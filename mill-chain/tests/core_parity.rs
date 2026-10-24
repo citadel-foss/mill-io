@@ -4,8 +4,10 @@
 
 use bitcoind::bitcoincore_rpc::{self, RpcApi};
 use bitcoind::{BitcoinD, Conf};
+use mill_chain::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use mill_chain::bitcoin::hashes::Hash;
-use mill_chain::bitcoin::{Address, Amount, BlockHash, Network, OutPoint, Txid};
+use mill_chain::bitcoin::{Address, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf};
+use mill_chain::bitcoin::{Transaction, Txid};
 use mill_chain::testing::{
     HttpReply, HttpRequest, MockHttpServer, MockReply, MockScript, MockServer,
 };
@@ -116,10 +118,18 @@ fn rpc_reply<F>(req: &HttpRequest, answer: &F) -> HttpReply
 where
     F: Fn(&str, &Value) -> Result<Value, (i64, String)>,
 {
+    rpc_reply_with_tip(req, &mock_tip, answer)
+}
+
+/// [`rpc_reply`], with `getbestblockhash` answered by `tip`.
+fn rpc_reply_with_tip<F>(req: &HttpRequest, tip: &dyn Fn() -> BlockHash, answer: &F) -> HttpReply
+where
+    F: Fn(&str, &Value) -> Result<Value, (i64, String)>,
+{
     let one = |request: &Value| {
         let method = request["method"].as_str().unwrap_or_default();
         let reply = match method {
-            "getbestblockhash" => Ok(json!(mock_tip())),
+            "getbestblockhash" => Ok(json!(tip())),
             _ => answer(method, &request["params"]),
         };
         match reply {
@@ -1379,6 +1389,550 @@ fn requirements_failures_are_not_unsupported() {
     let error = spawn_quick(server.url())
         .handle()
         .node_requirements()
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Transport(_)), "{:?}", error);
+}
+
+/// Spends `outpoint`, which `keys` holds the key to, back to the default wallet, and
+/// returns the signed transaction without broadcasting it.
+fn sign_spend(
+    node: &BitcoinD,
+    keys: &bitcoincore_rpc::Client,
+    outpoint: OutPoint,
+    value: Amount,
+) -> Transaction {
+    let to = node
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    let inputs = json!([{"txid": outpoint.txid, "vout": outpoint.vout}]);
+    let send = (value - Amount::from_sat(10_000)).to_btc();
+    let outputs = json!({ to.to_string(): send });
+    let unsigned: Value = keys
+        .call("createrawtransaction", &[inputs, outputs])
+        .unwrap();
+    let signed: Value = keys
+        .call("signrawtransactionwithwallet", &[unsigned])
+        .unwrap();
+    assert_eq!(signed["complete"], true, "{}", signed);
+    deserialize_hex(signed["hex"].as_str().unwrap()).unwrap()
+}
+
+/// The output of `txid` paying to `address`.
+fn output_to(node: &BitcoinD, txid: Txid, address: &Address) -> (OutPoint, ScriptBuf) {
+    let tx = node.client.get_raw_transaction(&txid, None).unwrap();
+    let vout = tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey == address.script_pubkey())
+        .unwrap();
+    (OutPoint::new(txid, vout as u32), address.script_pubkey())
+}
+
+#[test]
+fn fund_watch_broadcast_confirm() {
+    let node = node(&["-txindex=1"]);
+    let client = connect(&node, Some("watch"));
+    let h = client.handle();
+    let w = h.core_wallet().unwrap();
+    w.prepare("watch").unwrap();
+    let keys = key_holder(&node);
+    let (desc, address) = watched_key(&keys);
+    w.import_descriptors(&[json!({"desc": desc, "timestamp": "now"})])
+        .unwrap();
+    mine(&node, 101);
+
+    let funding = node
+        .client
+        .send_to_address(
+            &address,
+            Amount::ONE_BTC,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    mine(&node, 1);
+    let utxos = w.list_unspent(1, None).unwrap();
+    assert_eq!(utxos.len(), 1);
+    let (outpoint, script) = (utxos[0].outpoint, utxos[0].script_pubkey.clone());
+    assert_eq!(outpoint.txid, funding);
+    assert_eq!(script, address.script_pubkey());
+    assert_eq!(h.spending_tx(&outpoint, &script, false), Ok(None));
+    assert_eq!(h.spending_tx(&outpoint, &script, true), Ok(None));
+
+    let spend = sign_spend(&node, &keys, outpoint, Amount::ONE_BTC);
+    let txid = h.broadcast(&spend).unwrap();
+    assert_eq!(txid, spend.compute_txid());
+    assert_eq!(h.tx_status(&txid), Ok(TxStatus::Mempool));
+    assert_eq!(
+        h.spending_tx(&outpoint, &script, false)
+            .unwrap()
+            .map(|tx| tx.compute_txid()),
+        Some(txid)
+    );
+    // Only in the mempool: not a confirmed spend.
+    assert_eq!(h.spending_tx(&outpoint, &script, true), Ok(None));
+
+    let mined = mine(&node, 1)[0];
+    assert_eq!(
+        h.tx_status(&txid),
+        Ok(TxStatus::Confirmed {
+            height: 103,
+            block_hash: mined
+        })
+    );
+    let confirmed = h.spending_tx(&outpoint, &script, true).unwrap().unwrap();
+    assert_eq!(*confirmed, spend);
+    assert!(w
+        .list_unspent(0, None)
+        .unwrap()
+        .iter()
+        .all(|u| u.outpoint != outpoint));
+}
+
+#[test]
+fn spend_lookup_is_bounded() {
+    let node = node(&["-txindex=1"]);
+    let keys = key_holder(&node);
+    mine(&node, 101);
+    let address = keys.get_new_address(None, None).unwrap().assume_checked();
+    let funding = node
+        .client
+        .send_to_address(
+            &address,
+            Amount::ONE_BTC,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    mine(&node, 1);
+    let (outpoint, script) = output_to(&node, funding, &address);
+    mine(&node, 199);
+    let spend = sign_spend(&node, &keys, outpoint, Amount::ONE_BTC);
+    node.client.send_raw_transaction(&spend).unwrap();
+    mine(&node, 1);
+    let funded_at = node.client.get_block_count().unwrap() - 200;
+    assert_eq!(funded_at, 102);
+
+    // A fresh client, so nothing is cached.
+    let client = connect(&node, None);
+    let h = client.handle();
+    for confirmed_only in [true, false] {
+        let client = connect(&node, None);
+        let h = client.handle();
+        let found = h.spending_tx(&outpoint, &script, confirmed_only).unwrap();
+        let used = client.stats().requests_sent;
+        eprintln!("confirmed_only {}: {} requests", confirmed_only, used);
+        assert!(used <= 10, "{} requests", used);
+        assert_eq!(found.as_deref(), Some(&spend));
+    }
+
+    // Again on one client: the blocks come from its cache.
+    let found = h.spending_tx(&outpoint, &script, true).unwrap();
+    assert_eq!(found.as_deref(), Some(&spend));
+    let first = client.stats().requests_sent;
+    let found = h.spending_tx(&outpoint, &script, true).unwrap();
+    assert_eq!(found.as_deref(), Some(&spend));
+    let again = client.stats().requests_sent - first;
+    assert!(again <= 5, "{} requests with every block cached", again);
+}
+
+#[test]
+fn spend_lookup_edges_on_regtest() {
+    let node = node(&["-txindex=1"]);
+    let client = connect(&node, None);
+    let h = client.handle();
+    let keys = key_holder(&node);
+    mine(&node, 101);
+
+    // Funded and spent in the same block.
+    let address = keys.get_new_address(None, None).unwrap().assume_checked();
+    let funding = node
+        .client
+        .send_to_address(
+            &address,
+            Amount::ONE_BTC,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let (outpoint, script) = output_to(&node, funding, &address);
+    assert!(wait_until(10 * SECS, || keys
+        .get_transaction(&funding, None)
+        .is_ok()));
+    let spend = sign_spend(&node, &keys, outpoint, Amount::ONE_BTC);
+    h.broadcast(&spend).unwrap();
+    // Funding unconfirmed: no confirmed spend can exist, but the mempool has one.
+    assert_eq!(h.spending_tx(&outpoint, &script, true), Ok(None));
+    assert_eq!(
+        h.spending_tx(&outpoint, &script, false).unwrap().as_deref(),
+        Some(&spend)
+    );
+    let block = mine(&node, 1)[0];
+    let mined = h.block(102).unwrap();
+    assert_eq!(mined.block_hash(), block);
+    assert!(mined.txdata.iter().any(|tx| tx.compute_txid() == funding));
+    assert_eq!(
+        h.spending_tx(&outpoint, &script, true).unwrap().as_deref(),
+        Some(&spend)
+    );
+
+    // An output still unspent, an output that does not exist, a transaction that does not.
+    let (change, change_script) = output_to(&node, spend.compute_txid(), &{
+        let out = &spend.output[0];
+        Address::from_script(&out.script_pubkey, Network::Regtest).unwrap()
+    });
+    assert_eq!(h.spending_tx(&change, &change_script, true), Ok(None));
+    assert_eq!(h.spending_tx(&change, &change_script, false), Ok(None));
+    let missing = OutPoint::new(spend.compute_txid(), 7);
+    assert_eq!(
+        h.spending_tx(&missing, &change_script, true),
+        Err(ChainError::NotFound)
+    );
+    let unknown = OutPoint::new(txid(0xcd), 0);
+    assert_eq!(
+        h.spending_tx(&unknown, &change_script, false),
+        Err(ChainError::NotFound)
+    );
+
+    // An OP_RETURN output never enters the UTXO set and can never be spent.
+    let unsigned: Value = node
+        .client
+        .call(
+            "createrawtransaction",
+            &[json!([]), json!({"data": "6d696c6c"})],
+        )
+        .unwrap();
+    let funded: Value = node.client.call("fundrawtransaction", &[unsigned]).unwrap();
+    let signed: Value = node
+        .client
+        .call("signrawtransactionwithwallet", &[funded["hex"].clone()])
+        .unwrap();
+    let data_tx: Transaction = deserialize_hex(signed["hex"].as_str().unwrap()).unwrap();
+    let data_txid = h.broadcast(&data_tx).unwrap();
+    mine(&node, 1);
+    let vout = data_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey.is_op_return())
+        .unwrap();
+    let data = OutPoint::new(data_txid, vout as u32);
+    assert_eq!(h.tx_out(&data, false), Ok(None));
+    assert_eq!(
+        h.spending_tx(&data, &data_tx.output[vout].script_pubkey, true),
+        Ok(None)
+    );
+}
+
+/// A chain of `n` blocks for a mock: block 0 holds the funding transaction, block
+/// `spent_at` the spend (if any), and block `i` carries `pad(i)` bytes of padding.
+struct MockChain {
+    blocks: Vec<Block>,
+    funding: Transaction,
+    spend: Transaction,
+}
+
+impl MockChain {
+    fn new(n: usize, spent_at: Option<usize>, pad: impl Fn(usize) -> usize) -> Self {
+        let genesis = mill_chain::bitcoin::constants::genesis_block(Network::Regtest);
+        let mut funding = genesis.txdata[0].clone();
+        funding.output[0].script_pubkey = ScriptBuf::from(vec![0x51]);
+        funding.input[0].sequence = mill_chain::bitcoin::Sequence(7);
+        let mut spend = genesis.txdata[0].clone();
+        spend.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+        let mut blocks: Vec<Block> = Vec::new();
+        for i in 0..n {
+            let mut block = genesis.clone();
+            block.header.prev_blockhash = blocks
+                .last()
+                .map_or(BlockHash::all_zeros(), Block::block_hash);
+            block.header.time = i as u32;
+            block.txdata[0].output[0].script_pubkey = ScriptBuf::from(vec![0x51; pad(i)]);
+            if i == 0 {
+                block.txdata.push(funding.clone());
+            }
+            if Some(i) == spent_at {
+                block.txdata.push(spend.clone());
+            }
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            blocks.push(block);
+        }
+        MockChain {
+            blocks,
+            funding,
+            spend,
+        }
+    }
+
+    fn outpoint(&self) -> OutPoint {
+        OutPoint::new(self.funding.compute_txid(), 0)
+    }
+
+    /// Answers the spend lookup's calls; `tx_out` is `gettxout`'s answer.
+    fn answer(&self, method: &str, params: &Value, tx_out: &Value) -> Result<Value, (i64, String)> {
+        let tip = self.blocks.len() - 1;
+        let height_of = |hash: &str| {
+            self.blocks
+                .iter()
+                .position(|b| b.block_hash().to_string() == hash)
+                .unwrap()
+        };
+        match method {
+            "getblockcount" => Ok(json!(tip)),
+            "gettxout" => Ok(tx_out.clone()),
+            "getrawtransaction" => Ok(json!({
+                "txid": self.funding.compute_txid(),
+                "blockhash": self.blocks[0].block_hash(),
+                "confirmations": tip + 1,
+                "vout": [{"scriptPubKey": {"hex": "51"}}],
+            })),
+            "getblockheader" => {
+                let height = height_of(params[0].as_str().unwrap());
+                Ok(json!({"height": height, "confirmations": tip + 1 - height}))
+            }
+            "getblockhash" => match self.blocks.get(params[0].as_u64().unwrap() as usize) {
+                Some(block) => Ok(json!(block.block_hash())),
+                None => Err((-8, "Block height out of range".into())),
+            },
+            "getblock" => {
+                let height = height_of(params[0].as_str().unwrap());
+                Ok(json!(serialize_hex(&self.blocks[height])))
+            }
+            other => panic!("unexpected {}", other),
+        }
+    }
+}
+
+fn mock_spends(
+    chain: MockChain,
+    tx_out: Value,
+    max_body_bytes: usize,
+) -> (MockHttpServer, ChainClient, Arc<MockChain>) {
+    let chain = Arc::new(chain);
+    let serving = Arc::clone(&chain);
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        rpc_reply(req, &|method: &str, params: &Value| {
+            serving.answer(method, params, &tx_out)
+        })
+    })
+    .unwrap();
+    let mut config = CoreConfig::new(
+        server.url(),
+        CoreAuth::UserPass {
+            user: "u".into(),
+            pass: "p".into(),
+        },
+    );
+    config.max_body_bytes = max_body_bytes;
+    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    (server, client, chain)
+}
+
+fn getblock_batches(server: &MockHttpServer) -> Vec<usize> {
+    server
+        .requests_seen()
+        .iter()
+        .filter_map(|req| match req.json() {
+            Some(Value::Array(calls)) if calls.iter().all(|c| c["method"] == "getblock") => {
+                Some(calls.len())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn spend_scan_shrinks_batches_that_overflow() {
+    // Blocks grow, so batches sized from the first ones overflow the body cap.
+    let chain = MockChain::new(16, Some(15), |i| 100 + i * i * 40);
+    let largest = serialize_hex(&chain.blocks[15]).len();
+    let (server, client, chain) = mock_spends(chain, Value::Null, largest + 1000);
+    let found = client
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true)
+        .unwrap();
+    assert_eq!(found.as_deref(), Some(&chain.spend));
+    let batches = getblock_batches(&server);
+    let fetched: usize = batches.iter().sum();
+    assert!(fetched > 16, "no batch was refetched: {:?}", batches);
+    assert!(batches.iter().any(|&n| n > 1), "{:?}", batches);
+
+    // A single block over the cap is an error, never "no spend".
+    let chain = MockChain::new(4, Some(3), |i| if i == 2 { 4000 } else { 10 });
+    let (_server, client, chain) = mock_spends(chain, Value::Null, 2000);
+    let error = client
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+}
+
+#[test]
+fn spend_lookup_never_guesses() {
+    // Core says spent, but no block up to a tip that does not move spends it.
+    let chain = MockChain::new(5, None, |_| 10);
+    let (_server, client, chain) = mock_spends(chain, Value::Null, 1 << 20);
+    let error = client
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+
+    // Unspent in the confirmed set: no confirmed spend, without scanning.
+    let chain = MockChain::new(5, None, |_| 10);
+    let (server, client, chain) = mock_spends(chain, json!({"value": 1.0}), 1 << 20);
+    assert_eq!(
+        client
+            .handle()
+            .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true),
+        Ok(None)
+    );
+    assert!(getblock_batches(&server).is_empty());
+
+    // A funding block Core cannot place.
+    let chain = Arc::new(MockChain::new(2, None, |_| 10));
+    let serving = Arc::clone(&chain);
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        rpc_reply(req, &|method: &str, params: &Value| match method {
+            "getrawtransaction" => Ok(json!({"txid": serving.funding.compute_txid(),
+                "blockhash": serving.blocks[0].block_hash(), "vout": [{"scriptPubKey": {"hex": "51"}}]})),
+            _ => serving.answer(method, params, &Value::Null),
+        })
+    })
+    .unwrap();
+    let error = spawn_quick(server.url())
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+
+    // A gettxout reply that is not an output, and a mempool answer about another output.
+    let chain = MockChain::new(2, None, |_| 10);
+    let (_server, client, chain) = mock_spends(chain, json!(false), 1 << 20);
+    let error = client
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+    let chain = Arc::new(MockChain::new(2, None, |_| 10));
+    let serving = Arc::clone(&chain);
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        rpc_reply(req, &|method: &str, params: &Value| match method {
+            "gettxspendingprevout" => Ok(json!([{"txid": params[0][0]["txid"], "vout": 1}])),
+            _ => serving.answer(method, params, &Value::Null),
+        })
+    })
+    .unwrap();
+    let error = spawn_quick(server.url())
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), false)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+
+    // A block arrives during every first read: never settled.
+    let chain = Arc::new(MockChain::new(3, Some(2), |_| 10));
+    let serving = Arc::clone(&chain);
+    let tips = Arc::new(AtomicUsize::new(0));
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        let tip = || block_hash(tips.fetch_add(1, Ordering::SeqCst) as u8);
+        rpc_reply_with_tip(req, &tip, &|method: &str, params: &Value| {
+            serving.answer(method, params, &Value::Null)
+        })
+    })
+    .unwrap();
+    let error = spawn_quick(server.url())
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+
+    // Spent at first, unspent once the scan comes up empty (a reorg undid the spend): with
+    // the mempool in question, the lookup starts again rather than answer "no spend".
+    let chain = Arc::new(MockChain::new(3, None, |_| 10));
+    let serving = Arc::clone(&chain);
+    let outs = Arc::new(AtomicUsize::new(0));
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        rpc_reply(req, &|method: &str, params: &Value| match method {
+            "gettxspendingprevout" => Ok(json!([{"txid": params[0][0]["txid"], "vout": 0}])),
+            "gettxout" if outs.fetch_add(1, Ordering::SeqCst) % 2 == 1 => {
+                Ok(json!({"value": 1.0, "scriptPubKey": {"hex": "51"}}))
+            }
+            _ => serving.answer(method, params, &Value::Null),
+        })
+    })
+    .unwrap();
+    let client = spawn_quick(server.url());
+    let error = client
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), false)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+    assert_eq!(
+        client
+            .handle()
+            .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true),
+        Ok(None)
+    );
+
+    // A failure part way through the scan.
+    let chain = Arc::new(MockChain::new(5, Some(4), |_| 10));
+    let serving = Arc::clone(&chain);
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        rpc_reply(req, &|method: &str, params: &Value| match method {
+            "getblock" if params[0] == json!(serving.blocks[3].block_hash()) => {
+                Err((-32603, "Internal error".into()))
+            }
+            _ => serving.answer(method, params, &Value::Null),
+        })
+    })
+    .unwrap();
+    let error = spawn_quick(server.url())
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), true)
+        .unwrap_err();
+    assert!(
+        matches!(error, ChainError::Server { code: -32603, .. }),
+        "{:?}",
+        error
+    );
+
+    // The mempool names a transaction that does not spend the outpoint.
+    let chain = Arc::new(MockChain::new(2, None, |_| 10));
+    let serving = Arc::clone(&chain);
+    let unrelated = serialize_hex(&chain.funding);
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        rpc_reply(req, &|method: &str, params: &Value| match method {
+            "gettxspendingprevout" => Ok(json!([{"txid": params[0][0]["txid"], "vout": 0,
+                "spendingtxid": serving.funding.compute_txid()}])),
+            "getrawtransaction" if params[1] == json!(false) => Ok(json!(unrelated)),
+            _ => serving.answer(method, params, &Value::Null),
+        })
+    })
+    .unwrap();
+    let error = spawn_quick(server.url())
+        .handle()
+        .spending_tx(&chain.outpoint(), &ScriptBuf::new(), false)
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+
+    // The connection drops.
+    let server = MockHttpServer::start(|_| HttpReply::drop_connection()).unwrap();
+    let error = spawn_quick(server.url())
+        .handle()
+        .spending_tx(&OutPoint::new(txid(1), 0), &ScriptBuf::new(), true)
         .unwrap_err();
     assert!(matches!(error, ChainError::Transport(_)), "{:?}", error);
 }
