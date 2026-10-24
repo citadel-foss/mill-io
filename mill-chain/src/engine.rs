@@ -93,10 +93,22 @@ pub(crate) trait Codec: Send {
 
 pub(crate) type ReplyTx = Sender<Result<Value, ChainError>>;
 
+/// Where a call goes. Only Bitcoin Core tells chain and wallet calls apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    Chain,
+    Wallet,
+    /// A JSON-RPC batch to the chain endpoint: `params` is an array of
+    /// `{"method", "params"}` objects, and the reply an array of reply objects in the
+    /// same order.
+    ChainBatch,
+}
+
 /// A blocking caller's request, as handed to the loop.
 pub(crate) struct Call {
     pub(crate) method: String,
     pub(crate) params: Value,
+    pub(crate) route: Route,
     pub(crate) deadline: Option<Instant>,
     pub(crate) retries: u8,
     pub(crate) cancel: Option<Arc<AtomicBool>>,
@@ -104,7 +116,7 @@ pub(crate) struct Call {
 }
 
 impl Call {
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
@@ -160,27 +172,132 @@ pub(crate) struct State {
     jitter: f64,
     rng: u64,
     connected_before: bool,
-    events: Option<Sender<ChainEvent>>,
-    events_capacity: usize,
-    /// A `Resync` is the last item on the events channel and has not been read yet.
-    resync_pending: bool,
+    events: EventSink,
     scratch: Vec<u8>,
 }
 
+/// The counters behind [`ClientStats`], updated on the loop thread.
 #[derive(Default)]
-struct Stats {
-    pending: AtomicUsize,
-    sent: AtomicU64,
-    reconnects: AtomicU64,
-    resyncs: AtomicU64,
-    open: AtomicUsize,
+pub(crate) struct Stats {
+    pub(crate) pending: AtomicUsize,
+    pub(crate) sent: AtomicU64,
+    pub(crate) reconnects: AtomicU64,
+    pub(crate) resyncs: AtomicU64,
+    pub(crate) open: AtomicUsize,
+}
+
+impl Stats {
+    pub(crate) fn snapshot(&self) -> ClientStats {
+        ClientStats {
+            pending_requests: self.pending.load(Ordering::SeqCst),
+            requests_sent: self.sent.load(Ordering::SeqCst),
+            reconnects: self.reconnects.load(Ordering::SeqCst),
+            resyncs: self.resyncs.load(Ordering::SeqCst),
+            connections_open: self.open.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// The sending side of the events channel.
+pub(crate) struct EventSink {
+    events: Option<Sender<ChainEvent>>,
+    capacity: usize,
+    /// A `Resync` is the last item on the channel and has not been read yet.
+    resync_pending: bool,
+}
+
+impl EventSink {
+    /// Sends of `events` beyond `capacity` turn into one `Resync`, which needs a slot.
+    pub(crate) fn channel(capacity: usize) -> (Self, Receiver<ChainEvent>) {
+        let (events, receiver) = crossbeam_channel::bounded(capacity.saturating_add(1));
+        let sink = Self {
+            events: Some(events),
+            capacity,
+            resync_pending: false,
+        };
+        (sink, receiver)
+    }
+
+    /// Puts `event` on the channel. When it is full, drops the event and leaves a single
+    /// `Resync` instead, counted in `resyncs`; nothing more is sent until the consumer has
+    /// read it.
+    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
+    pub(crate) fn emit(&mut self, event: ChainEvent, resyncs: &AtomicU64) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        if self.resync_pending {
+            // Nothing is sent behind the `Resync`, so an empty channel means it was read.
+            if !events.is_empty() {
+                return;
+            }
+            self.resync_pending = false;
+        }
+        let event = if events.len() < self.capacity {
+            event
+        } else {
+            self.resync_pending = true;
+            ChainEvent::Resync {
+                reason: "event channel overflowed".to_string(),
+            }
+        };
+        let is_resync = matches!(event, ChainEvent::Resync { .. });
+        if events.try_send(event).is_ok() && is_resync {
+            resyncs.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Emits `n` placeholder events.
+    #[cfg(feature = "testing")]
+    pub(crate) fn inject(&mut self, n: usize, resyncs: &AtomicU64) {
+        use bitcoin::hashes::Hash;
+        for height in 0..n as u64 {
+            let event = ChainEvent::BlockDisconnected {
+                height,
+                hash: bitcoin::BlockHash::all_zeros(),
+            };
+            self.emit(event, resyncs);
+        }
+    }
+
+    /// Disconnects the receivers.
+    pub(crate) fn close(&mut self) {
+        self.events = None;
+    }
+}
+
+/// What the blocking facade needs from a backend's runtime. Every backend owns its event
+/// loop and follows the engine's rules for deadlines, cancellation and shutdown.
+pub(crate) trait Runtime: Send + Sync {
+    fn options(&self) -> &EngineOptions;
+    /// Runs `f` on the loop thread. Fails with `Shutdown` once the loop is gone.
+    fn post(&self, f: Box<dyn FnOnce() + Send>) -> Result<(), ChainError>;
+    fn set_loop_thread(&self);
+    fn is_loop_thread(&self) -> bool;
+    fn is_closed(&self) -> bool;
+    fn stats(&self) -> ClientStats;
+    /// Hands `call` to the loop; returns the id to abandon it by.
+    fn submit(&self, call: Call) -> Result<u64, ChainError>;
+    /// Ends call `id` with `error` if it is still pending.
+    fn abandon(&self, id: u64, error: ChainError);
+    /// Runs on the loop thread before the loop does.
+    fn start(&self);
+    /// Asks the loop to stop; calls made from now on fail with `Shutdown`.
+    fn stop(&self);
+    /// Runs on the loop thread once `run` returned: every pending call gets `Shutdown`,
+    /// connections close and the events channel disconnects.
+    fn close_all(&self);
+    /// Drops the runtime's reference to the loop.
+    fn release_loop(&self) -> Option<Arc<EventLoop>>;
+    /// Emits `n` placeholder events from the loop thread.
+    #[cfg(feature = "testing")]
+    fn inject_events(&self, n: usize);
 }
 
 /// Where and how to connect.
 pub(crate) struct Endpoint {
     pub(crate) addr: SocketAddr,
     pub(crate) codec: Box<dyn Codec>,
-    pub(crate) events_capacity: usize,
 }
 
 pub(crate) struct Engine {
@@ -248,7 +365,7 @@ impl Engine {
         endpoint: Endpoint,
         options: EngineOptions,
         event_loop: Arc<EventLoop>,
-        events: Sender<ChainEvent>,
+        events: EventSink,
     ) -> Arc<Self> {
         let seed = RandomState::new().build_hasher().finish() | 1;
         Arc::new_cyclic(|me| Engine {
@@ -273,18 +390,11 @@ impl Engine {
                 jitter: 1.0,
                 rng: seed,
                 connected_before: false,
-                events: Some(events),
-                events_capacity: endpoint.events_capacity,
-                resync_pending: false,
+                events,
                 scratch: Vec::new(),
             }),
             stats: Stats::default(),
         })
-    }
-
-    /// Sends of `events` beyond `capacity` turn into one `Resync`, which needs a slot.
-    pub(crate) fn events_channel(capacity: usize) -> (Sender<ChainEvent>, Receiver<ChainEvent>) {
-        crossbeam_channel::bounded(capacity.saturating_add(1))
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -319,13 +429,7 @@ impl Engine {
     }
 
     pub(crate) fn stats(&self) -> ClientStats {
-        ClientStats {
-            pending_requests: self.stats.pending.load(Ordering::SeqCst),
-            requests_sent: self.stats.sent.load(Ordering::SeqCst),
-            reconnects: self.stats.reconnects.load(Ordering::SeqCst),
-            resyncs: self.stats.resyncs.load(Ordering::SeqCst),
-            connections_open: self.stats.open.load(Ordering::SeqCst),
-        }
+        self.stats.snapshot()
     }
 
     /// Hands `call` to the loop; returns the id to cancel it by.
@@ -385,7 +489,7 @@ impl Engine {
         st.in_flight.clear();
         let calls: Vec<Pending> = st.calls.drain().map(|(_, pending)| pending).collect();
         self.stats.pending.store(0, Ordering::SeqCst);
-        st.events = None;
+        st.events.close();
         drop(st);
         for pending in calls {
             if let (Some(timer), Some(event_loop)) = (pending.timer, &event_loop) {
@@ -746,56 +850,79 @@ impl Engine {
         st.link = Link::Backoff(timer);
     }
 
-    /// Puts `event` on the events channel. When it is full, drops the event and leaves a
-    /// single `Resync` instead; nothing more is sent until the consumer has read it.
-    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
-    fn emit(&self, st: &mut State, event: ChainEvent) {
-        let Some(events) = &st.events else {
-            return;
-        };
-        if st.resync_pending {
-            // Nothing is sent behind the `Resync`, so an empty channel means it was read.
-            if !events.is_empty() {
-                return;
-            }
-            st.resync_pending = false;
-        }
-        let event = if events.len() < st.events_capacity {
-            event
-        } else {
-            st.resync_pending = true;
-            ChainEvent::Resync {
-                reason: "event channel overflowed".to_string(),
-            }
-        };
-        let is_resync = matches!(event, ChainEvent::Resync { .. });
-        if events.try_send(event).is_ok() && is_resync {
-            self.stats.resyncs.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     /// Emits `n` placeholder events from the loop thread.
     #[cfg(feature = "testing")]
     pub(crate) fn inject_events(&self, n: usize) {
-        use bitcoin::hashes::Hash;
-        let mut st = self.lock();
-        for height in 0..n as u64 {
-            let event = ChainEvent::BlockDisconnected {
-                height,
-                hash: bitcoin::BlockHash::all_zeros(),
-            };
-            self.emit(&mut st, event);
+        self.lock().events.inject(n, &self.stats.resyncs);
+    }
+}
+
+impl Runtime for Engine {
+    fn options(&self) -> &EngineOptions {
+        &self.options
+    }
+
+    fn post(&self, f: Box<dyn FnOnce() + Send>) -> Result<(), ChainError> {
+        Engine::post(self, f)
+    }
+
+    fn set_loop_thread(&self) {
+        Engine::set_loop_thread(self)
+    }
+
+    fn is_loop_thread(&self) -> bool {
+        Engine::is_loop_thread(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        Engine::is_closed(self)
+    }
+
+    fn stats(&self) -> ClientStats {
+        Engine::stats(self)
+    }
+
+    fn submit(&self, call: Call) -> Result<u64, ChainError> {
+        match call.route {
+            Route::Chain => Engine::submit(self, call),
+            Route::Wallet => Err(ChainError::Unsupported("wallet calls")),
+            Route::ChainBatch => Err(ChainError::Unsupported("batch calls")),
         }
+    }
+
+    fn abandon(&self, id: u64, error: ChainError) {
+        Engine::abandon(self, id, error)
+    }
+
+    fn start(&self) {
+        Engine::start(self)
+    }
+
+    fn stop(&self) {
+        Engine::stop(self)
+    }
+
+    fn close_all(&self) {
+        Engine::close_all(self)
+    }
+
+    fn release_loop(&self) -> Option<Arc<EventLoop>> {
+        Engine::release_loop(self)
+    }
+
+    #[cfg(feature = "testing")]
+    fn inject_events(&self, n: usize) {
+        Engine::inject_events(self, n)
     }
 }
 
 /// True once `deadline` has passed. A loop that runs late can handle a reply and its call's
 /// overdue deadline in one turn, I/O first; the deadline came first, so it wins.
-fn expired(deadline: Option<Instant>, now: Instant) -> bool {
+pub(crate) fn expired(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
 }
 
-fn round_up_to_ms(d: Duration) -> Duration {
+pub(crate) fn round_up_to_ms(d: Duration) -> Duration {
     Duration::from_millis(u64::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX))
 }
 
@@ -813,7 +940,7 @@ pub(crate) fn backoff_delay(
 }
 
 /// A factor in [0.8, 1.2) from a xorshift generator.
-fn jitter_factor(rng: &mut u64) -> f64 {
+pub(crate) fn jitter_factor(rng: &mut u64) -> f64 {
     let mut x = *rng;
     x ^= x << 13;
     x ^= x >> 7;
