@@ -50,6 +50,10 @@ name = "core_rpc"
 required-features = ["testing"]
 
 [[test]]
+name = "core_parity"
+required-features = ["testing"]
+
+[[test]]
 name = "socks5"
 required-features = ["testing"]
 

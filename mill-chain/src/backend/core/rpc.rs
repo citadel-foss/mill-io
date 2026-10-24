@@ -10,14 +10,14 @@
 //! in flight (deadline, cancel) closes that connection, or the late response would be
 //! read as the answer to the next request.
 
-use super::{CoreAuth, CoreConfig};
+use super::{CoreAuth, CoreConfig, CoreShared};
 use crate::engine::{backoff_delay, expired, jitter_factor, round_up_to_ms};
 use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime, Stats};
 use crate::layer::{Dialer, Hop};
 use crate::proto::http::{self, Response, ResponseParser};
 use crate::proto::jsonrpc;
 use crate::ChainError;
-use mill_io::{EventLoop, TimerId};
+use mill_io::{EventLoop, TaskPriority, TimerId};
 use mill_net::errors::{NetworkError, Result as NetResult};
 use mill_net::tcp::{ConnSender, ConnectionId, NetworkHandler, ServerContext};
 use mill_net::tcp::{TcpClient, TcpClientConfig};
@@ -210,6 +210,7 @@ pub(crate) struct CoreRpc {
     next_call_id: AtomicU64,
     state: Mutex<State>,
     stats: Stats,
+    shared: CoreShared,
 }
 
 pub(crate) struct Events {
@@ -332,6 +333,7 @@ impl CoreRpc {
             loop_thread: OnceLock::new(),
             closed: AtomicBool::new(false),
             next_call_id: AtomicU64::new(1),
+            shared: CoreShared::new(),
             state: Mutex::new(State {
                 closed: false,
                 auth: Auth::new(config.auth),
@@ -1025,6 +1027,16 @@ impl Runtime for CoreRpc {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+
+    fn spawn_compute(&self, task: Box<dyn FnOnce() + Send>) -> Result<(), ChainError> {
+        let event_loop = self.event_loop().ok_or(ChainError::Shutdown)?;
+        event_loop.spawn_compute_with_priority(task, TaskPriority::High);
+        Ok(())
+    }
+
+    fn core(&self) -> Option<&CoreShared> {
+        Some(&self.shared)
     }
 
     #[cfg(feature = "testing")]

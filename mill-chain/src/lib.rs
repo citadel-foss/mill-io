@@ -31,4 +31,4 @@ pub use client::{ChainClient, ChainConfig, ChainHandle, MillChain};
 pub use engine::{ClientStats, EngineOptions};
 pub use error::ChainError;
 pub use layer::{Socks5Config, Socks5Error, TlsConfig, TlsVerify, TransportConfig};
-pub use types::{BackendHealth, ChainEvent, FeeRate, HistoryItem, Tip, TxStatus, Utxo};
+pub use types::{BackendHealth, ChainEvent, FeeRate, HistoryItem, Tip, TxOutInfo, TxStatus, Utxo};
