@@ -8,6 +8,10 @@ pub(crate) use rpc::CoreRpc;
 pub use wallet::{AddressInfo, CoreWallet, ScanProgress, TxCategory, WalletTx, WalletUtxo};
 
 use crate::layer::TransportConfig;
+use crate::ChainError;
+use chain::{as_array, as_str, as_u32, field, opt_field, Query};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -93,11 +97,163 @@ pub enum CoreAuth {
 pub struct ZmqConfig {}
 
 /// State the typed queries of one Core client share across its handles.
-#[derive(Debug, Default)]
-pub(crate) struct CoreShared {}
+#[derive(Debug)]
+pub(crate) struct CoreShared {
+    /// The `rpc_url` host, standing in for a ZMQ endpoint bound to every interface.
+    rpc_host: String,
+}
 
 impl CoreShared {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(rpc_host: String) -> Self {
+        Self { rpc_host }
+    }
+}
+
+/// What the node offers, once it meets every requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeInfo {
+    /// Bitcoin Core's version, as `getnetworkinfo` reports it: 280100 for 28.1.0.
+    pub version: u32,
+    /// `-txindex` is on.
+    pub txindex: bool,
+    /// Every ZMQ topic the node publishes (`sequence`, `rawtx`, `rawblock`, `hashblock`,
+    /// `hashtx`), with its `tcp://host:port` endpoint. An endpoint bound to every interface
+    /// names the `rpc_url` host instead.
+    pub zmq: BTreeMap<String, String>,
+}
+
+/// The oldest Bitcoin Core supported: `gettxspendingprevout` arrived in 24.0.
+const MIN_VERSION: u32 = 240_000;
+/// `RPC_METHOD_NOT_FOUND`, which a bitcoind built without ZMQ answers
+/// `getzmqnotifications` with.
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Checks the node is Core 24 or later with `-txindex` and publishes the `sequence` and
+/// `rawtx` topics; [`ChainError::Unsupported`] naming the first problem found otherwise.
+/// The version is checked first, before asking an old node for anything else.
+pub(crate) fn node_requirements(q: &Query<'_>) -> Result<NodeInfo, ChainError> {
+    let network = q.chain("getnetworkinfo", json!([]))?;
+    let version = as_u32(field(&network, "version", "getnetworkinfo")?, "version")?;
+    if version < MIN_VERSION {
+        return Err(ChainError::Unsupported(
+            "Bitcoin Core version is below 24; 24 or later is required",
+        ));
+    }
+    let indexes = q.chain("getindexinfo", json!([]))?;
+    if !indexes.is_object() {
+        return Err(ChainError::Protocol("getindexinfo: not an object".into()));
+    }
+    if opt_field(&indexes, "txindex").is_none() {
+        return Err(ChainError::Unsupported(
+            "txindex is off; run Bitcoin Core with -txindex=1",
+        ));
+    }
+    let notifications = match q.chain("getzmqnotifications", json!([])) {
+        Ok(notifications) => notifications,
+        Err(ChainError::Server {
+            code: METHOD_NOT_FOUND,
+            ..
+        }) => {
+            return Err(ChainError::Unsupported(
+                "zmq is not built into this bitcoind; topics sequence and rawtx are required",
+            ))
+        }
+        Err(e) => return Err(e),
+    };
+    let zmq = zmq_endpoints(&notifications, &q.core().rpc_host)?;
+    if !zmq.contains_key("sequence") {
+        return Err(ChainError::Unsupported(
+            "zmq topic sequence is not published; set -zmqpubsequence",
+        ));
+    }
+    if !zmq.contains_key("rawtx") {
+        return Err(ChainError::Unsupported(
+            "zmq topic rawtx is not published; set -zmqpubrawtx",
+        ));
+    }
+    Ok(NodeInfo {
+        version,
+        txindex: true,
+        zmq,
+    })
+}
+
+/// Each published topic's endpoint, keyed by the topic without its `pub` prefix. The first
+/// endpoint listed wins when a topic is published twice.
+fn zmq_endpoints(list: &Value, rpc_host: &str) -> Result<BTreeMap<String, String>, ChainError> {
+    let mut endpoints = BTreeMap::new();
+    for notification in as_array(list, "getzmqnotifications")? {
+        let what = "getzmqnotifications";
+        let kind = as_str(field(notification, "type", what)?, "type")?;
+        let address = as_str(field(notification, "address", what)?, "address")?;
+        let topic = kind.strip_prefix("pub").unwrap_or(kind);
+        endpoints
+            .entry(topic.to_string())
+            .or_insert_with(|| reachable_endpoint(address, rpc_host));
+    }
+    Ok(endpoints)
+}
+
+/// `address` with a wildcard bind host replaced by `rpc_host`. Anything but `tcp://` is
+/// returned as is.
+fn reachable_endpoint(address: &str, rpc_host: &str) -> String {
+    let wildcard = address
+        .strip_prefix("tcp://")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .filter(|(host, _)| matches!(*host, "0.0.0.0" | "*" | "::" | "[::]"));
+    match wildcard {
+        Some((_, port)) => format!("tcp://{}:{}", rpc_host, port),
+        None => address.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_binds_name_the_rpc_host() {
+        for bind in ["0.0.0.0", "*", "::", "[::]"] {
+            assert_eq!(
+                reachable_endpoint(&format!("tcp://{}:28332", bind), "node.local"),
+                "tcp://node.local:28332",
+                "{}",
+                bind
+            );
+        }
+        assert_eq!(
+            reachable_endpoint("tcp://0.0.0.0:28332", "[::1]"),
+            "tcp://[::1]:28332"
+        );
+        for kept in [
+            "tcp://127.0.0.1:28332",
+            "tcp://10.0.0.2:28333",
+            "tcp://[::1]:28332",
+            "ipc:///tmp/zmq.sock",
+            "tcp://0.0.0.0",
+        ] {
+            assert_eq!(reachable_endpoint(kept, "node.local"), kept);
+        }
+    }
+
+    #[test]
+    fn topics_lose_their_pub_prefix_and_keep_the_first_endpoint() {
+        let list = json!([
+            {"type": "pubsequence", "address": "tcp://0.0.0.0:1", "hwm": 1000},
+            {"type": "pubrawtx", "address": "tcp://127.0.0.1:2", "hwm": 1000},
+            {"type": "pubrawtx", "address": "tcp://127.0.0.1:3", "hwm": 1000},
+        ]);
+        let endpoints = zmq_endpoints(&list, "h").unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints["sequence"], "tcp://h:1");
+        assert_eq!(endpoints["rawtx"], "tcp://127.0.0.1:2");
+        assert!(matches!(
+            zmq_endpoints(&json!([{"type": "pubrawtx"}]), "h"),
+            Err(ChainError::Protocol(_))
+        ));
+        assert!(matches!(
+            zmq_endpoints(&json!({}), "h"),
+            Err(ChainError::Protocol(_))
+        ));
     }
 }

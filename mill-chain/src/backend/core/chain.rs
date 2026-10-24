@@ -4,6 +4,7 @@
 //! message together say the thing does not exist. Core reuses `-5` for "cannot tell" (no
 //! `-txindex`, index still syncing), and those stay [`ChainError::Server`].
 
+use super::CoreShared;
 use crate::engine::Route;
 use crate::types::TxOutInfo;
 use crate::{ChainError, ChainHandle, FeeRate, Tip, TxStatus};
@@ -65,6 +66,7 @@ pub(crate) type Job<T> = Box<dyn FnOnce() -> Result<T, ChainError> + Send>;
 /// query started.
 pub(crate) struct Query<'a> {
     handle: &'a ChainHandle,
+    core: &'a CoreShared,
     deadline: Option<Instant>,
 }
 
@@ -72,13 +74,19 @@ impl<'a> Query<'a> {
     /// Starts a query; [`ChainError::Unsupported`] naming `what` on a backend that is not
     /// Bitcoin Core.
     pub(crate) fn new(handle: &'a ChainHandle, what: &'static str) -> Result<Self, ChainError> {
-        if handle.runtime().core().is_none() {
-            return Err(ChainError::Unsupported(what));
-        }
+        let core = handle
+            .runtime()
+            .core()
+            .ok_or(ChainError::Unsupported(what))?;
         Ok(Self {
             handle,
+            core,
             deadline: handle.deadline_from_now(),
         })
+    }
+
+    pub(crate) fn core(&self) -> &'a CoreShared {
+        self.core
     }
 
     pub(crate) fn chain(&self, method: &str, params: Value) -> Result<Value, ChainError> {
