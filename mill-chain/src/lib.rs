@@ -19,6 +19,8 @@ mod client;
 mod engine;
 mod error;
 #[cfg_attr(not(feature = "testing"), allow(dead_code))]
+mod layer;
+#[cfg_attr(not(feature = "testing"), allow(dead_code))]
 mod proto;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -28,4 +30,5 @@ pub use backend::core::{CoreAuth, CoreConfig, ZmqConfig};
 pub use client::{ChainClient, ChainConfig, ChainHandle, MillChain};
 pub use engine::{ClientStats, EngineOptions};
 pub use error::ChainError;
+pub use layer::{Socks5Config, Socks5Error, TransportConfig};
 pub use types::{BackendHealth, ChainEvent, FeeRate, HistoryItem, Tip, TxStatus, Utxo};

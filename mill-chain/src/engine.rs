@@ -11,6 +11,7 @@
 //! - A caller's reply channel is completed only after the call left `State` and the
 //!   `pending` gauge was updated, so `stats()` read after a call returns includes it.
 
+use crate::layer::{Dialer, Hop};
 use crate::{ChainError, ChainEvent};
 use crossbeam_channel::{Receiver, Sender};
 use mill_io::{EventLoop, TimerId};
@@ -132,9 +133,12 @@ struct Pending {
 
 enum Link {
     Idle,
+    /// Waiting for the compute pool to resolve the hop; the number tells attempts apart.
+    Resolving(u64),
     Connecting {
         _client: TcpClient<Events>,
         id: ConnectionId,
+        handshake: Option<TimerId>,
     },
     Connected {
         _client: TcpClient<Events>,
@@ -148,7 +152,7 @@ impl Link {
     fn id(&self) -> Option<ConnectionId> {
         match self {
             Link::Connecting { id, .. } | Link::Connected { id, .. } => Some(*id),
-            Link::Idle | Link::Backoff(_) => None,
+            Link::Idle | Link::Resolving(_) | Link::Backoff(_) => None,
         }
     }
 }
@@ -172,6 +176,7 @@ pub(crate) struct State {
     jitter: f64,
     rng: u64,
     connected_before: bool,
+    resolves: u64,
     events: EventSink,
     scratch: Vec<u8>,
 }
@@ -292,17 +297,20 @@ pub(crate) trait Runtime: Send + Sync {
     /// Emits `n` placeholder events from the loop thread.
     #[cfg(feature = "testing")]
     fn inject_events(&self, n: usize);
+    /// Hostnames resolved locally so far.
+    #[cfg(feature = "testing")]
+    fn dns_lookups(&self) -> u64;
 }
 
 /// Where and how to connect.
 pub(crate) struct Endpoint {
-    pub(crate) addr: SocketAddr,
+    pub(crate) dialer: Dialer,
     pub(crate) codec: Box<dyn Codec>,
 }
 
 pub(crate) struct Engine {
     me: Weak<Engine>,
-    addr: SocketAddr,
+    dialer: Dialer,
     pub(crate) options: EngineOptions,
     /// Taken out at shutdown, after the loop thread is joined, so the loop and its worker
     /// threads are dropped by the thread that shuts down.
@@ -350,9 +358,18 @@ impl NetworkHandler for Events {
 
     fn on_error(&self, _ctx: &ServerContext, conn: Option<ConnectionId>, error: NetworkError) {
         match (conn, &error) {
-            (Some(conn), NetworkError::Connect(_) | NetworkError::Io(_)) => {
+            (Some(conn), NetworkError::Connect(_)) => {
                 if let Some(engine) = self.engine.upgrade() {
                     engine.post_lost(conn, error.to_string());
+                }
+            }
+            (Some(conn), NetworkError::Io(cause)) => {
+                if let Some(engine) = self.engine.upgrade() {
+                    if peer_went_away(cause.as_ref()) {
+                        engine.post_lost(conn, error.to_string());
+                    } else {
+                        engine.post_io_error(conn, error.to_string(), cause.to_string());
+                    }
                 }
             }
             _ => log::debug!("backend connection: {}", error),
@@ -370,7 +387,7 @@ impl Engine {
         let seed = RandomState::new().build_hasher().finish() | 1;
         Arc::new_cyclic(|me| Engine {
             me: me.clone(),
-            addr: endpoint.addr,
+            dialer: endpoint.dialer,
             options,
             event_loop: RwLock::new(Some(event_loop)),
             loop_thread: OnceLock::new(),
@@ -390,6 +407,7 @@ impl Engine {
                 jitter: 1.0,
                 rng: seed,
                 connected_before: false,
+                resolves: 0,
                 events,
                 scratch: Vec::new(),
             }),
@@ -572,7 +590,26 @@ impl Engine {
             .and_then(|deadline| self.arm_deadline(&event_loop, id, deadline));
         match rearmed {
             Some(timer) => pending.timer = Some(timer),
-            None => self.finish(&mut st, &event_loop, id, Err(ChainError::Timeout)),
+            None => {
+                self.finish(&mut st, &event_loop, id, Err(ChainError::Timeout));
+                self.drop_unwanted_handshake(&mut st, &event_loop);
+            }
+        }
+    }
+
+    /// A layer handshake gets as long as the calls waiting on it: once the last of them
+    /// timed out, its socket is closed and the next call starts a fresh connection.
+    fn drop_unwanted_handshake(&self, st: &mut State, event_loop: &Arc<EventLoop>) {
+        let Link::Connecting { id, .. } = st.link else {
+            return;
+        };
+        if st.queue.is_empty() && self.dialer.handshake_timeout().is_some() {
+            self.lost(
+                st,
+                event_loop,
+                id,
+                "handshake still running at the call deadline",
+            );
         }
     }
 
@@ -594,10 +631,14 @@ impl Engine {
         let Link::Connecting {
             _client: client,
             id,
+            handshake,
         } = std::mem::replace(&mut st.link, Link::Idle)
         else {
             return;
         };
+        if let Some(timer) = handshake {
+            event_loop.cancel_timer(timer);
+        }
         let sender = client.sender();
         st.link = Link::Connected {
             _client: client,
@@ -660,6 +701,89 @@ impl Engine {
         if let Some(event_loop) = self.event_loop() {
             let mut st = self.lock();
             self.lost(&mut st, &event_loop, conn, &reason);
+        }
+    }
+
+    /// An I/O error before `on_connect` came from a layer's handshake (TCP connect
+    /// failures arrive as `Connect`); after it, the connection simply dropped.
+    fn post_io_error(&self, conn: ConnectionId, reason: String, cause: String) {
+        if let Some(engine) = self.me.upgrade() {
+            let _ = self.post(move || {
+                let Some(event_loop) = engine.event_loop() else {
+                    return;
+                };
+                let mut st = engine.lock();
+                if !engine.handshake_failed(&mut st, &event_loop, conn, &cause) {
+                    engine.lost(&mut st, &event_loop, conn, &reason);
+                }
+            });
+        }
+    }
+
+    fn on_handshake_timeout(&self, conn: ConnectionId, after: Duration) {
+        let Some(event_loop) = self.event_loop() else {
+            return;
+        };
+        let mut st = self.lock();
+        let reason = format!("timed out after {:?}", after);
+        self.handshake_failed(&mut st, &event_loop, conn, &reason);
+    }
+
+    /// The peer was reached but a layer's handshake failed, which a retry rarely fixes
+    /// (a refused proxy request, a bad certificate): queued calls fail now with the cause
+    /// unless they have retries left, and the reconnect goes on for later calls.
+    /// False if `conn` is not the connection being set up.
+    fn handshake_failed(
+        &self,
+        st: &mut State,
+        event_loop: &Arc<EventLoop>,
+        conn: ConnectionId,
+        cause: &str,
+    ) -> bool {
+        if !matches!(st.link, Link::Connecting { id, .. } if id == conn) {
+            return false;
+        }
+        let reason = format!("handshake failed: {}", cause);
+        self.lost(st, event_loop, conn, &reason);
+        let queued: Vec<u64> = st.queue.drain(..).collect();
+        for id in queued {
+            let Some(pending) = st.calls.get_mut(&id) else {
+                continue;
+            };
+            if pending.call.retries > 0 {
+                pending.call.retries -= 1;
+                st.queue.push_back(id);
+            } else {
+                self.finish(
+                    st,
+                    event_loop,
+                    id,
+                    Err(ChainError::Transport(reason.clone())),
+                );
+            }
+        }
+        true
+    }
+
+    fn on_resolved(&self, resolve: u64, result: std::io::Result<Vec<SocketAddr>>) {
+        let Some(event_loop) = self.event_loop() else {
+            return;
+        };
+        let mut st = self.lock();
+        if st.closed || !matches!(st.link, Link::Resolving(n) if n == resolve) {
+            return;
+        }
+        match result {
+            // Successive attempts walk the list, so one dead address cannot pin us.
+            Ok(addrs) if !addrs.is_empty() => {
+                let addr = addrs[st.attempt as usize % addrs.len()];
+                self.connect_to(&mut st, &event_loop, addr);
+            }
+            Ok(_) => self.schedule_reconnect(&mut st, &event_loop),
+            Err(e) => {
+                log::debug!("resolving the backend failed: {}", e);
+                self.schedule_reconnect(&mut st, &event_loop);
+            }
         }
     }
 
@@ -800,6 +924,25 @@ impl Engine {
     }
 
     fn connect(&self, st: &mut State, event_loop: &Arc<EventLoop>) {
+        let (host, port) = match self.dialer.hop() {
+            Hop::Connect(addr) => return self.connect_to(st, event_loop, addr),
+            Hop::Resolve(host, port) => (host, port),
+        };
+        st.resolves += 1;
+        let resolve = st.resolves;
+        st.link = Link::Resolving(resolve);
+        let resolver = self.dialer.resolver();
+        let engine = self.me.clone();
+        event_loop.spawn_compute(move || {
+            let result = resolver(&host, port);
+            if let Some(engine) = engine.upgrade() {
+                let posted = Arc::clone(&engine);
+                let _ = engine.post(move || posted.on_resolved(resolve, result));
+            }
+        });
+    }
+
+    fn connect_to(&self, st: &mut State, event_loop: &Arc<EventLoop>, addr: SocketAddr) {
         let config = TcpClientConfig {
             keep_alive: Some(Duration::from_secs(30)),
             ..TcpClientConfig::default()
@@ -807,18 +950,29 @@ impl Engine {
         let handler = Events {
             engine: self.me.clone(),
         };
-        let started = TcpClient::connect(self.addr, config, handler)
+        let started = TcpClient::connect(addr, config, handler)
+            .and_then(|client| self.dialer.add_layers(client))
             .and_then(|mut client| client.start(event_loop).map(|()| client))
             .map_err(|e| e.to_string());
         match started {
             Ok(client) => {
+                let id = client.id();
+                let handshake = self.dialer.handshake_timeout().map(|after| {
+                    let engine = self.me.clone();
+                    event_loop.schedule_once(after, move || {
+                        if let Some(engine) = engine.upgrade() {
+                            engine.on_handshake_timeout(id, after);
+                        }
+                    })
+                });
                 st.link = Link::Connecting {
-                    id: client.id(),
+                    id,
                     _client: client,
+                    handshake,
                 };
             }
             Err(e) => {
-                log::debug!("connecting to {} failed: {}", self.addr, e);
+                log::debug!("connecting to {} failed: {}", addr, e);
                 self.schedule_reconnect(st, event_loop);
             }
         }
@@ -848,6 +1002,11 @@ impl Engine {
             }
         });
         st.link = Link::Backoff(timer);
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn dns_lookups(&self) -> u64 {
+        self.dialer.dns_lookups()
     }
 
     /// Emits `n` placeholder events from the loop thread.
@@ -914,6 +1073,25 @@ impl Runtime for Engine {
     fn inject_events(&self, n: usize) {
         Engine::inject_events(self, n)
     }
+
+    #[cfg(feature = "testing")]
+    fn dns_lookups(&self) -> u64 {
+        Engine::dns_lookups(self)
+    }
+}
+
+/// The peer closed or reset the socket: a dropped connection, retried like any other, not
+/// a handshake a layer rejected.
+fn peer_went_away(cause: &(dyn std::error::Error + 'static)) -> bool {
+    cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        )
+    })
 }
 
 /// True once `deadline` has passed. A loop that runs late can handle a reply and its call's

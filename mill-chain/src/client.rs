@@ -6,6 +6,8 @@ use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime}
 #[cfg(feature = "testing")]
 use crate::engine::{Endpoint, Engine};
 #[cfg(feature = "testing")]
+use crate::layer::{Dialer, TransportConfig};
+#[cfg(feature = "testing")]
 use crate::proto::line::LineJsonRpc;
 use crate::{ChainError, ChainEvent};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -40,6 +42,19 @@ pub enum ChainConfig {
         /// Events held for the consumer before they are replaced by one `Resync`.
         events_capacity: usize,
     },
+    /// Line-delimited JSON-RPC to `host:port` through `transport`. The host may be a
+    /// hostname, which goes unresolved to a SOCKS5 proxy if one is set.
+    #[cfg(feature = "testing")]
+    RawLineJsonRpcVia {
+        /// The server's hostname or IP address.
+        host: String,
+        /// The server's port.
+        port: u16,
+        /// How to reach it.
+        transport: TransportConfig,
+        /// Events held for the consumer before they are replaced by one `Resync`.
+        events_capacity: usize,
+    },
     /// Bitcoin Core's JSON-RPC server over HTTP/1.1.
     Core(CoreConfig),
 }
@@ -49,6 +64,10 @@ impl ChainConfig {
         match self {
             #[cfg(feature = "testing")]
             ChainConfig::RawLineJsonRpc {
+                events_capacity, ..
+            } => *events_capacity,
+            #[cfg(feature = "testing")]
+            ChainConfig::RawLineJsonRpcVia {
                 events_capacity, ..
             } => *events_capacity,
             ChainConfig::Core(_) => CoreConfig::EVENTS_CAPACITY,
@@ -66,7 +85,20 @@ fn runtime(
         #[cfg(feature = "testing")]
         ChainConfig::RawLineJsonRpc { addr, .. } => {
             let endpoint = Endpoint {
-                addr,
+                dialer: Dialer::direct(addr),
+                codec: Box::new(LineJsonRpc::new()),
+            };
+            Ok(Engine::new(endpoint, options, event_loop, events))
+        }
+        #[cfg(feature = "testing")]
+        ChainConfig::RawLineJsonRpcVia {
+            host,
+            port,
+            transport,
+            ..
+        } => {
+            let endpoint = Endpoint {
+                dialer: Dialer::new(&host, port, &transport)?,
                 codec: Box::new(LineJsonRpc::new()),
             };
             Ok(Engine::new(endpoint, options, event_loop, events))
@@ -88,7 +120,11 @@ impl MillChain {
     /// Starts a client on its own event loop thread and begins connecting.
     ///
     /// Returns once the thread runs, without waiting for the connection: an unreachable
-    /// backend is retried in the background, and calls queue until it answers.
+    /// backend is retried in the background, and calls queue until it answers. A
+    /// connection whose handshake fails (a SOCKS5 proxy refusing the request) fails the
+    /// queued calls that have no retries left with [`ChainError::Transport`].
+    ///
+    /// Fails at once if the config is malformed, such as a proxy that is not `host:port`.
     pub fn spawn_with(
         config: ChainConfig,
         options: EngineOptions,
