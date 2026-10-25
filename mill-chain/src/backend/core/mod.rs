@@ -2,6 +2,7 @@
 
 pub(crate) mod chain;
 mod rpc;
+pub(crate) mod spend;
 mod wallet;
 
 pub(crate) use rpc::CoreRpc;
@@ -9,10 +10,13 @@ pub use wallet::{AddressInfo, CoreWallet, ScanProgress, TxCategory, WalletTx, Wa
 
 use crate::layer::TransportConfig;
 use crate::ChainError;
+use bitcoin::{Block, BlockHash};
 use chain::{as_array, as_str, as_u32, field, opt_field, Query};
 use serde_json::{json, Value};
+use spend::BlockCache;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// How to reach a Bitcoin Core node.
@@ -96,16 +100,39 @@ pub enum CoreAuth {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZmqConfig {}
 
-/// State the typed queries of one Core client share across its handles.
+/// State the typed queries of one Core client share across its handles. The cache is
+/// locked only by callers, never across a request.
 #[derive(Debug)]
 pub(crate) struct CoreShared {
     /// The `rpc_url` host, standing in for a ZMQ endpoint bound to every interface.
     rpc_host: String,
+    max_body_bytes: usize,
+    blocks: Mutex<BlockCache>,
 }
 
 impl CoreShared {
-    pub(crate) fn new(rpc_host: String) -> Self {
-        Self { rpc_host }
+    pub(crate) fn new(rpc_host: String, max_body_bytes: usize) -> Self {
+        Self {
+            rpc_host,
+            max_body_bytes,
+            blocks: Mutex::new(BlockCache::default()),
+        }
+    }
+
+    pub(crate) fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes
+    }
+
+    pub(crate) fn cached_block(&self, hash: &BlockHash) -> Option<Arc<Block>> {
+        self.cache().get(hash)
+    }
+
+    pub(crate) fn cache_block(&self, hash: BlockHash, block: Arc<Block>) {
+        self.cache().insert(hash, block);
+    }
+
+    fn cache(&self) -> MutexGuard<'_, BlockCache> {
+        self.blocks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

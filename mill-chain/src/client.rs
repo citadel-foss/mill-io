@@ -12,7 +12,7 @@ use crate::layer::{Dialer, TransportConfig};
 use crate::proto::line::LineJsonRpc;
 use crate::{ChainError, ChainEvent, FeeRate, Tip, TxOutInfo, TxStatus};
 use bitcoin::block::Header;
-use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid};
+use bitcoin::{Block, BlockHash, Network, OutPoint, Script, Transaction, Txid};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use mill_io::EventLoop;
 use serde_json::Value;
@@ -373,6 +373,25 @@ impl ChainHandle {
         include_mempool: bool,
     ) -> Result<Option<TxOutInfo>, ChainError> {
         Query::new(self, "tx_out")?.tx_out(outpoint, include_mempool)
+    }
+
+    /// The transaction spending `outpoint`: one in the mempool or the best chain, or with
+    /// `confirmed_only`, one in the best chain. `Ok(None)` means the node shows no such
+    /// spend; an outpoint whose transaction the node does not have is
+    /// [`ChainError::NotFound`].
+    ///
+    /// On Bitcoin Core this asks the mempool with `gettxspendingprevout`, then scans the
+    /// blocks from the funding block to the tip in batches, decoded on the compute pool and
+    /// cached; `script`, which backends that index by script need, is not used.
+    pub fn spending_tx(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        confirmed_only: bool,
+    ) -> Result<Option<Arc<Transaction>>, ChainError> {
+        let _ = script;
+        let q = Query::new(self, "spending_tx")?;
+        crate::backend::core::spend::spending_tx(&q, outpoint, confirmed_only)
     }
 
     /// Broadcasts `tx` and returns its txid. A transaction the node already has, in its
