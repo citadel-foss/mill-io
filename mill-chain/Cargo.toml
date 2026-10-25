@@ -26,6 +26,7 @@ sha2 = { version = "0.10", optional = true }
 webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
+bitcoincore-rpc-json = "0.19"
 bitcoind = "0.36"
 mill-net = { workspace = true, features = ["testing"] }
 proptest = "1"
