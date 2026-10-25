@@ -38,6 +38,10 @@ testing = []
 # TLS connections (rustls with ring, WebPKI roots, certificate pins).
 tls = ["dep:rustls", "dep:sha2", "dep:webpki-roots"]
 
+[[example]]
+name = "core_over_tor"
+required-features = ["tls"]
+
 [[test]]
 name = "engine"
 required-features = ["testing"]
