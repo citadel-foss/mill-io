@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     env,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[cfg(target_os = "linux")]
@@ -18,24 +18,6 @@ use mio::Interest;
 static EVENT_LOOP: OnceLock<EventLoop> = OnceLock::new();
 fn event_loop() -> &'static EventLoop {
     EVENT_LOOP.get_or_init(EventLoop::default)
-}
-static CURRENT_TOKEN: OnceLock<RwLock<NextToken>> = OnceLock::new();
-fn current_token_lock() -> &'static RwLock<NextToken> {
-    CURRENT_TOKEN.get_or_init(|| RwLock::new(NextToken::new()))
-}
-
-struct NextToken(usize);
-
-impl NextToken {
-    fn new() -> Self {
-        NextToken(1)
-    }
-
-    fn next(&mut self) -> Token {
-        let next = self.0;
-        self.0 += 1;
-        Token(next)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +54,7 @@ impl FileWatcher {
 
     pub fn watch_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref().to_path_buf();
-        let token = current_token_lock().write()?.next();
+        let token = event_loop().alloc_token();
 
         println!("[INFO] Watching path={:?}, token={:?}", path, token);
 
