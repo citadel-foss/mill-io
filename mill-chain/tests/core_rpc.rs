@@ -3,7 +3,7 @@
 
 use bitcoind::bitcoincore_rpc::{self, RpcApi};
 use bitcoind::{BitcoinD, Conf};
-use mill_chain::MillChain;
+use mill_chain::Chain;
 use mill_chain::{ChainClient, ChainConfig, ChainError, ChainHandle, CoreAuth, CoreConfig};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -48,7 +48,7 @@ fn core_config(node: &BitcoinD) -> CoreConfig {
 fn connect(node: &BitcoinD, wallet: Option<&str>) -> ChainClient {
     let mut config = core_config(node);
     config.wallet = wallet.map(str::to_string);
-    MillChain::spawn(ChainConfig::Core(config)).unwrap()
+    Chain::spawn(ChainConfig::Core(config)).unwrap()
 }
 
 /// Makes calls and records which methods round-tripped.
@@ -273,7 +273,7 @@ fn cookie_rotation_after_restart() {
 
     // Spawned before the node, while the cookie does not exist yet.
     let config = CoreConfig::new(url.clone(), CoreAuth::Cookie(cookie.clone()));
-    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    let client = Chain::spawn(ChainConfig::Core(config)).unwrap();
     let handle = client.handle();
 
     let first = Process::start(datadir.path(), port);
@@ -305,7 +305,7 @@ fn work_queue_full_is_absorbed() {
     let mut config = core_config(&node);
     // Far more connections than the node's 2 threads and 2 queue slots, so it answers 503.
     config.rpc_connections = 64;
-    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    let client = Chain::spawn(ChainConfig::Core(config)).unwrap();
     let left = Arc::new(AtomicIsize::new(1000));
     let errors = Arc::new(AtomicUsize::new(0));
     let callers: Vec<_> = (0..64)

@@ -14,7 +14,7 @@
 
 mod support;
 
-use mill_chain::{ChainConfig, ChainError, ChainHandle, MillChain};
+use mill_chain::{Chain, ChainConfig, ChainError, ChainHandle};
 use mill_io::EventLoop;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let client = MillChain::spawn(ChainConfig::Core(support::core_config(None)))?;
+    let client = Chain::spawn(ChainConfig::Core(support::core_config(None)))?;
     let app = Arc::new(EventLoop::new_low_latency(64, 100)?);
     let running = {
         let app = Arc::clone(&app);

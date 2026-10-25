@@ -1,4 +1,4 @@
-//! The blocking facade: [`MillChain`] starts a client, [`ChainClient`] owns it and
+//! The blocking facade: [`Chain`] starts a client, [`ChainClient`] owns it and
 //! [`ChainHandle`] makes calls.
 
 use crate::backend::core::chain::Query;
@@ -112,9 +112,9 @@ fn runtime(
 
 /// Starts chain clients.
 #[derive(Debug)]
-pub struct MillChain;
+pub struct Chain;
 
-impl MillChain {
+impl Chain {
     /// Starts a client with [`EngineOptions::default`]; see [`spawn_with`](Self::spawn_with).
     pub fn spawn(config: ChainConfig) -> Result<ChainClient, ChainError> {
         Self::spawn_with(config, EngineOptions::default())

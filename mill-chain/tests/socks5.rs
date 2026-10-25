@@ -2,8 +2,8 @@ use mill_chain::testing::{
     local_dns_lookups, HttpReply, MockHttpServer, MockReply, MockScript, MockServer, MockSocks5,
 };
 use mill_chain::{
-    ChainClient, ChainConfig, ChainError, CoreAuth, CoreConfig, MillChain, Socks5Config,
-    Socks5Error, TransportConfig,
+    Chain, ChainClient, ChainConfig, ChainError, CoreAuth, CoreConfig, Socks5Config, Socks5Error,
+    TransportConfig,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -45,7 +45,7 @@ fn via_proxy(proxy: SocketAddr, isolate: bool) -> TransportConfig {
 }
 
 fn spawn(host: &str, port: u16, transport: TransportConfig) -> ChainClient {
-    MillChain::spawn(ChainConfig::RawLineJsonRpcVia {
+    Chain::spawn(ChainConfig::RawLineJsonRpcVia {
         host: host.to_string(),
         port,
         transport,
@@ -280,7 +280,7 @@ fn malformed_proxy_is_refused_at_spawn() {
             }),
             tls: None,
         };
-        let result = MillChain::spawn(ChainConfig::RawLineJsonRpcVia {
+        let result = Chain::spawn(ChainConfig::RawLineJsonRpcVia {
             host: "example.onion".into(),
             port: 1,
             transport,
@@ -328,7 +328,7 @@ fn core_via(node_port: u16, transport: TransportConfig) -> ChainClient {
         },
     );
     config.transport = transport;
-    MillChain::spawn(ChainConfig::Core(config)).unwrap()
+    Chain::spawn(ChainConfig::Core(config)).unwrap()
 }
 
 #[test]

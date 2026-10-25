@@ -20,7 +20,7 @@
 mod support;
 
 use mill_chain::bitcoin::{OutPoint, ScriptBuf, Txid};
-use mill_chain::{ChainConfig, ChainError, ChainHandle, MillChain};
+use mill_chain::{Chain, ChainConfig, ChainError, ChainHandle};
 use mill_io::EventLoop;
 use std::error::Error;
 use std::process::ExitCode;
@@ -84,7 +84,7 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
     let confirmed_only = args.next().as_deref() != Some("any");
     let give_up = Duration::from_secs(args.next().map_or(Ok(600), |s| s.parse())?);
 
-    let client = MillChain::spawn(ChainConfig::Core(support::core_config(None)))?;
+    let client = Chain::spawn(ChainConfig::Core(support::core_config(None)))?;
     let stop = Arc::new(AtomicBool::new(false));
     let chain = client
         .handle()

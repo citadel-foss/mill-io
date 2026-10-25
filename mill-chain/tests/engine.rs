@@ -1,6 +1,6 @@
 use crossbeam_channel::TryRecvError;
 use mill_chain::testing::{inject_events, on_reactor, MockReply, MockScript, MockServer};
-use mill_chain::{ChainClient, ChainConfig, ChainError, ChainEvent, EngineOptions, MillChain};
+use mill_chain::{Chain, ChainClient, ChainConfig, ChainError, ChainEvent, EngineOptions};
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::Read;
@@ -42,7 +42,7 @@ fn spawn(addr: SocketAddr, options: EngineOptions, events_capacity: usize) -> Ch
         addr,
         events_capacity,
     };
-    MillChain::spawn_with(config, options).unwrap()
+    Chain::spawn_with(config, options).unwrap()
 }
 
 fn connect(server: &MockServer) -> ChainClient {
