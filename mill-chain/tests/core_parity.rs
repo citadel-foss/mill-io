@@ -1443,19 +1443,7 @@ fn fund_watch_broadcast_confirm() {
         .unwrap();
     mine(&node, 101);
 
-    let funding = node
-        .client
-        .send_to_address(
-            &address,
-            Amount::ONE_BTC,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+    let funding = pay(&node, &address, Amount::ONE_BTC);
     mine(&node, 1);
     let utxos = w.list_unspent(1, None).unwrap();
     assert_eq!(utxos.len(), 1);
@@ -1501,19 +1489,7 @@ fn spend_lookup_is_bounded() {
     let keys = key_holder(&node);
     mine(&node, 101);
     let address = keys.get_new_address(None, None).unwrap().assume_checked();
-    let funding = node
-        .client
-        .send_to_address(
-            &address,
-            Amount::ONE_BTC,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+    let funding = pay(&node, &address, Amount::ONE_BTC);
     mine(&node, 1);
     let (outpoint, script) = output_to(&node, funding, &address);
     mine(&node, 199);
@@ -1556,23 +1532,8 @@ fn spend_lookup_edges_on_regtest() {
 
     // Funded and spent in the same block.
     let address = keys.get_new_address(None, None).unwrap().assume_checked();
-    let funding = node
-        .client
-        .send_to_address(
-            &address,
-            Amount::ONE_BTC,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+    let funding = pay(&node, &address, Amount::ONE_BTC);
     let (outpoint, script) = output_to(&node, funding, &address);
-    assert!(wait_until(10 * SECS, || keys
-        .get_transaction(&funding, None)
-        .is_ok()));
     let spend = sign_spend(&node, &keys, outpoint, Amount::ONE_BTC);
     h.broadcast(&spend).unwrap();
     // Funding unconfirmed: no confirmed spend can exist, but the mempool has one.
