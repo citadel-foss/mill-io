@@ -1,5 +1,6 @@
 //! Bitcoin Core over its JSON-RPC HTTP server.
 
+pub(crate) mod chain;
 mod rpc;
 
 pub(crate) use rpc::CoreRpc;
@@ -88,3 +89,13 @@ pub enum CoreAuth {
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZmqConfig {}
+
+/// State the typed queries of one Core client share across its handles.
+#[derive(Debug, Default)]
+pub(crate) struct CoreShared {}
+
+impl CoreShared {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
