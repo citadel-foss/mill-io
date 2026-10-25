@@ -14,23 +14,7 @@ use mill_chain::{EngineOptions, TxStatus};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
-
-const SECS: Duration = Duration::from_secs(1);
-
-fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
+use std::time::Duration;
 
 fn exe() -> String {
     bitcoind::exe_path().expect("set BITCOIND_EXE to a bitcoind binary")
@@ -55,6 +39,14 @@ fn connect(node: &BitcoinD, wallet: Option<&str>) -> ChainClient {
     MillChain::spawn(ChainConfig::Core(core_config(node, wallet))).unwrap()
 }
 
+/// Returns once every wallet on the node has processed the blocks and mempool transactions
+/// validated so far, which Core hands to wallets through an asynchronous queue.
+fn synced(node: &BitcoinD) {
+    node.client
+        .call::<Value>("syncwithvalidationinterfacequeue", &[])
+        .unwrap();
+}
+
 /// Mines `n` blocks to the node's default wallet.
 fn mine(node: &BitcoinD, n: u64) -> Vec<BlockHash> {
     let to = node
@@ -62,7 +54,19 @@ fn mine(node: &BitcoinD, n: u64) -> Vec<BlockHash> {
         .get_new_address(None, None)
         .unwrap()
         .assume_checked();
-    node.client.generate_to_address(n, &to).unwrap()
+    let mined = node.client.generate_to_address(n, &to).unwrap();
+    synced(node);
+    mined
+}
+
+/// Sends `amount` from the node's default wallet to `to`.
+fn pay(node: &BitcoinD, to: &Address, amount: Amount) -> Txid {
+    let txid = node
+        .client
+        .send_to_address(to, amount, None, None, None, None, None, None)
+        .unwrap();
+    synced(node);
+    txid
 }
 
 /// Sends `sats` from the node's default wallet to a fresh address of its own.
@@ -72,18 +76,7 @@ fn send(node: &BitcoinD, sats: u64) -> Txid {
         .get_new_address(None, None)
         .unwrap()
         .assume_checked();
-    node.client
-        .send_to_address(
-            &to,
-            Amount::from_sat(sats),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap()
+    pay(node, &to, Amount::from_sat(sats))
 }
 
 /// The best block hash the mocks report unless a test says otherwise.
@@ -893,43 +886,14 @@ fn wallet_views_on_regtest() {
         vec![address.as_unchecked().clone()]
     );
 
-    let first = node
-        .client
-        .send_to_address(
-            &address,
-            Amount::ONE_BTC,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-    // minconf 0 includes the mempool. The wallet hears of mempool transactions
-    // asynchronously.
-    assert!(wait_until(10 * SECS, || w
-        .list_unspent(0, None)
-        .unwrap()
-        .len()
-        == 1));
+    let first = pay(&node, &address, Amount::ONE_BTC);
+    // minconf 0 includes the mempool.
     let unconfirmed = w.list_unspent(0, None).unwrap();
+    assert_eq!(unconfirmed.len(), 1);
     assert_eq!(unconfirmed[0].confirmations, 0);
     assert_eq!(w.list_unspent(1, None), Ok(Vec::new()));
     mine(&node, 1);
-    let second = node
-        .client
-        .send_to_address(
-            &address,
-            Amount::from_sat(30_000),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+    let second = pay(&node, &address, Amount::from_sat(30_000));
 
     let confirmed = w.list_unspent(1, None).unwrap();
     assert_eq!(confirmed.len(), 1);
