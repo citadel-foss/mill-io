@@ -89,3 +89,29 @@ Bitcoin Core.
   over the proxy if one is set. `TlsVerify` picks WebPKI roots, a CA file, or a SHA-256
   pin of the server's leaf certificate; `InsecureForTests` exists only with `testing`.
   The name check is skipped for `.onion` hosts; the chain or pin is still checked.
+
+## Examples
+
+Each example is a short program in [`examples/`](examples); its module doc gives the run
+command. They reach Bitcoin Core through `BITCOIN_RPC_URL` (default
+`http://127.0.0.1:18443`) and `BITCOIN_RPC_AUTH=user:password` or `BITCOIN_RPC_COOKIE`
+(default `~/.bitcoin/regtest/.cookie`).
+
+| Example | Shows |
+| --- | --- |
+| `core_queries` | `node_requirements`, the tip and a header, `estimate_fee`, `tx_status`, and reading `ChainError::is_absence` |
+| `watch_wallet` | `core_wallet`: `prepare`, `import_descriptors`, a rescan with `scanning_status` progress, `list_unspent`, `list_transactions` |
+| `spend_watch` | polling `spending_tx` on a mill-io timer, with a give-up timer on the handle's cancel flag; only `Ok(None)` means "not spent" |
+| `shared_handle` | one client shared by many tasks on a mill-io compute pool, each with its own deadline, retries or cancel flag; `stats()` |
+| `core_over_tor` | an onion RPC endpoint through Tor's SOCKS port with `isolate`, optionally over TLS with a pinned certificate or a CA file (`--features tls`) |
+
+A regtest node that serves all of them, `node_requirements` included:
+
+```text
+bitcoind -regtest -txindex=1 -fallbackfee=0.0001 \
+    -zmqpubsequence=tcp://127.0.0.1:28332 -zmqpubrawtx=tcp://127.0.0.1:28333
+```
+
+RPC auth is the node's cookie by default; with `-rpcuser`/`-rpcpassword` or `-rpcauth`, set
+`BITCOIN_RPC_AUTH`. `-fallbackfee` only lets the node's own wallet fund the examples'
+addresses on regtest, where there are no fee estimates.
