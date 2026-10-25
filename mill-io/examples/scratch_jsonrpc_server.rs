@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock},
     time::SystemTime,
 };
 
@@ -17,27 +17,6 @@ fn event_loop() -> &'static EventLoop {
 }
 
 const LISTENER_TOKEN: Token = Token(1);
-static NEXT_TOKEN: OnceLock<RwLock<TokenGenerator>> = OnceLock::new();
-fn next_token_lock() -> &'static RwLock<TokenGenerator> {
-    NEXT_TOKEN.get_or_init(|| RwLock::new(TokenGenerator::new()))
-}
-
-struct TokenGenerator {
-    next: usize,
-}
-
-impl TokenGenerator {
-    fn new() -> Self {
-        Self { next: 2 }
-    }
-
-    fn next(&mut self) -> Token {
-        let token = Token(self.next);
-        self.next += 1;
-        token
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 pub enum RpcRequest {
     Ping,
@@ -86,7 +65,7 @@ impl RpcServer {
                 Ok((mut stream, addr)) => {
                     println!("[INFO] New RPC connection from: {}", addr);
 
-                    let token = next_token_lock().write()?.next();
+                    let token = event_loop().alloc_token();
 
                     let before = SystemTime::now();
                     event_loop().register(
