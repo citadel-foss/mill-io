@@ -28,7 +28,7 @@ mod types;
 
 pub use backend::core::{AddressInfo, CoreWallet, ScanProgress, TxCategory, WalletTx, WalletUtxo};
 pub use backend::core::{CoreAuth, CoreConfig, NodeInfo, ZmqConfig};
-pub use client::{ChainClient, ChainConfig, ChainHandle, MillChain};
+pub use client::{Chain, ChainClient, ChainConfig, ChainHandle};
 pub use engine::{ClientStats, EngineOptions};
 pub use error::ChainError;
 pub use layer::{Socks5Config, Socks5Error, TlsConfig, TlsVerify, TransportConfig};

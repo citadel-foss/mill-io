@@ -1,5 +1,5 @@
 use mill_chain::testing::{batch_raw, parse_http_response, HttpReply, HttpRequest, MockHttpServer};
-use mill_chain::{ChainClient, ChainConfig, ChainError, CoreAuth, CoreConfig, MillChain};
+use mill_chain::{Chain, ChainClient, ChainConfig, ChainError, CoreAuth, CoreConfig};
 use mill_net::testing::{ChaosConfig, ChaosProxy};
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -38,7 +38,7 @@ fn config(url: String) -> CoreConfig {
 }
 
 fn spawn(config: CoreConfig) -> ChainClient {
-    MillChain::spawn(ChainConfig::Core(config)).unwrap()
+    Chain::spawn(ChainConfig::Core(config)).unwrap()
 }
 
 /// Answers every request, batched or not, with its own params.
@@ -687,7 +687,7 @@ fn bad_urls_are_refused() {
         "http://127.0.0.1",
     ] {
         assert!(matches!(
-            MillChain::spawn(ChainConfig::Core(config(url.into()))),
+            Chain::spawn(ChainConfig::Core(config(url.into()))),
             Err(ChainError::Unsupported(_))
         ));
     }

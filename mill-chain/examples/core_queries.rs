@@ -12,14 +12,14 @@
 mod support;
 
 use mill_chain::bitcoin::Txid;
-use mill_chain::{ChainConfig, ChainError, MillChain, TxStatus};
+use mill_chain::{Chain, ChainConfig, ChainError, TxStatus};
 use std::error::Error;
 use std::process::ExitCode;
 use std::time::Duration;
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     let txid: Option<Txid> = std::env::args().nth(1).map(|t| t.parse()).transpose()?;
-    let client = MillChain::spawn(ChainConfig::Core(support::core_config(None)))?;
+    let client = Chain::spawn(ChainConfig::Core(support::core_config(None)))?;
     let chain = client.handle().deadline(Duration::from_secs(10));
 
     match chain.node_requirements() {

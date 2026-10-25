@@ -1,6 +1,6 @@
 use mill_chain::testing::{local_dns_lookups, MockSocks5};
 use mill_chain::{
-    ChainClient, ChainConfig, ChainError, MillChain, Socks5Config, TlsConfig, TlsVerify,
+    Chain, ChainClient, ChainConfig, ChainError, Socks5Config, TlsConfig, TlsVerify,
     TransportConfig,
 };
 use mill_net::testing::{ChaosConfig, ChaosProxy};
@@ -225,7 +225,7 @@ fn tls(server_name: Option<&str>, verify: TlsVerify) -> TransportConfig {
 }
 
 fn spawn(host: &str, port: u16, transport: TransportConfig) -> ChainClient {
-    MillChain::spawn(ChainConfig::RawLineJsonRpcVia {
+    Chain::spawn(ChainConfig::RawLineJsonRpcVia {
         host: host.to_string(),
         port,
         transport,
@@ -512,7 +512,7 @@ fn bad_tls_configs_fail_at_spawn() {
     let empty = tls(None, TlsVerify::CaFile(garbage.0.clone()));
     let bad_name = tls(Some("not a hostname"), TlsVerify::WebPki);
     for transport in [missing, empty, bad_name] {
-        let result = MillChain::spawn(ChainConfig::RawLineJsonRpcVia {
+        let result = Chain::spawn(ChainConfig::RawLineJsonRpcVia {
             host: "127.0.0.1".into(),
             port: 1,
             transport: transport.clone(),
@@ -525,7 +525,7 @@ fn bad_tls_configs_fail_at_spawn() {
             result
         );
     }
-    let webpki = MillChain::spawn(ChainConfig::RawLineJsonRpcVia {
+    let webpki = Chain::spawn(ChainConfig::RawLineJsonRpcVia {
         host: "127.0.0.1".into(),
         port: 1,
         transport: tls(None, TlsVerify::WebPki),

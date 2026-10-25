@@ -12,7 +12,7 @@ use mill_chain::bitcoin::{Transaction, Txid};
 use mill_chain::testing::{
     HttpReply, HttpRequest, MockHttpServer, MockReply, MockScript, MockServer,
 };
-use mill_chain::{ChainClient, ChainConfig, ChainError, CoreAuth, CoreConfig, MillChain};
+use mill_chain::{Chain, ChainClient, ChainConfig, ChainError, CoreAuth, CoreConfig};
 use mill_chain::{EngineOptions, TxStatus};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +39,7 @@ fn core_config(node: &BitcoinD, wallet: Option<&str>) -> CoreConfig {
 }
 
 fn connect(node: &BitcoinD, wallet: Option<&str>) -> ChainClient {
-    MillChain::spawn(ChainConfig::Core(core_config(node, wallet))).unwrap()
+    Chain::spawn(ChainConfig::Core(core_config(node, wallet))).unwrap()
 }
 
 /// Returns once every wallet on the node has processed the blocks and mempool transactions
@@ -112,7 +112,7 @@ fn spawn_quick(url: String) -> ChainClient {
         backoff_max: Duration::from_millis(50),
         ..EngineOptions::default()
     };
-    MillChain::spawn_with(ChainConfig::Core(config), options).unwrap()
+    Chain::spawn_with(ChainConfig::Core(config), options).unwrap()
 }
 
 fn rpc_reply<F>(req: &HttpRequest, answer: &F) -> HttpReply
@@ -734,7 +734,7 @@ fn one_deadline_covers_a_whole_query() {
 #[test]
 fn typed_queries_need_bitcoin_core() {
     let server = MockServer::start(MockScript::new(|_| MockReply::Never)).unwrap();
-    let client = MillChain::spawn_with(
+    let client = Chain::spawn_with(
         ChainConfig::RawLineJsonRpc {
             addr: server.addr(),
             events_capacity: 16,
@@ -995,7 +995,7 @@ where
         },
     );
     config.wallet = wallet.map(str::to_string);
-    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    let client = Chain::spawn(ChainConfig::Core(config)).unwrap();
     (server, client)
 }
 
@@ -1187,7 +1187,7 @@ fn wallet_failures_are_errors() {
         backoff_max: Duration::from_millis(50),
         ..EngineOptions::default()
     };
-    let client = MillChain::spawn_with(ChainConfig::Core(config), options).unwrap();
+    let client = Chain::spawn_with(ChainConfig::Core(config), options).unwrap();
     let w = client.handle().core_wallet().unwrap();
     let errors = [
         w.prepare("w"),
@@ -1338,7 +1338,7 @@ fn zmq_endpoints_discovered_per_topic() {
     // The RPC host, written as a name, replaces each wildcard bind.
     let mut config = core_config(&node, None);
     config.rpc_url = config.rpc_url.replace("127.0.0.1", "localhost");
-    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    let client = Chain::spawn(ChainConfig::Core(config)).unwrap();
     let info = client.handle().node_requirements().unwrap();
     let expected: std::collections::BTreeMap<String, String> = [
         ("sequence", format!("tcp://localhost:{}", sequence_port)),
@@ -1699,7 +1699,7 @@ fn mock_spends(
         },
     );
     config.max_body_bytes = max_body_bytes;
-    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    let client = Chain::spawn(ChainConfig::Core(config)).unwrap();
     (server, client, chain)
 }
 

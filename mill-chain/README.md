@@ -19,7 +19,7 @@ Every query returns `Result<_, ChainError>`.
 
 ## Threading rules
 
-- `MillChain::spawn` starts one event loop thread (mill-io, direct dispatch) that owns
+- `Chain::spawn` starts one event loop thread (mill-io, direct dispatch) that owns
   the backend connection and every protocol state machine. Nothing else runs on it.
 - `ChainClient` and `ChainHandle` are `Clone + Send + Sync`. Calls block the calling
   thread until a reply, the handle's deadline, its cancel flag, or shutdown. All handles
