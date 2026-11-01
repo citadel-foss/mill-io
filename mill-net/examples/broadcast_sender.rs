@@ -16,7 +16,6 @@ use mill_net::tcp::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 const DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
@@ -152,8 +151,8 @@ impl NetworkHandler for Downloader {
     }
 }
 
-fn main() -> Result<()> {
-    let event_loop = Arc::new(EventLoop::default());
+#[mill_io::main]
+fn main(event_loop: &Arc<EventLoop>) -> Result<()> {
     let subscribers = Subscribers::default();
     let (downloads, download_requests) = mpsc::channel();
     let (drained, drained_events) = mpsc::channel();
@@ -171,7 +170,7 @@ fn main() -> Result<()> {
             drained,
         },
     )?);
-    Arc::clone(&server).start(&event_loop, event_loop.alloc_token())?;
+    Arc::clone(&server).start(event_loop, event_loop.alloc_token())?;
     let addr = server.local_addr()?;
     println!(
         "[server] on {addr}, watermarks: high {} KiB, low {} KiB",
@@ -182,20 +181,15 @@ fn main() -> Result<()> {
     let ticks = AtomicUsize::new(0);
     let ticker = {
         let subscribers = Arc::clone(&subscribers);
-        event_loop.schedule_repeating(Duration::from_millis(20), move || {
+        mill_io::every(Duration::from_millis(20), move || {
             broadcast_tick(&subscribers, ticks.fetch_add(1, Ordering::SeqCst) + 1);
         })
-    };
-
-    let runner = {
-        let event_loop = Arc::clone(&event_loop);
-        thread::spawn(move || event_loop.run().expect("event loop failed"))
     };
 
     let (lines, tick_lines) = mpsc::channel();
     let mut subscriber =
         TcpClient::connect(addr, TcpClientConfig::default(), Subscriber { lines })?;
-    subscriber.start(&event_loop)?;
+    subscriber.start(event_loop)?;
 
     let received = Arc::new(AtomicUsize::new(0));
     let (complete, download_complete) = mpsc::channel();
@@ -207,12 +201,12 @@ fn main() -> Result<()> {
             complete,
         },
     )?;
-    downloader.start(&event_loop)?;
+    downloader.start(event_loop)?;
 
     let (first_refusal, refused_at) = mpsc::channel();
     let producer = {
         let sender = download_requests.recv_timeout(WAIT)?;
-        thread::spawn(move || stream_download(sender, drained_events, first_refusal))
+        mill_io::spawn(move || stream_download(sender, drained_events, first_refusal))
     };
 
     let refused_after = refused_at.recv_timeout(WAIT)?;
@@ -238,12 +232,10 @@ fn main() -> Result<()> {
         received.load(Ordering::SeqCst) / (1024 * 1024)
     );
 
-    event_loop.cancel_timer(ticker);
+    mill_io::cancel_timer(ticker);
     drop(subscriber);
     drop(downloader);
     server.stop()?;
-    event_loop.stop();
-    runner.join().expect("event loop thread panicked");
 
     assert!(download.refusals >= 1);
     assert_eq!(received.load(Ordering::SeqCst), DOWNLOAD_BYTES);

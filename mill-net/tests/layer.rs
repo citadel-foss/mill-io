@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mill_io::EventLoop;
+
 mod common;
 
 use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
@@ -174,36 +176,30 @@ fn xor_layer_round_trip() {
     }
 }
 
-#[test]
-fn layer_handshake_gates_on_connect_and_transforms_bytes() {
-    for (mode, event_loop) in pool_and_direct() {
-        let (server, echo) = xor_echo_server(&event_loop);
-        let runner = spawn_loop(&event_loop);
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn layer_handshake_gates_on_connect_and_transforms_bytes(event_loop: &Arc<EventLoop>) {
+    let (server, echo) = xor_echo_server(event_loop);
 
-        let mut raw = TcpStream::connect(server.local_addr().unwrap()).unwrap();
-        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut key = [0; 1];
-        raw.read_exact(&mut key).unwrap();
-        assert_eq!(key, [0x5a], "{mode}: the server's layer did not start");
-        assert!(
-            !wait_until(Duration::from_millis(100), || echo
-                .connects
-                .load(Ordering::SeqCst)
-                > 0),
-            "{mode}: on_connect fired before the handshake finished"
-        );
+    let mut raw = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut key = [0; 1];
+    raw.read_exact(&mut key).unwrap();
+    assert_eq!(key, [0x5a], "the server's layer did not start");
+    assert!(
+        !wait_until(Duration::from_millis(100), || echo
+            .connects
+            .load(Ordering::SeqCst)
+            > 0),
+        "on_connect fired before the handshake finished"
+    );
 
-        raw.write_all(&[0x11]).unwrap();
-        raw.write_all(&[b'h' ^ 0x11, b'i' ^ 0x11]).unwrap();
-        let mut reply = [0; 2];
-        raw.read_exact(&mut reply).unwrap();
-        assert_eq!(reply, [b'h' ^ 0x5a, b'i' ^ 0x5a], "{mode}");
-        assert_eq!(echo.received.lock().as_slice(), b"hi", "{mode}");
-        assert_eq!(echo.connects.load(Ordering::SeqCst), 1, "{mode}");
-
-        stop_loop(&event_loop, runner);
-        drop(server);
-    }
+    raw.write_all(&[0x11]).unwrap();
+    raw.write_all(&[b'h' ^ 0x11, b'i' ^ 0x11]).unwrap();
+    let mut reply = [0; 2];
+    raw.read_exact(&mut reply).unwrap();
+    assert_eq!(reply, [b'h' ^ 0x5a, b'i' ^ 0x5a]);
+    assert_eq!(echo.received.lock().as_slice(), b"hi");
+    assert_eq!(echo.connects.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -300,70 +296,63 @@ fn is_peer_gone(kind: Option<io::ErrorKind>) -> bool {
     )
 }
 
-#[test]
-fn peer_close_during_the_handshake_is_an_error() {
-    for (mode, event_loop) in pool_and_direct() {
-        let runner = spawn_loop(&event_loop);
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn peer_close_during_the_handshake_is_an_error(event_loop: &Arc<EventLoop>) {
+    // Client side: the peer accepts and closes before sending its key.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let watcher = Watcher::default();
+    let mut client = TcpClient::connect(
+        listener.local_addr().unwrap(),
+        TcpClientConfig::default(),
+        watcher.clone(),
+    )
+    .unwrap()
+    .with_layer(XorLayer::new(0x33))
+    .unwrap();
+    client.start(event_loop).unwrap();
+    drop(listener.accept().unwrap());
+    assert!(
+        wait_until(Duration::from_secs(2), || !watcher.errors.lock().is_empty()),
+        "client: the close during the handshake was not reported"
+    );
+    let (conn, kind) = watcher.errors.lock()[0];
+    assert_eq!(conn, Some(client.id()));
+    assert!(is_peer_gone(kind), "client: {kind:?}");
+    assert!(
+        wait_until(Duration::from_secs(2), || matches!(
+            client.send(b"x"),
+            Err(SendError::Closed)
+        )),
+        "client: the connection was not cleaned up"
+    );
+    assert_eq!(watcher.connects.load(Ordering::SeqCst), 0);
+    assert_eq!(watcher.disconnects.load(Ordering::SeqCst), 0);
 
-        // Client side: the peer accepts and closes before sending its key.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let watcher = Watcher::default();
-        let mut client = TcpClient::connect(
-            listener.local_addr().unwrap(),
-            TcpClientConfig::default(),
-            watcher.clone(),
-        )
-        .unwrap()
-        .with_layer(XorLayer::new(0x33))
+    // Server side: a raw peer connects and closes before sending its key.
+    let watcher = Watcher::default();
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        .build();
+    let server = Arc::new(
+        TcpServer::new(config, watcher.clone())
+            .unwrap()
+            .with_layer(|| Box::new(XorLayer::new(0x44))),
+    );
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
         .unwrap();
-        client.start(&event_loop).unwrap();
-        drop(listener.accept().unwrap());
-        assert!(
-            wait_until(Duration::from_secs(2), || !watcher.errors.lock().is_empty()),
-            "{mode}: client: the close during the handshake was not reported"
-        );
-        let (conn, kind) = watcher.errors.lock()[0];
-        assert_eq!(conn, Some(client.id()), "{mode}");
-        assert!(is_peer_gone(kind), "{mode}: client: {kind:?}");
-        assert!(
-            wait_until(Duration::from_secs(2), || matches!(
-                client.send(b"x"),
-                Err(SendError::Closed)
-            )),
-            "{mode}: client: the connection was not cleaned up"
-        );
-        assert_eq!(watcher.connects.load(Ordering::SeqCst), 0, "{mode}");
-        assert_eq!(watcher.disconnects.load(Ordering::SeqCst), 0, "{mode}");
-
-        // Server side: a raw peer connects and closes before sending its key.
-        let watcher = Watcher::default();
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            .build();
-        let server = Arc::new(
-            TcpServer::new(config, watcher.clone())
-                .unwrap()
-                .with_layer(|| Box::new(XorLayer::new(0x44))),
-        );
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-        drop(TcpStream::connect(server.local_addr().unwrap()).unwrap());
-        assert!(
-            wait_until(Duration::from_secs(2), || !watcher.errors.lock().is_empty()),
-            "{mode}: server: the close during the handshake was not reported"
-        );
-        let (conn, kind) = watcher.errors.lock()[0];
-        assert!(conn.is_some(), "{mode}");
-        assert!(is_peer_gone(kind), "{mode}: server: {kind:?}");
-        assert!(
-            wait_until(Duration::from_secs(2), || server.connection_count() == 0),
-            "{mode}: server: the connection was not cleaned up"
-        );
-        assert_eq!(watcher.connects.load(Ordering::SeqCst), 0, "{mode}");
-        assert_eq!(watcher.disconnects.load(Ordering::SeqCst), 0, "{mode}");
-
-        stop_loop(&event_loop, runner);
-        drop((client, server));
-    }
+    drop(TcpStream::connect(server.local_addr().unwrap()).unwrap());
+    assert!(
+        wait_until(Duration::from_secs(2), || !watcher.errors.lock().is_empty()),
+        "server: the close during the handshake was not reported"
+    );
+    let (conn, kind) = watcher.errors.lock()[0];
+    assert!(conn.is_some());
+    assert!(is_peer_gone(kind), "server: {kind:?}");
+    assert!(
+        wait_until(Duration::from_secs(2), || server.connection_count() == 0),
+        "server: the connection was not cleaned up"
+    );
+    assert_eq!(watcher.connects.load(Ordering::SeqCst), 0);
+    assert_eq!(watcher.disconnects.load(Ordering::SeqCst), 0);
 }

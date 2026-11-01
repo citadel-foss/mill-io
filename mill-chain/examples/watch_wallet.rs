@@ -18,29 +18,23 @@
 mod support;
 
 use mill_chain::{Chain, ChainConfig, CoreWallet};
-use mill_io::EventLoop;
 use serde_json::json;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 const LAST_INDEX: u32 = 99;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 struct Progress {
-    app: Arc<EventLoop>,
     wallet: CoreWallet,
     rescanned: AtomicBool,
 }
 
 fn report_later(progress: Arc<Progress>) {
-    let app = Arc::clone(&progress.app);
-    app.schedule_once(PROGRESS_INTERVAL, move || {
-        let app = Arc::clone(&progress.app);
-        app.spawn_compute(move || report(progress));
+    mill_io::after(PROGRESS_INTERVAL, move || {
+        mill_io::spawn(move || report(progress));
     });
 }
 
@@ -60,6 +54,7 @@ fn report(progress: Arc<Progress>) {
     report_later(progress);
 }
 
+#[mill_io::main(low_latency, events = 64, poll_timeout_ms = 100)]
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let usage = "usage: watch_wallet <wallet> <descriptor#checksum> [rescan-from]";
@@ -83,30 +78,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("imported {}", descriptor);
     }
 
-    let app = Arc::new(EventLoop::new_low_latency(64, 100)?);
-    let running = {
-        let app = Arc::clone(&app);
-        thread::spawn(move || app.run().map_err(|e| e.to_string()))
-    };
-    let (rescanned, rescan) = mpsc::sync_channel(1);
     let long_calls = client.handle().deadline(Duration::from_secs(6 * 3600));
-    app.spawn_compute(move || {
-        let result = long_calls
+    let rescan = mill_io::spawn(move || {
+        long_calls
             .core_wallet()
-            .and_then(|wallet| wallet.rescan_from(rescan_from));
-        let _ = rescanned.send(result);
+            .and_then(|wallet| wallet.rescan_from(rescan_from))
     });
     let progress = Arc::new(Progress {
-        app: Arc::clone(&app),
         wallet: wallet.clone(),
         rescanned: AtomicBool::new(false),
     });
     report_later(Arc::clone(&progress));
 
-    let result = rescan.recv()?;
+    let result = rescan.join()?;
     progress.rescanned.store(true, Ordering::SeqCst);
-    app.stop();
-    running.join().map_err(|_| "event loop panicked")??;
     result?;
     println!("rescanned from height {}", rescan_from);
 

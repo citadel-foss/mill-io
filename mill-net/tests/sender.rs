@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use mill_io::EventLoop;
+
 mod common;
 
 use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
@@ -166,103 +168,97 @@ fn socket_report(_port: u16) -> String {
     String::new()
 }
 
-#[test]
-fn conn_sender_from_threads_and_timers() {
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn conn_sender_from_threads_and_timers(event_loop: &Arc<EventLoop>) {
     const THREADS: u32 = 8;
     const PER_THREAD: u32 = 2000;
     const TIMER_FRAMES: u32 = 200;
     const COMPUTE_FRAMES: u32 = 500;
     const TOTAL: usize = (THREADS * PER_THREAD + TIMER_FRAMES + COMPUTE_FRAMES) as usize;
 
-    for (mode, event_loop) in pool_and_direct() {
-        let checker = FrameChecker::default();
-        let state = Arc::clone(&checker.state);
-        let frames = Arc::clone(&checker.frames);
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            .build();
-        let server = Arc::new(TcpServer::new(config, checker).unwrap());
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-
-        let drains = Drains::default();
-        let mut client = TcpClient::connect(
-            server.local_addr().unwrap(),
-            TcpClientConfig::default(),
-            drains.clone(),
-        )
+    let checker = FrameChecker::default();
+    let state = Arc::clone(&checker.state);
+    let frames = Arc::clone(&checker.frames);
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        .build();
+    let server = Arc::new(TcpServer::new(config, checker).unwrap());
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
         .unwrap();
-        client.start(&event_loop).unwrap();
-        let runner = spawn_loop(&event_loop);
 
-        let timer_sender = client.sender();
-        let timer_seq = Arc::new(AtomicU32::new(0));
-        let timer = {
-            let timer_seq = Arc::clone(&timer_seq);
-            event_loop.schedule_repeating(Duration::from_millis(1), move || {
-                let seq = timer_seq.load(Ordering::SeqCst);
-                if seq < TIMER_FRAMES && timer_sender.send(&frame(THREADS, seq)).is_ok() {
-                    timer_seq.store(seq + 1, Ordering::SeqCst);
+    let drains = Drains::default();
+    let mut client = TcpClient::connect(
+        server.local_addr().unwrap(),
+        TcpClientConfig::default(),
+        drains.clone(),
+    )
+    .unwrap();
+    client.start(event_loop).unwrap();
+
+    let timer_sender = client.sender();
+    let timer_seq = Arc::new(AtomicU32::new(0));
+    let timer = {
+        let timer_seq = Arc::clone(&timer_seq);
+        event_loop.schedule_repeating(Duration::from_millis(1), move || {
+            let seq = timer_seq.load(Ordering::SeqCst);
+            if seq < TIMER_FRAMES && timer_sender.send(&frame(THREADS, seq)).is_ok() {
+                timer_seq.store(seq + 1, Ordering::SeqCst);
+            }
+        })
+    };
+
+    let compute_sender = client.sender();
+    let compute_drains = drains.clone();
+    event_loop.spawn_compute(move || {
+        for seq in 0..COMPUTE_FRAMES {
+            send_retrying(&compute_sender, &frame(THREADS + 1, seq), &compute_drains);
+        }
+    });
+
+    let producers: Vec<_> = (0..THREADS)
+        .map(|producer| {
+            let sender = client.sender();
+            let drains = drains.clone();
+            thread::spawn(move || {
+                for seq in 0..PER_THREAD {
+                    send_retrying(&sender, &frame(producer, seq), &drains);
                 }
             })
-        };
+        })
+        .collect();
+    for producer in producers {
+        producer.join().unwrap();
+    }
 
-        let compute_sender = client.sender();
-        let compute_drains = drains.clone();
-        event_loop.spawn_compute(move || {
-            for seq in 0..COMPUTE_FRAMES {
-                send_retrying(&compute_sender, &frame(THREADS + 1, seq), &compute_drains);
-            }
-        });
-
-        let producers: Vec<_> = (0..THREADS)
-            .map(|producer| {
-                let sender = client.sender();
-                let drains = drains.clone();
-                thread::spawn(move || {
-                    for seq in 0..PER_THREAD {
-                        send_retrying(&sender, &frame(producer, seq), &drains);
-                    }
-                })
-            })
-            .collect();
-        for producer in producers {
-            producer.join().unwrap();
-        }
-
-        let all_arrived = wait_until(Duration::from_secs(30), || {
+    let all_arrived = wait_until(Duration::from_secs(30), || {
+        frames.load(Ordering::SeqCst) >= TOTAL
+    });
+    let stalled_at = (!all_arrived).then(|| {
+        // Tells a slow machine from a stall in the failure message.
+        let at_deadline = frames.load(Ordering::SeqCst);
+        let sockets = socket_report(server.local_addr().unwrap().port());
+        wait_until(Duration::from_secs(30), || {
             frames.load(Ordering::SeqCst) >= TOTAL
         });
-        let stalled_at = (!all_arrived).then(|| {
-            // Tells a slow machine from a stall in the failure message.
-            let at_deadline = frames.load(Ordering::SeqCst);
-            let sockets = socket_report(server.local_addr().unwrap().port());
-            wait_until(Duration::from_secs(30), || {
-                frames.load(Ordering::SeqCst) >= TOTAL
-            });
-            (at_deadline, frames.load(Ordering::SeqCst), sockets)
-        });
-        event_loop.cancel_timer(timer);
-        let state = state.lock();
-        assert!(
-            state.errors.is_empty(),
-            "{mode}: {} bad frames, first: {}",
-            state.errors.len(),
-            state.errors[0]
+        (at_deadline, frames.load(Ordering::SeqCst), sockets)
+    });
+    event_loop.cancel_timer(timer);
+    let state = state.lock();
+    assert!(
+        state.errors.is_empty(),
+        "{} bad frames, first: {}",
+        state.errors.len(),
+        state.errors[0]
+    );
+    if let Some((at_deadline, later, sockets)) = stalled_at {
+        panic!(
+            "{at_deadline} of {TOTAL} frames arrived within 30 s, {later} after 30 s more ({}); sockets at the deadline:\n{sockets}",
+            if later == at_deadline { "stalled" } else { "still moving" }
         );
-        if let Some((at_deadline, later, sockets)) = stalled_at {
-            panic!(
-                "{mode}: {at_deadline} of {TOTAL} frames arrived within 30 s, {later} after 30 s more ({}); sockets at the deadline:\n{sockets}",
-                if later == at_deadline { "stalled" } else { "still moving" }
-            );
-        }
-        assert_eq!(timer_seq.load(Ordering::SeqCst), TIMER_FRAMES);
-        drop(state);
-
-        stop_loop(&event_loop, runner);
-        drop((client, server));
     }
+    assert_eq!(timer_seq.load(Ordering::SeqCst), TIMER_FRAMES);
+    drop(state);
 }
 
 #[derive(Clone, Default)]
@@ -373,171 +369,146 @@ fn close_from_handler_and_threads_fires_on_disconnect_once() {
     }
 }
 
-#[test]
-fn zero_byte_send_writes_nothing() {
-    for (mode, event_loop) in pool_and_direct() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let handler = Lifecycle::default();
-        let connects = Arc::clone(&handler.connects);
-        let disconnects = Arc::clone(&handler.disconnects);
-        let mut client = TcpClient::connect(
-            listener.local_addr().unwrap(),
-            TcpClientConfig::default(),
-            handler,
-        )
-        .unwrap();
-        client.start(&event_loop).unwrap();
-        let runner = spawn_loop(&event_loop);
-        let (mut peer, _) = listener.accept().unwrap();
-        assert!(wait_until(Duration::from_secs(5), || connects
-            .load(Ordering::SeqCst)
-            == 1));
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn zero_byte_send_writes_nothing(event_loop: &Arc<EventLoop>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let handler = Lifecycle::default();
+    let connects = Arc::clone(&handler.connects);
+    let disconnects = Arc::clone(&handler.disconnects);
+    let mut client = TcpClient::connect(
+        listener.local_addr().unwrap(),
+        TcpClientConfig::default(),
+        handler,
+    )
+    .unwrap();
+    client.start(event_loop).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    assert!(wait_until(Duration::from_secs(5), || connects
+        .load(Ordering::SeqCst)
+        == 1));
 
-        let sender = client.sender();
-        sender.send(b"").unwrap();
-        sender.send(b"a").unwrap();
-        sender.send(b"").unwrap();
-        let mut first = [0; 1];
-        peer.read_exact(&mut first).unwrap();
-        sender.close();
-        assert!(matches!(sender.send(b""), Err(SendError::Closed)), "{mode}");
+    let sender = client.sender();
+    sender.send(b"").unwrap();
+    sender.send(b"a").unwrap();
+    sender.send(b"").unwrap();
+    let mut first = [0; 1];
+    peer.read_exact(&mut first).unwrap();
+    sender.close();
+    assert!(matches!(sender.send(b""), Err(SendError::Closed)));
 
-        let mut rest = Vec::new();
-        peer.read_to_end(&mut rest).unwrap();
-        assert_eq!(&first, b"a", "{mode}");
-        assert!(rest.is_empty(), "{mode}: {} extra bytes", rest.len());
-        assert_eq!(disconnects.load(Ordering::SeqCst), 1, "{mode}");
-
-        stop_loop(&event_loop, runner);
-    }
+    let mut rest = Vec::new();
+    peer.read_to_end(&mut rest).unwrap();
+    assert_eq!(&first, b"a");
+    assert!(rest.is_empty(), "{} extra bytes", rest.len());
+    assert_eq!(disconnects.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn peer_close_with_queued_data_disconnects_once() {
-    for (mode, event_loop) in pool_and_direct() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let handler = Lifecycle::default();
-        let connects = Arc::clone(&handler.connects);
-        let disconnects = Arc::clone(&handler.disconnects);
-        let config = TcpClientConfig {
-            high_watermark: 64 * 1024 * 1024,
-            ..TcpClientConfig::default()
-        };
-        let mut client =
-            TcpClient::connect(listener.local_addr().unwrap(), config, handler).unwrap();
-        client.start(&event_loop).unwrap();
-        let runner = spawn_loop(&event_loop);
-        let (peer, _) = listener.accept().unwrap();
-        assert!(wait_until(Duration::from_secs(5), || connects
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn peer_close_with_queued_data_disconnects_once(event_loop: &Arc<EventLoop>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let handler = Lifecycle::default();
+    let connects = Arc::clone(&handler.connects);
+    let disconnects = Arc::clone(&handler.disconnects);
+    let config = TcpClientConfig {
+        high_watermark: 64 * 1024 * 1024,
+        ..TcpClientConfig::default()
+    };
+    let mut client = TcpClient::connect(listener.local_addr().unwrap(), config, handler).unwrap();
+    client.start(event_loop).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    assert!(wait_until(Duration::from_secs(5), || connects
+        .load(Ordering::SeqCst)
+        == 1));
+
+    client.send(&vec![3; 32 * 1024 * 1024]).unwrap();
+    drop(peer);
+
+    assert!(
+        wait_until(Duration::from_secs(5), || disconnects
             .load(Ordering::SeqCst)
-            == 1));
-
-        client.send(&vec![3; 32 * 1024 * 1024]).unwrap();
-        drop(peer);
-
-        assert!(
-            wait_until(Duration::from_secs(5), || disconnects
-                .load(Ordering::SeqCst)
-                == 1),
-            "{mode}: the peer's close went unnoticed"
-        );
-        assert!(
-            wait_until(Duration::from_secs(5), || matches!(
-                client.send(b"x"),
-                Err(SendError::Closed)
-            )),
-            "{mode}: sends still accepted after the peer closed"
-        );
-        assert!(
-            !wait_until(Duration::from_millis(100), || disconnects
-                .load(Ordering::SeqCst)
-                > 1),
-            "{mode}: on_disconnect fired twice"
-        );
-
-        stop_loop(&event_loop, runner);
-    }
+            == 1),
+        "the peer's close went unnoticed"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || matches!(
+            client.send(b"x"),
+            Err(SendError::Closed)
+        )),
+        "sends still accepted after the peer closed"
+    );
+    assert!(
+        !wait_until(Duration::from_millis(100), || disconnects
+            .load(Ordering::SeqCst)
+            > 1),
+        "on_disconnect fired twice"
+    );
 }
 
-#[test]
-fn reset_mid_frame_is_an_error() {
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn reset_mid_frame_is_an_error(event_loop: &Arc<EventLoop>) {
     use mill_net::testing::{ChaosConfig, ChaosProxy};
     use std::io::Write;
     use std::net::TcpStream;
 
-    for (mode, event_loop) in pool_and_direct() {
-        let handler = Lifecycle::default();
-        let disconnects = Arc::clone(&handler.disconnects);
-        let errors = Arc::clone(&handler.errors);
-        let received = Arc::clone(&handler.received);
-        let connected = Arc::clone(&handler.connects);
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            .build();
-        let server = Arc::new(TcpServer::new(config, handler).unwrap());
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-        let runner = spawn_loop(&event_loop);
-        let proxy = ChaosProxy::start(
-            server.local_addr().unwrap(),
-            ChaosConfig {
-                reset_after: Some(1000),
-                ..ChaosConfig::default()
-            },
-        )
+    let handler = Lifecycle::default();
+    let disconnects = Arc::clone(&handler.disconnects);
+    let errors = Arc::clone(&handler.errors);
+    let received = Arc::clone(&handler.received);
+    let connected = Arc::clone(&handler.connects);
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        .build();
+    let server = Arc::new(TcpServer::new(config, handler).unwrap());
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
         .unwrap();
+    let proxy = ChaosProxy::start(
+        server.local_addr().unwrap(),
+        ChaosConfig {
+            reset_after: Some(1000),
+            ..ChaosConfig::default()
+        },
+    )
+    .unwrap();
 
-        let mut peer = TcpStream::connect(proxy.addr()).unwrap();
-        let _ = peer.write_all(&[5; 100_000]);
+    let mut peer = TcpStream::connect(proxy.addr()).unwrap();
+    let _ = peer.write_all(&[5; 100_000]);
 
-        assert!(
-            wait_until(Duration::from_secs(5), || disconnects
-                .load(Ordering::SeqCst)
-                == 1),
-            "{mode}: the reset went unnoticed"
-        );
-        assert_eq!(connected.load(Ordering::SeqCst), 1, "{mode}");
-        let errors = errors.lock().clone();
-        assert!(
-            !errors.is_empty() && errors.iter().all(Option::is_some),
-            "{mode}: the reset was not reported as a connection error: {errors:?}"
-        );
-        assert!(received.load(Ordering::SeqCst) <= 1000, "{mode}");
-        assert_eq!(server.connection_count(), 0, "{mode}");
-
-        stop_loop(&event_loop, runner);
-        drop((proxy, server));
-    }
+    assert!(
+        wait_until(Duration::from_secs(5), || disconnects
+            .load(Ordering::SeqCst)
+            == 1),
+        "the reset went unnoticed"
+    );
+    assert_eq!(connected.load(Ordering::SeqCst), 1);
+    let errors = errors.lock().clone();
+    assert!(
+        !errors.is_empty() && errors.iter().all(Option::is_some),
+        "the reset was not reported as a connection error: {errors:?}"
+    );
+    assert!(received.load(Ordering::SeqCst) <= 1000);
+    assert_eq!(server.connection_count(), 0);
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn accepted_socket_option_errors_name_the_connection() {
-    for (mode, event_loop) in pool_and_direct() {
-        let handler = Lifecycle::default();
-        let (ids, errors) = (Arc::clone(&handler.ids), Arc::clone(&handler.errors));
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            // Linux rejects a TCP_KEEPIDLE above 32767 s, so every accept fails this option.
-            .keep_alive(Some(Duration::MAX))
-            .build();
-        let server = Arc::new(TcpServer::new(config, handler).unwrap());
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-        let runner = spawn_loop(&event_loop);
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn accepted_socket_option_errors_name_the_connection(event_loop: &Arc<EventLoop>) {
+    let handler = Lifecycle::default();
+    let (ids, errors) = (Arc::clone(&handler.ids), Arc::clone(&handler.errors));
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        // Linux rejects a TCP_KEEPIDLE above 32767 s, so every accept fails this option.
+        .keep_alive(Some(Duration::MAX))
+        .build();
+    let server = Arc::new(TcpServer::new(config, handler).unwrap());
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
+        .unwrap();
 
-        let _peer = std::net::TcpStream::connect(server.local_addr().unwrap()).unwrap();
-        assert!(
-            wait_until(Duration::from_secs(5), || ids.lock().len() == 1),
-            "{mode}"
-        );
-        let id = ids.lock()[0];
-        assert_eq!(*errors.lock(), vec![Some(id)], "{mode}");
-
-        stop_loop(&event_loop, runner);
-    }
+    let _peer = std::net::TcpStream::connect(server.local_addr().unwrap()).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || ids.lock().len() == 1));
+    let id = ids.lock()[0];
+    assert_eq!(*errors.lock(), vec![Some(id)]);
 }
 
 #[derive(Clone, Default)]
@@ -560,67 +531,61 @@ impl NetworkHandler for Pauser {
     }
 }
 
-#[test]
-fn paused_reads_push_back_on_the_peer() {
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn paused_reads_push_back_on_the_peer(event_loop: &Arc<EventLoop>) {
     const TOTAL: usize = 64 * 1024 * 1024;
     const CHUNK: usize = 64 * 1024;
 
-    for (mode, event_loop) in pool_and_direct() {
-        let pauser = Pauser::default();
-        let (paused, received) = (Arc::clone(&pauser.sender), Arc::clone(&pauser.received));
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            .build();
-        let server = Arc::new(TcpServer::new(config, pauser).unwrap());
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-        let mut client = TcpClient::connect(
-            server.local_addr().unwrap(),
-            TcpClientConfig::default(),
-            Lifecycle::default(),
-        )
+    let pauser = Pauser::default();
+    let (paused, received) = (Arc::clone(&pauser.sender), Arc::clone(&pauser.received));
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        .build();
+    let server = Arc::new(TcpServer::new(config, pauser).unwrap());
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
         .unwrap();
-        client.start(&event_loop).unwrap();
-        let runner = spawn_loop(&event_loop);
-        assert!(wait_until(Duration::from_secs(5), || paused
-            .lock()
-            .is_some()));
+    let mut client = TcpClient::connect(
+        server.local_addr().unwrap(),
+        TcpClientConfig::default(),
+        Lifecycle::default(),
+    )
+    .unwrap();
+    client.start(event_loop).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || paused
+        .lock()
+        .is_some()));
 
-        let data: Vec<u8> = (0..TOTAL).map(|i| (i % 253) as u8).collect();
-        let chunks: Vec<&[u8]> = data.chunks(CHUNK).collect();
-        let mut next = 0;
-        while next < chunks.len() {
-            match client.send(chunks[next]) {
-                Ok(()) => next += 1,
-                Err(SendError::Backpressure) => break,
-                Err(e) => panic!("{mode}: {e}"),
-            }
+    let data: Vec<u8> = (0..TOTAL).map(|i| (i % 253) as u8).collect();
+    let chunks: Vec<&[u8]> = data.chunks(CHUNK).collect();
+    let mut next = 0;
+    while next < chunks.len() {
+        match client.send(chunks[next]) {
+            Ok(()) => next += 1,
+            Err(SendError::Backpressure) => break,
+            Err(e) => panic!("{e}"),
         }
-        assert!(
-            next < chunks.len(),
-            "{mode}: the sender never felt the paused reader"
-        );
-        assert!(
-            received.lock().is_empty(),
-            "{mode}: paused reads still delivered data"
-        );
-
-        paused.lock().as_ref().unwrap().resume_reads();
-        for chunk in &chunks[next..] {
-            assert!(
-                wait_until(Duration::from_secs(10), || client.send(chunk).is_ok()),
-                "{mode}: the queue never drained after resume_reads"
-            );
-        }
-        assert!(
-            wait_until(Duration::from_secs(30), || received.lock().len() == TOTAL),
-            "{mode}: {} of {TOTAL} bytes after resume_reads",
-            received.lock().len()
-        );
-        assert!(*received.lock() == data, "{mode}: bytes reordered or lost");
-
-        stop_loop(&event_loop, runner);
-        drop((client, server));
     }
+    assert!(
+        next < chunks.len(),
+        "the sender never felt the paused reader"
+    );
+    assert!(
+        received.lock().is_empty(),
+        "paused reads still delivered data"
+    );
+
+    paused.lock().as_ref().unwrap().resume_reads();
+    for chunk in &chunks[next..] {
+        assert!(
+            wait_until(Duration::from_secs(10), || client.send(chunk).is_ok()),
+            "the queue never drained after resume_reads"
+        );
+    }
+    assert!(
+        wait_until(Duration::from_secs(30), || received.lock().len() == TOTAL),
+        "{} of {TOTAL} bytes after resume_reads",
+        received.lock().len()
+    );
+    assert!(*received.lock() == data, "bytes reordered or lost");
 }

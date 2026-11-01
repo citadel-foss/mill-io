@@ -10,9 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mill_io::EventLoop;
+
 mod common;
 
-use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
+use common::wait_until;
 
 type ErrorLog = Arc<Mutex<Vec<(Option<ConnectionId>, String, Option<io::ErrorKind>, Instant)>>>;
 
@@ -56,217 +58,186 @@ impl NetworkHandler for Recorder {
 }
 
 #[cfg(unix)]
-#[test]
-fn connect_timeout_is_enforced() {
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn connect_timeout_is_enforced(event_loop: &Arc<EventLoop>) {
     use std::net::TcpStream;
 
-    for (mode, event_loop) in pool_and_direct() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Calling `listen` again on a listening socket changes its backlog. 1, not 0: some
+    // systems read 0 as "the default".
+    socket2::SockRef::from(&listener).listen(1).unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Fill the queue until the kernel starts dropping SYNs, however it counts the
+    // backlog; then the client's SYN is dropped too.
+    let mut fillers = Vec::new();
+    let mut black_hole = false;
+    while fillers.len() < 200 {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            Ok(stream) => fillers.push(stream),
+            Err(e) => {
+                black_hole = e.kind() == io::ErrorKind::TimedOut;
+                break;
+            }
+        }
+    }
+    if !black_hole && !cfg!(target_os = "linux") {
+        eprintln!(
+            "skipped: after {} connections the listener still answered SYNs, \
+             so this OS gives no way to stall a connect",
+            fillers.len()
+        );
+        return;
+    }
+    assert!(black_hole, "a full backlog did not drop SYNs");
+
+    let recorder = Recorder::default();
+    let errors = Arc::clone(&recorder.errors);
+    let connects = Arc::clone(&recorder.connects);
+    let disconnects = Arc::clone(&recorder.disconnects);
+    let config = TcpClientConfig {
+        connect_timeout: Duration::from_millis(500),
+        ..TcpClientConfig::default()
+    };
+    let mut client = TcpClient::connect(addr, config, recorder).unwrap();
+    let id = client.id();
+    let started = Instant::now();
+    client.start(event_loop).unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(2), || !errors.lock().is_empty()),
+        "no connect error within 2 s"
+    );
+    let (conn, message, kind, at) = errors.lock()[0].clone();
+    let elapsed = at - started;
+    assert!(
+        elapsed <= Duration::from_millis(700),
+        "timed out after {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(450),
+        "failed early after {elapsed:?}: {message}"
+    );
+    assert_eq!(conn, Some(id));
+    assert_eq!(kind, Some(io::ErrorKind::TimedOut), "{message}");
+    assert_eq!(connects.load(Ordering::SeqCst), 0, "on_connect fired");
+    assert_eq!(disconnects.load(Ordering::SeqCst), 0);
+    assert!(matches!(client.send(b"x"), Err(SendError::Closed)));
+    assert_eq!(event_loop.pending_timers(), 0, "timer left behind");
+}
+
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn connect_refused_is_an_error(event_loop: &Arc<EventLoop>) {
+    let addr = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        // Calling `listen` again on a listening socket changes its backlog. 1, not 0: some
-        // systems read 0 as "the default".
-        socket2::SockRef::from(&listener).listen(1).unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Fill the queue until the kernel starts dropping SYNs, however it counts the
-        // backlog; then the client's SYN is dropped too.
-        let mut fillers = Vec::new();
-        let mut black_hole = false;
-        while fillers.len() < 200 {
-            match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-                Ok(stream) => fillers.push(stream),
-                Err(e) => {
-                    black_hole = e.kind() == io::ErrorKind::TimedOut;
-                    break;
-                }
-            }
-        }
-        if !black_hole && !cfg!(target_os = "linux") {
-            eprintln!(
-                "{mode}: skipped: after {} connections the listener still answered SYNs, \
-                 so this OS gives no way to stall a connect",
-                fillers.len()
+        listener.local_addr().unwrap()
+    };
+
+    let recorder = Recorder::default();
+    let errors = Arc::clone(&recorder.errors);
+    let connects = Arc::clone(&recorder.connects);
+    let disconnects = Arc::clone(&recorder.disconnects);
+    let _client = match TcpClient::connect(addr, TcpClientConfig::default(), recorder) {
+        Ok(mut client) => {
+            client.start(event_loop).unwrap();
+            let connect_error = || {
+                errors
+                    .lock()
+                    .iter()
+                    .find(|(_, _, kind, _)| kind.is_some())
+                    .cloned()
+            };
+            assert!(
+                wait_until(Duration::from_secs(5), || connect_error().is_some()),
+                "refused connect reported no connect error: {:?}",
+                errors.lock()
             );
-            continue;
+            let (conn, message, _, _) = connect_error().unwrap();
+            assert_eq!(conn, Some(client.id()), "{message}");
+            assert!(matches!(client.send(b"x"), Err(SendError::Closed)));
+            Some(client)
         }
-        assert!(black_hole, "{mode}: a full backlog did not drop SYNs");
+        Err(_) => None,
+    };
 
-        let recorder = Recorder::default();
-        let errors = Arc::clone(&recorder.errors);
-        let connects = Arc::clone(&recorder.connects);
-        let disconnects = Arc::clone(&recorder.disconnects);
-        let config = TcpClientConfig {
-            connect_timeout: Duration::from_millis(500),
-            ..TcpClientConfig::default()
-        };
-        let mut client = TcpClient::connect(addr, config, recorder).unwrap();
-        let id = client.id();
-        let runner = spawn_loop(&event_loop);
-        let started = Instant::now();
-        client.start(&event_loop).unwrap();
-
-        assert!(
-            wait_until(Duration::from_secs(2), || !errors.lock().is_empty()),
-            "{mode}: no connect error within 2 s"
-        );
-        let (conn, message, kind, at) = errors.lock()[0].clone();
-        let elapsed = at - started;
-        assert!(
-            elapsed <= Duration::from_millis(700),
-            "{mode}: timed out after {elapsed:?}"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(450),
-            "{mode}: failed early after {elapsed:?}: {message}"
-        );
-        assert_eq!(conn, Some(id), "{mode}");
-        assert_eq!(kind, Some(io::ErrorKind::TimedOut), "{mode}: {message}");
-        assert_eq!(
-            connects.load(Ordering::SeqCst),
-            0,
-            "{mode}: on_connect fired"
-        );
-        assert_eq!(disconnects.load(Ordering::SeqCst), 0, "{mode}");
-        assert!(matches!(client.send(b"x"), Err(SendError::Closed)));
-        assert_eq!(event_loop.pending_timers(), 0, "{mode}: timer left behind");
-
-        stop_loop(&event_loop, runner);
-        drop(fillers);
-    }
+    assert_eq!(connects.load(Ordering::SeqCst), 0, "on_connect fired");
+    assert_eq!(disconnects.load(Ordering::SeqCst), 0);
+    assert_eq!(event_loop.pending_timers(), 0, "timer left behind");
 }
 
-#[test]
-fn connect_refused_is_an_error() {
-    for (mode, event_loop) in pool_and_direct() {
-        let addr = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
-
-        let recorder = Recorder::default();
-        let errors = Arc::clone(&recorder.errors);
-        let connects = Arc::clone(&recorder.connects);
-        let disconnects = Arc::clone(&recorder.disconnects);
-        let runner = spawn_loop(&event_loop);
-        let client = match TcpClient::connect(addr, TcpClientConfig::default(), recorder) {
-            Ok(mut client) => {
-                client.start(&event_loop).unwrap();
-                let connect_error = || {
-                    errors
-                        .lock()
-                        .iter()
-                        .find(|(_, _, kind, _)| kind.is_some())
-                        .cloned()
-                };
-                assert!(
-                    wait_until(Duration::from_secs(5), || connect_error().is_some()),
-                    "{mode}: refused connect reported no connect error: {:?}",
-                    errors.lock()
-                );
-                let (conn, message, _, _) = connect_error().unwrap();
-                assert_eq!(conn, Some(client.id()), "{mode}: {message}");
-                assert!(matches!(client.send(b"x"), Err(SendError::Closed)));
-                Some(client)
-            }
-            Err(_) => None,
-        };
-
-        assert_eq!(
-            connects.load(Ordering::SeqCst),
-            0,
-            "{mode}: on_connect fired"
-        );
-        assert_eq!(disconnects.load(Ordering::SeqCst), 0, "{mode}");
-        assert_eq!(event_loop.pending_timers(), 0, "{mode}: timer left behind");
-        stop_loop(&event_loop, runner);
-        drop(client);
-    }
-}
-
-#[test]
-fn on_connect_waits_for_the_handshake_and_ctx_sends() {
-    for (mode, event_loop) in pool_and_direct() {
-        let server_recorder = Recorder::default();
-        let server_received = Arc::clone(&server_recorder.received);
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            .build();
-        let server = Arc::new(TcpServer::new(config, server_recorder).unwrap());
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-
-        let recorder = Recorder {
-            greeting: Some(b"hello from on_connect"),
-            ..Recorder::default()
-        };
-        let connects = Arc::clone(&recorder.connects);
-        let errors = Arc::clone(&recorder.errors);
-        let mut client = TcpClient::connect(
-            server.local_addr().unwrap(),
-            TcpClientConfig::default(),
-            recorder,
-        )
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn on_connect_waits_for_the_handshake_and_ctx_sends(event_loop: &Arc<EventLoop>) {
+    let server_recorder = Recorder::default();
+    let server_received = Arc::clone(&server_recorder.received);
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        .build();
+    let server = Arc::new(TcpServer::new(config, server_recorder).unwrap());
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
         .unwrap();
-        client.start(&event_loop).unwrap();
-        assert_eq!(
-            connects.load(Ordering::SeqCst),
-            0,
-            "{mode}: on_connect fired inside start()"
-        );
-        let runner = spawn_loop(&event_loop);
 
-        assert!(
-            wait_until(Duration::from_secs(5), || {
-                server_received.lock().as_slice() == b"hello from on_connect"
-            }),
-            "{mode}: server got {:?}, client errors {:?}",
-            server_received.lock(),
-            errors.lock()
-        );
-        assert_eq!(connects.load(Ordering::SeqCst), 1, "{mode}");
-        assert_eq!(
-            event_loop.pending_timers(),
-            0,
-            "{mode}: connect timer not cancelled"
-        );
+    let recorder = Recorder {
+        greeting: Some(b"hello from on_connect"),
+        ..Recorder::default()
+    };
+    let connects = Arc::clone(&recorder.connects);
+    let errors = Arc::clone(&recorder.errors);
+    let mut client = TcpClient::connect(
+        server.local_addr().unwrap(),
+        TcpClientConfig::default(),
+        recorder,
+    )
+    .unwrap();
+    client.start(event_loop).unwrap();
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        0,
+        "on_connect fired inside start()"
+    );
 
-        stop_loop(&event_loop, runner);
-        drop((client, server));
-    }
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server_received.lock().as_slice() == b"hello from on_connect"
+        }),
+        "server got {:?}, client errors {:?}",
+        server_received.lock(),
+        errors.lock()
+    );
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        event_loop.pending_timers(),
+        0,
+        "connect timer not cancelled"
+    );
 }
 
-#[test]
-fn sends_queued_while_connecting_are_flushed() {
-    for (mode, event_loop) in pool_and_direct() {
-        let server_recorder = Recorder::default();
-        let server_received = Arc::clone(&server_recorder.received);
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            .build();
-        let server = Arc::new(TcpServer::new(config, server_recorder).unwrap());
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-
-        let mut client = TcpClient::connect(
-            server.local_addr().unwrap(),
-            TcpClientConfig::default(),
-            Recorder::default(),
-        )
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn sends_queued_while_connecting_are_flushed(event_loop: &Arc<EventLoop>) {
+    let server_recorder = Recorder::default();
+    let server_received = Arc::clone(&server_recorder.received);
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        .build();
+    let server = Arc::new(TcpServer::new(config, server_recorder).unwrap());
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
         .unwrap();
-        client.send(b"early ").unwrap();
-        client.start(&event_loop).unwrap();
-        client.send(b"bird").unwrap();
-        let runner = spawn_loop(&event_loop);
 
-        assert!(
-            wait_until(Duration::from_secs(5), || {
-                server_received.lock().as_slice() == b"early bird"
-            }),
-            "{mode}: server got {:?}",
-            server_received.lock()
-        );
+    let mut client = TcpClient::connect(
+        server.local_addr().unwrap(),
+        TcpClientConfig::default(),
+        Recorder::default(),
+    )
+    .unwrap();
+    client.send(b"early ").unwrap();
+    client.start(event_loop).unwrap();
+    client.send(b"bird").unwrap();
 
-        stop_loop(&event_loop, runner);
-        drop((client, server));
-    }
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server_received.lock().as_slice() == b"early bird"
+        }),
+        "server got {:?}",
+        server_received.lock()
+    );
 }

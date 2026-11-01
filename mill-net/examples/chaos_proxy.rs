@@ -13,7 +13,6 @@ use mill_net::tcp::{
 use mill_net::testing::{ChaosConfig, ChaosProxy};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const MESSAGE_BYTES: usize = 4096;
@@ -47,8 +46,8 @@ impl NetworkHandler for Collector {
     }
 }
 
-fn main() -> Result<()> {
-    let event_loop = Arc::new(EventLoop::default());
+#[mill_io::main]
+fn main(event_loop: &Arc<EventLoop>) -> Result<()> {
     let server_reads = Arc::new(AtomicUsize::new(0));
     let server = Arc::new(TcpServer::new(
         TcpServerConfig::builder()
@@ -58,7 +57,7 @@ fn main() -> Result<()> {
             reads: Arc::clone(&server_reads),
         },
     )?);
-    Arc::clone(&server).start(&event_loop, event_loop.alloc_token())?;
+    Arc::clone(&server).start(event_loop, event_loop.alloc_token())?;
 
     let proxy = ChaosProxy::start(
         server.local_addr()?,
@@ -74,11 +73,6 @@ fn main() -> Result<()> {
         proxy.addr()
     );
 
-    let runner = {
-        let event_loop = Arc::clone(&event_loop);
-        thread::spawn(move || event_loop.run().expect("event loop failed"))
-    };
-
     let (complete, echoed) = mpsc::channel();
     let mut client = TcpClient::connect(
         proxy.addr(),
@@ -89,7 +83,7 @@ fn main() -> Result<()> {
             complete,
         },
     )?;
-    client.start(&event_loop)?;
+    client.start(event_loop)?;
 
     let message: Vec<u8> = (0..MESSAGE_BYTES).map(|i| (i % 251) as u8).collect();
     let started = Instant::now();
@@ -112,7 +106,5 @@ fn main() -> Result<()> {
     drop(client);
     drop(proxy);
     server.stop()?;
-    event_loop.stop();
-    runner.join().expect("event loop thread panicked");
     Ok(())
 }

@@ -4,16 +4,7 @@ use mill_net::tcp::{
     traits::{ConnectionId, NetworkHandler},
     ServerContext, TcpServer, TcpServerConfig,
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-    time::Instant,
-};
-
-static EVENT_LOOP: OnceLock<Arc<EventLoop>> = OnceLock::new();
-fn event_loop() -> &'static Arc<EventLoop> {
-    EVENT_LOOP.get_or_init(|| Arc::new(EventLoop::default()))
-}
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 struct HttpResponse {
     status: u16,
@@ -216,13 +207,10 @@ impl ComputeHttpHandler {
 
             ("GET", "/hash") => {
                 println!("[INFO] Spawning HIGH priority crypto hash task");
-                event_loop().spawn_compute_with_priority(
-                    || {
-                        let result = simulate_crypto_hash("secret_data_to_hash");
-                        println!("[COMPUTE] Hash result ready: {}", result);
-                    },
-                    TaskPriority::High,
-                );
+                mill_io::spawn_with_priority(TaskPriority::High, || {
+                    let result = simulate_crypto_hash("secret_data_to_hash");
+                    println!("[COMPUTE] Hash result ready: {}", result);
+                });
 
                 HttpResponse::html(
                     r#"<html>
@@ -238,7 +226,7 @@ impl ComputeHttpHandler {
 
             ("GET", "/process-image") => {
                 println!("[INFO] Spawning NORMAL priority image processing task");
-                event_loop().spawn_compute(|| {
+                mill_io::spawn(|| {
                     let result = simulate_image_processing(1000, 1000);
                     println!("[COMPUTE] Image processing result: {}", result);
                 });
@@ -257,13 +245,10 @@ impl ComputeHttpHandler {
 
             ("GET", "/analytics") => {
                 println!("[INFO] Spawning LOW priority analytics task");
-                event_loop().spawn_compute_with_priority(
-                    || {
-                        let result = simulate_analytics(10_000_000);
-                        println!("[COMPUTE] Analytics result: {}", result);
-                    },
-                    TaskPriority::Low,
-                );
+                mill_io::spawn_with_priority(TaskPriority::Low, || {
+                    let result = simulate_analytics(10_000_000);
+                    println!("[COMPUTE] Analytics result: {}", result);
+                });
 
                 HttpResponse::html(
                     r#"<html>
@@ -278,7 +263,9 @@ impl ComputeHttpHandler {
             }
 
             ("GET", "/metrics") => {
-                let metrics = event_loop().get_compute_metrics();
+                let metrics = mill_io::current()
+                    .get_compute_metrics()
+                    .expect("handlers only run while their loop is alive");
                 let json = format!(
                     r#"{{
   "tasks_submitted": {},
@@ -312,38 +299,29 @@ impl ComputeHttpHandler {
 
                 for i in 0..3 {
                     let task_id = i;
-                    event_loop().spawn_compute_with_priority(
-                        move || {
-                            println!("[COMPUTE] LOW priority task {} starting", task_id);
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            println!("[COMPUTE] LOW priority task {} done", task_id);
-                        },
-                        TaskPriority::Low,
-                    );
+                    mill_io::spawn_with_priority(TaskPriority::Low, move || {
+                        println!("[COMPUTE] LOW priority task {} starting", task_id);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        println!("[COMPUTE] LOW priority task {} done", task_id);
+                    });
                 }
 
                 for i in 0..3 {
                     let task_id = i;
-                    event_loop().spawn_compute_with_priority(
-                        move || {
-                            println!("[COMPUTE] HIGH priority task {} starting", task_id);
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            println!("[COMPUTE] HIGH priority task {} done", task_id);
-                        },
-                        TaskPriority::High,
-                    );
+                    mill_io::spawn_with_priority(TaskPriority::High, move || {
+                        println!("[COMPUTE] HIGH priority task {} starting", task_id);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        println!("[COMPUTE] HIGH priority task {} done", task_id);
+                    });
                 }
 
                 for i in 0..3 {
                     let task_id = i;
-                    event_loop().spawn_compute_with_priority(
-                        move || {
-                            println!("[COMPUTE] CRITICAL priority task {} starting", task_id);
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            println!("[COMPUTE] CRITICAL priority task {} done", task_id);
-                        },
-                        TaskPriority::Critical,
-                    );
+                    mill_io::spawn_with_priority(TaskPriority::Critical, move || {
+                        println!("[COMPUTE] CRITICAL priority task {} starting", task_id);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        println!("[COMPUTE] CRITICAL priority task {} done", task_id);
+                    });
                 }
 
                 HttpResponse::html(
@@ -410,11 +388,12 @@ fn main() -> Result<()> {
     println!("  {url}/metrics       - Pool metrics (JSON)");
     println!();
 
-    server.start(event_loop(), event_loop().alloc_token())?;
+    let event_loop = Arc::new(EventLoop::default());
+    server.start(&event_loop, event_loop.alloc_token())?;
 
     println!("Server started. Press Ctrl+C to stop.");
 
-    event_loop().run()?;
+    event_loop.run()?;
 
     Ok(())
 }
