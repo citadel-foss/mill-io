@@ -333,7 +333,7 @@ impl CoreRpc {
             loop_thread: OnceLock::new(),
             closed: AtomicBool::new(false),
             next_call_id: AtomicU64::new(1),
-            shared: CoreShared::new(host.clone()),
+            shared: CoreShared::new(host.clone(), config.max_body_bytes),
             state: Mutex::new(State {
                 closed: false,
                 auth: Auth::new(config.auth),

@@ -219,16 +219,21 @@ impl<'a> Query<'a> {
 
     pub(crate) fn block(&self, height: u64) -> Result<Arc<Block>, ChainError> {
         let hash = self.block_hash(height)?;
+        if let Some(block) = self.core.cached_block(&hash) {
+            return Ok(block);
+        }
         let hex = match self.chain("getblock", json!([hash, 0])) {
             Ok(Value::String(hex)) => hex,
             Ok(other) => return Err(unexpected("getblock", &other)),
             Err(e) if is_pruned(&e) => return Err(ChainError::Unsupported("block: pruned")),
             Err(e) => return Err(e),
         };
-        let mut blocks = self.on_pool(vec![decode_block_job(hash, hex)])?;
-        blocks
+        let block = self
+            .on_pool(vec![decode_block_job(hash, hex)])?
             .pop()
-            .ok_or_else(|| ChainError::Protocol("compute job lost".into()))
+            .ok_or_else(|| ChainError::Protocol("compute job lost".into()))?;
+        self.core.cache_block(hash, Arc::clone(&block));
+        Ok(block)
     }
 
     pub(crate) fn transaction(&self, txid: &Txid) -> Result<Arc<Transaction>, ChainError> {

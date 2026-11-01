@@ -4,6 +4,7 @@
 //! The parser takes bytes in reads of any size and copies body bytes once, so a body
 //! arriving a byte at a time costs no more than one arriving whole.
 
+use crate::ChainError;
 use base64::Engine as _;
 use std::fmt;
 
@@ -52,6 +53,13 @@ pub(crate) struct Response {
     pub(crate) body: Vec<u8>,
 }
 
+const BODY_TOO_LARGE: &str = "HTTP response body exceeds";
+
+/// A call failed because its reply was larger than `CoreConfig::max_body_bytes`.
+pub(crate) fn is_body_too_large(e: &ChainError) -> bool {
+    matches!(e, ChainError::Protocol(message) if message.starts_with(BODY_TOO_LARGE))
+}
+
 /// Why a response could not be parsed. The connection cannot be used after one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HttpError {
@@ -69,9 +77,7 @@ impl fmt::Display for HttpError {
             HttpError::HeadTooLarge => {
                 write!(f, "HTTP response head exceeds {} bytes", MAX_HEAD_BYTES)
             }
-            HttpError::BodyTooLarge(cap) => {
-                write!(f, "HTTP response body exceeds {} bytes", cap)
-            }
+            HttpError::BodyTooLarge(cap) => write!(f, "{} {} bytes", BODY_TOO_LARGE, cap),
             HttpError::Truncated => write!(f, "connection closed inside an HTTP response"),
         }
     }
@@ -806,6 +812,11 @@ mod tests {
             HttpError::BodyTooLarge(7).to_string(),
             "HTTP response body exceeds 7 bytes"
         );
+        let too_large = ChainError::Protocol(HttpError::BodyTooLarge(7).to_string());
+        assert!(is_body_too_large(&too_large));
+        let other = ChainError::Protocol(HttpError::HeadTooLarge.to_string());
+        assert!(!is_body_too_large(&other));
+        assert!(!is_body_too_large(&ChainError::Transport("x".into())));
         assert_eq!(
             HttpError::HeadTooLarge.to_string(),
             "HTTP response head exceeds 65536 bytes"
