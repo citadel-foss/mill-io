@@ -2,6 +2,7 @@
 //! against a scripted HTTP mock for answers a real node cannot be made to give. The
 //! binary comes from `BITCOIND_EXE`, or `bitcoind` on `PATH`.
 
+use bitcoind::bitcoincore_rpc::jsonrpc::serde;
 use bitcoind::bitcoincore_rpc::{self, RpcApi};
 use bitcoind::{BitcoinD, Conf};
 use mill_chain::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
@@ -1896,4 +1897,537 @@ fn spend_lookup_never_guesses() {
         .spending_tx(&OutPoint::new(txid(1), 0), &ScriptBuf::new(), true)
         .unwrap_err();
     assert!(matches!(error, ChainError::Transport(_)), "{:?}", error);
+}
+
+/// Bitcoin Core replies captured by `examples/capture_core_golden.rs`.
+struct Golden {
+    name: String,
+    captures: Vec<Value>,
+}
+
+impl Golden {
+    fn load_all() -> Vec<Golden> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
+        let mut goldens: Vec<Golden> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "json"))
+            .map(|path| {
+                let golden: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                Golden {
+                    name: golden["bitcoind"].as_str().unwrap().to_string(),
+                    captures: golden["captures"].as_array().unwrap().clone(),
+                }
+            })
+            .collect();
+        goldens.sort_by(|a, b| a.name.cmp(&b.name));
+        goldens
+    }
+
+    fn entries(&self, synthetic: bool) -> Vec<Value> {
+        self.captures
+            .iter()
+            .filter(|c| c["synthetic"].as_bool().unwrap_or(false) == synthetic)
+            .cloned()
+            .collect()
+    }
+
+    /// The real captures, and the synthetic ones no real capture has the method and params
+    /// of.
+    fn served(&self) -> Vec<Value> {
+        let real = self.entries(false);
+        let extra: Vec<Value> = self
+            .entries(true)
+            .into_iter()
+            .filter(|s| {
+                !real
+                    .iter()
+                    .any(|r| r["method"] == s["method"] && r["params"] == s["params"])
+            })
+            .collect();
+        real.into_iter().chain(extra).collect()
+    }
+
+    /// The captured result of `method` with `params`.
+    fn result(&self, method: &str, params: Value) -> Value {
+        self.captures
+            .iter()
+            .find(|c| c["method"] == method && c["params"] == params && c.get("result").is_some())
+            .unwrap_or_else(|| panic!("{}: no result for {} {}", self.name, method, params))
+            ["result"]
+            .clone()
+    }
+
+    fn synthetic(&self, method: &str) -> Value {
+        self.entries(true)
+            .into_iter()
+            .find(|c| c["method"] == method)
+            .unwrap_or_else(|| panic!("{}: no synthetic {}", self.name, method))["result"]
+            .clone()
+    }
+
+    fn with(&self, method: &str, f: impl Fn(&Value) -> bool) -> Vec<Value> {
+        self.entries(false)
+            .into_iter()
+            .filter(|c| c["method"] == method && f(c))
+            .collect()
+    }
+}
+
+/// Answers each request with the capture of the same method and params, else the only
+/// capture of that method; records which captures were used.
+fn serve(
+    entries: Vec<Value>,
+    used: Arc<std::sync::Mutex<Vec<bool>>>,
+) -> (MockHttpServer, ChainClient) {
+    *used.lock().unwrap() = vec![false; entries.len()];
+    mock_wallet(Some("watch"), move |_, method, params| {
+        let same = |c: &&Value| c["method"] == method;
+        let index = entries
+            .iter()
+            .position(|c| same(&c) && c["params"] == *params)
+            .or_else(|| {
+                let mut of_method = entries.iter().enumerate().filter(|(_, c)| same(c));
+                match (of_method.next(), of_method.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            });
+        let Some(index) = index else {
+            return Err((-32601, format!("no capture for {} {}", method, params)));
+        };
+        used.lock().unwrap()[index] = true;
+        let capture = &entries[index];
+        match capture.get("error") {
+            Some(e) => Err((
+                e["code"].as_i64().unwrap(),
+                e["message"].as_str().unwrap().into(),
+            )),
+            None => Ok(capture["result"].clone()),
+        }
+    })
+}
+
+fn rpc_json<T: serde::de::DeserializeOwned>(value: Value) -> T {
+    serde_json::from_value(value).unwrap()
+}
+
+/// The differences from `bitcoincore-rpc-json` this test finds, by their id in
+/// `tests/golden/EXPECTED_DIFFS.md`.
+struct Diffs {
+    seen: std::collections::BTreeSet<&'static str>,
+}
+
+impl Diffs {
+    fn expect(&mut self, id: &'static str) {
+        self.seen.insert(id);
+    }
+}
+
+#[test]
+fn parse_parity_with_bitcoincore_rpc_json() {
+    use bitcoind::bitcoincore_rpc::json as rpcjson;
+    use mill_chain::bitcoin::block::Header;
+    use mill_chain::{Tip, TxOutInfo, WalletTx, WalletUtxo};
+
+    let goldens = Golden::load_all();
+    assert!(!goldens.is_empty(), "no golden files");
+    let mut diffs = Diffs {
+        seen: Default::default(),
+    };
+    for golden in &goldens {
+        eprintln!("checking bitcoind {}", golden.name);
+        let used = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served = golden.served();
+        let (_server, client) = serve(served.clone(), Arc::clone(&used));
+        let h = client.handle();
+        let w = h.core_wallet().unwrap();
+
+        // Chain state.
+        let info: rpcjson::GetBlockchainInfoResult =
+            rpc_json(golden.result("getblockchaininfo", json!([])));
+        assert_eq!(
+            h.tip(),
+            Ok(Tip {
+                height: info.blocks,
+                hash: info.best_block_hash
+            })
+        );
+        assert_eq!(h.network(), Ok(info.chain));
+        let height = info.blocks;
+        let hash: BlockHash = rpc_json(golden.result("getblockhash", json!([height])));
+        assert_eq!(h.block_hash(height), Ok(hash));
+        assert_eq!(h.block_hash(height + 1), Err(ChainError::NotFound));
+        let header: Header = deserialize_hex(
+            golden
+                .result("getblockheader", json!([hash, false]))
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(h.header(height), Ok(header));
+        let block: Block = deserialize_hex(
+            golden
+                .result("getblock", json!([hash, 0]))
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(*h.block(height).unwrap(), block);
+
+        // Transactions, and where they stand.
+        for capture in golden.with("getrawtransaction", |c| c["params"][1] == json!(false)) {
+            let txid: Txid = rpc_json(capture["params"][0].clone());
+            let Some(hex) = capture.get("result") else {
+                assert_eq!(h.transaction(&txid), Err(ChainError::NotFound));
+                assert_eq!(h.tx_status(&txid), Err(ChainError::NotFound));
+                continue;
+            };
+            let tx: Transaction = deserialize_hex(hex.as_str().unwrap()).unwrap();
+            assert_eq!(*h.transaction(&txid).unwrap(), tx);
+            let verbose: rpcjson::GetRawTransactionResult =
+                rpc_json(golden.result("getrawtransaction", json!([txid, true])));
+            assert_eq!(verbose.transaction().unwrap(), tx);
+            let expected = match verbose.blockhash {
+                Some(block_hash) if verbose.confirmations.unwrap_or(0) > 0 => {
+                    let header: rpcjson::GetBlockHeaderResult =
+                        rpc_json(golden.result("getblockheader", json!([block_hash, true])));
+                    TxStatus::Confirmed {
+                        height: header.height as u64,
+                        block_hash,
+                    }
+                }
+                _ => {
+                    let _: rpcjson::GetMempoolEntryResult =
+                        rpc_json(golden.result("getmempoolentry", json!([txid])));
+                    TxStatus::Mempool
+                }
+            };
+            assert_eq!(h.tx_status(&txid), Ok(expected));
+        }
+
+        // Outputs.
+        for capture in golden.with("gettxout", |_| true) {
+            let params = &capture["params"];
+            let outpoint = OutPoint::new(
+                rpc_json(params[0].clone()),
+                params[1].as_u64().unwrap() as u32,
+            );
+            let parsed: Option<rpcjson::GetTxOutResult> = rpc_json(capture["result"].clone());
+            let expected = parsed.map(|out| TxOutInfo {
+                value: out.value,
+                script_pubkey: ScriptBuf::from(out.script_pub_key.hex),
+                confirmations: out.confirmations,
+                coinbase: out.coinbase,
+            });
+            assert_eq!(h.tx_out(&outpoint, params[2] == json!(true)), Ok(expected));
+        }
+        let mempool: Vec<Txid> = rpc_json(golden.result("getrawmempool", json!([false])));
+        assert_eq!(h.mempool_txids(), Ok(mempool));
+
+        // The mempool spender, parsed as openswap parses it.
+        #[derive(serde::Deserialize)]
+        #[serde(crate = "bitcoind::bitcoincore_rpc::jsonrpc::serde")]
+        struct SpendingPrevout {
+            spendingtxid: Option<Txid>,
+        }
+        let capture = &golden.with("gettxspendingprevout", |_| true)[0];
+        let prevout = &capture["params"][0][0];
+        let spent = OutPoint::new(
+            rpc_json(prevout["txid"].clone()),
+            prevout["vout"].as_u64().unwrap() as u32,
+        );
+        let spenders: Vec<SpendingPrevout> = rpc_json(capture["result"].clone());
+        let found = h.spending_tx(&spent, &ScriptBuf::new(), false).unwrap();
+        assert_eq!(found.map(|tx| tx.compute_txid()), spenders[0].spendingtxid);
+
+        // Broadcasts: a mempool transaction is answered with its txid; one already mined
+        // is an error to bitcoincore-rpc and a success here.
+        for capture in golden.with("sendrawtransaction", |_| true) {
+            let tx: Transaction = deserialize_hex(capture["params"][0].as_str().unwrap()).unwrap();
+            match capture.get("result") {
+                Some(txid) => assert_eq!(h.broadcast(&tx), Ok(rpc_json::<Txid>(txid.clone()))),
+                None => {
+                    assert_eq!(capture["error"]["code"], -27);
+                    assert_eq!(h.broadcast(&tx), Ok(tx.compute_txid()));
+                    diffs.expect("D3");
+                }
+            }
+        }
+
+        // Fees.
+        let none: rpcjson::EstimateSmartFeeResult =
+            rpc_json(golden.result("estimatesmartfee", json!([6])));
+        assert!(none.fee_rate.is_none() && none.errors.is_some());
+        assert_eq!(h.estimate_fee(6), Err(ChainError::NotFound));
+        let some: rpcjson::EstimateSmartFeeResult =
+            rpc_json(golden.result("estimatesmartfee", json!([2])));
+        let per_kvb = some.fee_rate.unwrap();
+        assert_eq!(
+            h.estimate_fee(2).unwrap().sat_per_vb(),
+            per_kvb.to_sat() as f64 / 1000.0
+        );
+
+        // Wallet views.
+        let unspent: Vec<rpcjson::ListUnspentResultEntry> =
+            rpc_json(golden.result("listunspent", json!([0, 9_999_999])));
+        let expected: Vec<WalletUtxo> = unspent
+            .into_iter()
+            .map(|u| WalletUtxo {
+                outpoint: OutPoint::new(u.txid, u.vout),
+                value: u.amount,
+                script_pubkey: u.script_pub_key,
+                confirmations: u.confirmations,
+                address: u.address,
+                label: u.label,
+                descriptor: u.descriptor,
+                witness_script: u.witness_script,
+                redeem_script: u.redeem_script,
+                spendable: u.spendable,
+                solvable: u.solvable,
+                safe: u.safe,
+            })
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(w.list_unspent(0, None), Ok(expected));
+        let history: Vec<rpcjson::ListTransactionResult> =
+            rpc_json(golden.result("listtransactions", json!(["*", 10, 0, true])));
+        let expected: Vec<WalletTx> = history
+            .into_iter()
+            .map(|t| WalletTx {
+                txid: t.info.txid,
+                vout: t.detail.vout,
+                category: match t.detail.category {
+                    rpcjson::GetTransactionResultDetailCategory::Send => {
+                        mill_chain::TxCategory::Send
+                    }
+                    rpcjson::GetTransactionResultDetailCategory::Receive => {
+                        mill_chain::TxCategory::Receive
+                    }
+                    rpcjson::GetTransactionResultDetailCategory::Generate => {
+                        mill_chain::TxCategory::Generate
+                    }
+                    rpcjson::GetTransactionResultDetailCategory::Immature => {
+                        mill_chain::TxCategory::Immature
+                    }
+                    rpcjson::GetTransactionResultDetailCategory::Orphan => {
+                        mill_chain::TxCategory::Orphan
+                    }
+                },
+                amount: t.detail.amount,
+                fee: t.detail.fee,
+                confirmations: t.info.confirmations,
+                block_hash: t.info.blockhash,
+                block_height: t.info.blockheight.map(u64::from),
+                time: t.info.time,
+                address: t.detail.address,
+                label: t.detail.label,
+            })
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(w.list_transactions(10, 0), Ok(expected));
+
+        let capture = &golden.with("getaddressinfo", |_| true)[0];
+        let address: Address =
+            rpc_json::<Address<_>>(capture["params"][0].clone()).assume_checked();
+        let raw = &capture["result"];
+        let ours = w.address_info(&address).unwrap();
+        let parsed: rpcjson::GetAddressInfoResult = rpc_json(raw.clone());
+        assert_eq!(Some(ours.is_mine), parsed.is_mine);
+        assert_eq!(ours.is_watch_only, parsed.is_watchonly.unwrap_or(false));
+        assert_eq!(ours.is_mine, raw["ismine"].as_bool().unwrap());
+        assert_eq!(ours.solvable, raw["solvable"].as_bool().unwrap());
+        assert_eq!(ours.desc.as_deref(), raw["desc"].as_str());
+
+        for capture in golden.with("deriveaddresses", |_| true) {
+            let params = &capture["params"];
+            let range = params
+                .get(1)
+                .map(|r| [r[0].as_u64().unwrap() as u32, r[1].as_u64().unwrap() as u32]);
+            let expected: Vec<Address<mill_chain::bitcoin::address::NetworkUnchecked>> =
+                rpc_json(capture["result"].clone());
+            assert_eq!(
+                w.derive_addresses(params[0].as_str().unwrap(), range),
+                Ok(expected)
+            );
+        }
+
+        // Imports: bitcoincore-rpc hands back the per-item results; a rejected item is an
+        // error here.
+        let capture = &golden.with("importdescriptors", |_| true)[0];
+        let reqs = capture["params"][0].as_array().unwrap().clone();
+        let results: Vec<rpcjson::ImportMultiResult> = rpc_json(capture["result"].clone());
+        let rejected: Vec<&str> = reqs
+            .iter()
+            .zip(&results)
+            .filter(|(_, r)| !r.success)
+            .map(|(req, _)| req["desc"].as_str().unwrap())
+            .collect();
+        assert!(!rejected.is_empty());
+        match w.import_descriptors(&reqs) {
+            Err(ChainError::Server { message, .. }) => {
+                assert!(
+                    rejected.iter().all(|desc| message.contains(desc)),
+                    "{}",
+                    message
+                );
+                diffs.expect("D1");
+            }
+            other => panic!("{:?}", other),
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(crate = "bitcoind::bitcoincore_rpc::jsonrpc::serde")]
+        struct Rescan {
+            start_height: usize,
+            #[allow(dead_code)]
+            stop_height: Option<usize>,
+        }
+        let rescan = &golden.with("rescanblockchain", |_| true)[0];
+        let parsed: Rescan = rpc_json(rescan["result"].clone());
+        assert_eq!(
+            parsed.start_height as u64,
+            rescan["params"][0].as_u64().unwrap()
+        );
+        assert_eq!(w.rescan_from(parsed.start_height as u64), Ok(()));
+
+        // Rescan progress, parsed as openswap parses it.
+        #[derive(serde::Deserialize)]
+        #[serde(crate = "bitcoind::bitcoincore_rpc::jsonrpc::serde")]
+        struct Scanning {
+            scanning: Option<rpcjson::ScanningDetails>,
+        }
+        let expect_scan = |scanning: Option<rpcjson::ScanningDetails>| match scanning {
+            Some(rpcjson::ScanningDetails::Scanning { duration, progress }) => {
+                Some((duration as u64, progress))
+            }
+            _ => None,
+        };
+        let parsed: Scanning = rpc_json(golden.result("getwalletinfo", json!([])));
+        let ours = w.scanning_status().unwrap();
+        assert_eq!(
+            ours.map(|p| (p.duration.as_secs(), p.progress as f32)),
+            expect_scan(parsed.scanning)
+        );
+
+        // Imported ranges, checked as openswap checks them.
+        #[derive(serde::Deserialize)]
+        #[serde(crate = "bitcoind::bitcoincore_rpc::jsonrpc::serde")]
+        struct Listed {
+            desc: String,
+            range: Option<[u32; 2]>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(crate = "bitcoind::bitcoincore_rpc::jsonrpc::serde")]
+        struct Descriptors {
+            descriptors: Vec<Listed>,
+        }
+        let listed: Descriptors = rpc_json(golden.result("listdescriptors", json!([])));
+        assert!(listed.descriptors.iter().any(|d| d.range.is_some()));
+        for entry in &listed.descriptors {
+            for last_index in [0, 19, 20, 21, 999, 1000] {
+                let openswap = entry
+                    .range
+                    .is_some_and(|[start, end]| start == 0 && end >= last_index);
+                assert_eq!(
+                    w.imported_range_covers(&entry.desc, last_index),
+                    Ok(openswap),
+                    "{} {}",
+                    entry.desc,
+                    last_index
+                );
+            }
+        }
+
+        // Node requirements.
+        let network: rpcjson::GetNetworkInfoResult =
+            rpc_json(golden.result("getnetworkinfo", json!([])));
+        let indexes: rpcjson::GetIndexInfoResult =
+            rpc_json(golden.result("getindexinfo", json!([])));
+        let notifications: Vec<rpcjson::GetZmqNotificationsResult> =
+            rpc_json(golden.result("getzmqnotifications", json!([])));
+        let node = h.node_requirements().unwrap();
+        assert_eq!(node.version as usize, network.version);
+        assert_eq!(node.txindex, indexes.txindex.is_some());
+        assert_eq!(node.zmq.len(), notifications.len());
+        for n in &notifications {
+            let topic = n.notification_type.strip_prefix("pub").unwrap();
+            let port = n.address.rsplit_once(':').unwrap().1;
+            if n.address.starts_with("tcp://0.0.0.0:") {
+                assert_eq!(node.zmq[topic], format!("tcp://127.0.0.1:{}", port));
+                diffs.expect("D2");
+            } else {
+                assert_eq!(node.zmq[topic], n.address);
+            }
+        }
+
+        // Wallet bootstrap: loaded, on disk only, and absent.
+        let loaded: Vec<String> = rpc_json(golden.result("listwallets", json!([])));
+        let on_disk: rpcjson::ListWalletDirResult =
+            rpc_json(golden.result("listwalletdir", json!([])));
+        let _: rpcjson::LoadWalletResult =
+            rpc_json(golden.with("loadwallet", |_| true)[0]["result"].clone());
+        let _: rpcjson::LoadWalletResult =
+            rpc_json(golden.with("createwallet", |_| true)[0]["result"].clone());
+        let unloaded = on_disk
+            .wallets
+            .iter()
+            .map(|w| w.name.as_str())
+            .find(|name| !loaded.iter().any(|l| l == name))
+            .unwrap();
+        for (name, requests) in [(loaded[0].as_str(), 1), (unloaded, 3), ("absent", 3)] {
+            let before = client.stats().requests_sent;
+            assert_eq!(w.prepare(name), Ok(()), "{}", name);
+            assert_eq!(client.stats().requests_sent - before, requests, "{}", name);
+        }
+
+        let unused: Vec<String> = served
+            .iter()
+            .zip(used.lock().unwrap().iter())
+            .filter(|(_, used)| !**used)
+            .map(|(c, _)| format!("{} {}", c["method"], c["params"]))
+            .collect();
+        assert!(
+            unused.is_empty(),
+            "{}: captures never asked for: {:?}",
+            golden.name,
+            unused
+        );
+
+        // A rescan in progress, which only a synthetic reply shows.
+        let synthetic = golden.synthetic("getwalletinfo");
+        let parsed: Scanning = rpc_json(synthetic.clone());
+        let (_server, client) = mock_wallet(Some("watch"), move |_, _, _| Ok(synthetic.clone()));
+        let progress = client
+            .handle()
+            .core_wallet()
+            .unwrap()
+            .scanning_status()
+            .unwrap();
+        assert!(progress.is_some());
+        assert_eq!(
+            progress.map(|p| (p.duration.as_secs(), p.progress as f32)),
+            expect_scan(parsed.scanning)
+        );
+    }
+
+    let listed = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/golden/EXPECTED_DIFFS.md"
+    ))
+    .unwrap();
+    let documented: std::collections::BTreeSet<&str> = listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .filter_map(|title| title.split(':').next())
+        .filter(|id| {
+            id.strip_prefix('D')
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+        })
+        .collect();
+    assert_eq!(
+        diffs.seen, documented,
+        "the differences found must be exactly those in EXPECTED_DIFFS.md"
+    );
 }
