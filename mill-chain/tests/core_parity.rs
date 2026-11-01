@@ -1236,3 +1236,149 @@ fn rescan_progress_and_ranges_from_listings() {
         Err(ChainError::Protocol(_))
     ));
 }
+
+/// A `-zmqpub<topic>=tcp://<bind>:<free port>` argument and the port.
+fn zmq_arg(topic: &str, bind: &str) -> (&'static str, u16) {
+    let port = bitcoind::get_available_port().unwrap();
+    let arg = format!("-zmqpub{}=tcp://{}:{}", topic, bind, port);
+    (Box::leak(arg.into_boxed_str()), port)
+}
+
+fn unsupported_message(error: ChainError) -> &'static str {
+    match error {
+        ChainError::Unsupported(message) => message,
+        other => panic!("expected Unsupported, got {:?}", other),
+    }
+}
+
+#[test]
+fn requirements_check_rejects_bad_nodes() {
+    // No txindex.
+    let (sequence, _) = zmq_arg("sequence", "127.0.0.1");
+    let (rawtx, _) = zmq_arg("rawtx", "127.0.0.1");
+    let node_without_index = node(&[sequence, rawtx]);
+    let error = connect(&node_without_index, None)
+        .handle()
+        .node_requirements()
+        .unwrap_err();
+    assert!(unsupported_message(error).contains("txindex"));
+    drop(node_without_index);
+
+    // Older than 24, from a mock: nothing else is asked.
+    for (version, ok) in [(230_200, false), (239_999, false), (240_000, true)] {
+        let (server, client) = mock_core(move |method, _| match method {
+            "getnetworkinfo" => Ok(json!({"version": version, "subversion": "/Satoshi/"})),
+            "getindexinfo" => Ok(json!({"txindex": {"synced": true, "best_block_height": 1}})),
+            "getzmqnotifications" => Ok(json!([
+                {"type": "pubsequence", "address": "tcp://127.0.0.1:1", "hwm": 1000},
+                {"type": "pubrawtx", "address": "tcp://127.0.0.1:2", "hwm": 1000},
+            ])),
+            other => panic!("unexpected {}", other),
+        });
+        match client.handle().node_requirements() {
+            Ok(info) => assert!(ok && info.version == version, "{}", version),
+            Err(error) => {
+                assert!(!ok, "{}", version);
+                assert!(unsupported_message(error).contains("version"));
+                assert_eq!(server.requests_seen().len(), 1);
+            }
+        }
+    }
+
+    // A required topic is missing.
+    for (published, missing) in [("rawtx", "sequence"), ("sequence", "rawtx")] {
+        let (only, _) = zmq_arg(published, "127.0.0.1");
+        let (rawblock, _) = zmq_arg("rawblock", "127.0.0.1");
+        let node = node(&["-txindex=1", only, rawblock]);
+        let error = connect(&node, None)
+            .handle()
+            .node_requirements()
+            .unwrap_err();
+        let message = unsupported_message(error);
+        assert!(
+            message.contains("zmq") && message.contains(missing),
+            "{}",
+            message
+        );
+    }
+
+    // Every requirement met.
+    let (sequence, sequence_port) = zmq_arg("sequence", "127.0.0.1");
+    let (rawtx, rawtx_port) = zmq_arg("rawtx", "127.0.0.1");
+    let node = node(&["-txindex=1", sequence, rawtx]);
+    let info = connect(&node, None).handle().node_requirements().unwrap();
+    assert!(info.version >= 240_000);
+    assert!(info.txindex);
+    assert_eq!(info.zmq.len(), 2);
+    assert_eq!(
+        info.zmq["sequence"],
+        format!("tcp://127.0.0.1:{}", sequence_port)
+    );
+    assert_eq!(info.zmq["rawtx"], format!("tcp://127.0.0.1:{}", rawtx_port));
+}
+
+#[test]
+fn zmq_endpoints_discovered_per_topic() {
+    let (sequence, sequence_port) = zmq_arg("sequence", "0.0.0.0");
+    let (rawtx, rawtx_port) = zmq_arg("rawtx", "0.0.0.0");
+    let (rawblock, rawblock_port) = zmq_arg("rawblock", "0.0.0.0");
+    let (hashblock, hashblock_port) = zmq_arg("hashblock", "127.0.0.1");
+    let node = node(&["-txindex=1", sequence, rawtx, rawblock, hashblock]);
+    // The RPC host, written as a name, replaces each wildcard bind.
+    let mut config = core_config(&node, None);
+    config.rpc_url = config.rpc_url.replace("127.0.0.1", "localhost");
+    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    let info = client.handle().node_requirements().unwrap();
+    let expected: std::collections::BTreeMap<String, String> = [
+        ("sequence", format!("tcp://localhost:{}", sequence_port)),
+        ("rawtx", format!("tcp://localhost:{}", rawtx_port)),
+        ("rawblock", format!("tcp://localhost:{}", rawblock_port)),
+        ("hashblock", format!("tcp://127.0.0.1:{}", hashblock_port)),
+    ]
+    .into_iter()
+    .map(|(topic, endpoint)| (topic.to_string(), endpoint))
+    .collect();
+    assert_eq!(info.zmq, expected);
+    let ports: std::collections::BTreeSet<_> =
+        [sequence_port, rawtx_port, rawblock_port, hashblock_port].into();
+    assert_eq!(ports.len(), 4, "each topic on its own port");
+}
+
+#[test]
+fn requirements_failures_are_not_unsupported() {
+    // A bitcoind built without ZMQ.
+    let (_server, client) = mock_core(|method, _| match method {
+        "getnetworkinfo" => Ok(json!({"version": 280_100})),
+        "getindexinfo" => Ok(json!({"txindex": {"synced": false, "best_block_height": 1}})),
+        "getzmqnotifications" => Err((-32601, "Method not found".into())),
+        other => panic!("unexpected {}", other),
+    });
+    let message = unsupported_message(client.handle().node_requirements().unwrap_err());
+    assert!(message.contains("zmq") && message.contains("sequence") && message.contains("rawtx"));
+
+    // Any other failure is reported as it is.
+    let (_server, client) = mock_core(|method, _| match method {
+        "getnetworkinfo" => Ok(json!({"version": 280_100})),
+        "getindexinfo" => Err((-32603, "Internal error".into())),
+        "getzmqnotifications" => Ok(json!([])),
+        other => panic!("unexpected {}", other),
+    });
+    assert!(matches!(
+        client.handle().node_requirements(),
+        Err(ChainError::Server { code: -32603, .. })
+    ));
+    let (_server, client) = mock_core(|method, _| match method {
+        "getnetworkinfo" => Ok(json!({"version": "28.1"})),
+        _ => Ok(json!([])),
+    });
+    assert!(matches!(
+        client.handle().node_requirements(),
+        Err(ChainError::Protocol(_))
+    ));
+    let server = MockHttpServer::start(|_| HttpReply::drop_connection()).unwrap();
+    let error = spawn_quick(server.url())
+        .handle()
+        .node_requirements()
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Transport(_)), "{:?}", error);
+}

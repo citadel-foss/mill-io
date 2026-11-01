@@ -2,7 +2,7 @@
 //! [`ChainHandle`] makes calls.
 
 use crate::backend::core::chain::Query;
-use crate::backend::core::{CoreConfig, CoreRpc, CoreWallet};
+use crate::backend::core::{CoreConfig, CoreRpc, CoreWallet, NodeInfo};
 use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime};
 #[cfg(feature = "testing")]
 use crate::engine::{Endpoint, Engine};
@@ -395,6 +395,15 @@ impl ChainHandle {
     /// The network the node runs on.
     pub fn network(&self) -> Result<Network, ChainError> {
         Query::new(self, "network")?.network()
+    }
+
+    /// Checks that the node is Bitcoin Core 24 or later, runs `-txindex`, and publishes the
+    /// ZMQ topics `sequence` and `rawtx`, and returns what it offers.
+    ///
+    /// [`ChainError::Unsupported`] names the first unmet requirement: its message contains
+    /// `version`, `txindex`, or `zmq` and the missing topic.
+    pub fn node_requirements(&self) -> Result<NodeInfo, ChainError> {
+        crate::backend::core::node_requirements(&Query::new(self, "node_requirements")?)
     }
 
     /// Bitcoin Core's wallet RPCs, on a clone of this handle; [`ChainError::Unsupported`]
