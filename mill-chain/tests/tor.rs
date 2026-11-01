@@ -3,7 +3,7 @@
 //! and :9051), its control password from `MILL_CHAIN_TOR_PASSWORD` (default empty).
 
 use mill_chain::testing::{local_dns_lookups, MockReply, MockScript, MockServer};
-use mill_chain::{ChainClient, ChainConfig, ChainError, MillChain, Socks5Config, TransportConfig};
+use mill_chain::{Chain, ChainClient, ChainConfig, ChainError, Socks5Config, TransportConfig};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -105,7 +105,7 @@ fn echo_server() -> MockServer {
 }
 
 fn spawn_via_tor(onion: &str, isolate: bool) -> ChainClient {
-    MillChain::spawn(ChainConfig::RawLineJsonRpcVia {
+    Chain::spawn(ChainConfig::RawLineJsonRpcVia {
         host: onion.to_string(),
         port: ONION_PORT,
         transport: TransportConfig {

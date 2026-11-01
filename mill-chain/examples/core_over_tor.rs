@@ -16,7 +16,7 @@
 mod support;
 
 use mill_chain::bitcoin::hex::FromHex;
-use mill_chain::{ChainConfig, MillChain, Socks5Config, TlsConfig, TlsVerify, TransportConfig};
+use mill_chain::{Chain, ChainConfig, Socks5Config, TlsConfig, TlsVerify, TransportConfig};
 use std::env;
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.transport.tls.is_some()
     );
 
-    let client = MillChain::spawn(ChainConfig::Core(config))?;
+    let client = Chain::spawn(ChainConfig::Core(config))?;
     let chain = client.handle().deadline(ONION_PATIENCE);
     let started = Instant::now();
     let tip = chain.tip()?;

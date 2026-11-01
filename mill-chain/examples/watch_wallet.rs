@@ -17,7 +17,7 @@
 
 mod support;
 
-use mill_chain::{ChainConfig, CoreWallet, MillChain};
+use mill_chain::{Chain, ChainConfig, CoreWallet};
 use mill_io::EventLoop;
 use serde_json::json;
 use std::error::Error;
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let descriptor = args.next().ok_or(usage)?;
     let rescan_from: u64 = args.next().map_or(Ok(0), |h| h.parse())?;
 
-    let client = MillChain::spawn(ChainConfig::Core(support::core_config(Some(&name))))?;
+    let client = Chain::spawn(ChainConfig::Core(support::core_config(Some(&name))))?;
     let wallet = client.handle().core_wallet()?;
     wallet.prepare(&name)?;
 
