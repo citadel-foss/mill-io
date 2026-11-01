@@ -71,12 +71,19 @@ use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Interest, Token};
 use parking_lot::Mutex;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{atomic::Ordering, Arc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 /// Builds one layer for each accepted connection.
 type LayerFactory = Arc<dyn Fn() -> Box<dyn Layer> + Send + Sync>;
+
+/// How long the listener waits to accept again after the process ran out of descriptors.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// Context for network handlers to interact with the server or client that called them.
 pub struct ServerContext {
@@ -121,6 +128,10 @@ impl ServerContext {
 ///
 /// A started server runs until [`stop`](Self::stop), or until its event loop is gone;
 /// dropping the handle passed to [`start`](Self::start) does not stop it.
+///
+/// Connections the peer aborted or reset before they were accepted are skipped. If the
+/// process runs out of file descriptors, the server reports it once through
+/// `on_error(None, NetworkError::Accept(..))` and tries again every 100 ms.
 pub struct TcpServer<H: NetworkHandler> {
     shared: Arc<Shared<H>>,
     listener: Arc<Mutex<Option<TcpListener>>>,
@@ -128,6 +139,8 @@ pub struct TcpServer<H: NetworkHandler> {
     local_addr: SocketAddr,
     config: TcpServerConfig,
     layers: Vec<LayerFactory>,
+    #[cfg(test)]
+    accept_faults: Arc<Mutex<VecDeque<io::Error>>>,
 }
 
 impl<H: NetworkHandler> TcpServer<H> {
@@ -143,6 +156,8 @@ impl<H: NetworkHandler> TcpServer<H> {
             listener_token: Mutex::new(None),
             config,
             layers: Vec::new(),
+            #[cfg(test)]
+            accept_faults: Arc::default(),
         })
     }
 
@@ -169,12 +184,16 @@ impl<H: NetworkHandler> TcpServer<H> {
     ) -> Result<()> {
         self.shared.bind(event_loop)?;
 
-        let listener_handler = ListenerEvents {
+        let listener_handler = ListenerEvents(Arc::new(Listener {
             shared: self.shared.clone(),
             listener: self.listener.clone(),
             config: self.config.clone(),
             layers: self.layers.clone(),
-        };
+            out_of_fds_reported: AtomicBool::new(false),
+            retry_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            faults: self.accept_faults.clone(),
+        }));
 
         let mut listener = self.listener.lock();
         let Some(listener) = listener.as_mut() else {
@@ -227,38 +246,109 @@ impl<H: NetworkHandler> TcpServer<H> {
 }
 
 /// Registered with the loop for the listening socket.
-struct ListenerEvents<H: NetworkHandler> {
-    shared: Arc<Shared<H>>,
-    listener: Arc<Mutex<Option<TcpListener>>>,
-    config: TcpServerConfig,
-    layers: Vec<LayerFactory>,
-}
+struct ListenerEvents<H: NetworkHandler>(Arc<Listener<H>>);
 
 impl<H: NetworkHandler> EventHandler for ListenerEvents<H> {
     fn handle_event(&self, event: &Event) {
-        if !event.is_readable() {
-            return;
-        }
-
-        loop {
-            let accepted = match self.listener.lock().as_ref() {
-                Some(listener) => listener.accept(),
-                None => return,
-            };
-            match accepted {
-                Ok((stream, peer_addr)) => self.accept(stream, peer_addr),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    self.shared.report(None, NetworkError::Accept(Box::new(e)));
-                    break;
-                }
-            }
+        if event.is_readable() {
+            Listener::accept_backlog(&self.0);
         }
     }
 }
 
-impl<H: NetworkHandler> ListenerEvents<H> {
+/// The listening socket and its accept state, shared with the accept retry timer.
+struct Listener<H: NetworkHandler> {
+    shared: Arc<Shared<H>>,
+    listener: Arc<Mutex<Option<TcpListener>>>,
+    config: TcpServerConfig,
+    layers: Vec<LayerFactory>,
+    /// Set from the first out-of-descriptors error until the backlog drains again.
+    out_of_fds_reported: AtomicBool,
+    /// An `ACCEPT_RETRY` timer is scheduled.
+    retry_pending: AtomicBool,
+    #[cfg(test)]
+    faults: Arc<Mutex<VecDeque<io::Error>>>,
+}
+
+/// Errors that end one pending connection, not the listener: accept the next one.
+fn is_transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    )
+}
+
+/// EMFILE and ENFILE, which have the same values on Linux, macOS and the BSDs.
+#[cfg(unix)]
+const OUT_OF_FDS: &[i32] = &[24, 23];
+/// WSAEMFILE.
+#[cfg(windows)]
+const OUT_OF_FDS: &[i32] = &[10024];
+#[cfg(not(any(unix, windows)))]
+const OUT_OF_FDS: &[i32] = &[];
+
+fn is_out_of_fds(e: &io::Error) -> bool {
+    e.raw_os_error()
+        .is_some_and(|code| OUT_OF_FDS.contains(&code))
+}
+
+impl<H: NetworkHandler> Listener<H> {
+    /// Accepts until `WouldBlock`. Under edge triggering a backlog left behind raises no new
+    /// event, so the loop only stops early when a timer will resume it, or on an error it
+    /// cannot get past.
+    fn accept_backlog(this: &Arc<Self>) {
+        loop {
+            let Some(accepted) = this.accept_one() else {
+                return;
+            };
+            match accepted {
+                Ok((stream, peer_addr)) => this.accept(stream, peer_addr),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if is_transient(&e) => {}
+                Err(e) if is_out_of_fds(&e) => {
+                    if !this.out_of_fds_reported.swap(true, Ordering::SeqCst) {
+                        this.shared.report(None, NetworkError::Accept(Box::new(e)));
+                    }
+                    Self::retry_later(this);
+                    return;
+                }
+                Err(e) => {
+                    this.shared.report(None, NetworkError::Accept(Box::new(e)));
+                    return;
+                }
+            }
+        }
+        this.out_of_fds_reported.store(false, Ordering::SeqCst);
+    }
+
+    /// Accepting again right away would spin until a descriptor is freed, so a timer does
+    /// it; at most one is pending.
+    fn retry_later(this: &Arc<Self>) {
+        if this.retry_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(event_loop) = this.shared.event_loop() else {
+            return;
+        };
+        let listener = Arc::downgrade(this);
+        event_loop.schedule_once(ACCEPT_RETRY, move || {
+            if let Some(listener) = listener.upgrade() {
+                listener.retry_pending.store(false, Ordering::SeqCst);
+                Self::accept_backlog(&listener);
+            }
+        });
+    }
+
+    fn accept_one(&self) -> Option<io::Result<(TcpStream, SocketAddr)>> {
+        #[cfg(test)]
+        if let Some(fault) = self.faults.lock().pop_front() {
+            return Some(Err(fault));
+        }
+        self.listener.lock().as_ref().map(TcpListener::accept)
+    }
+
     /// Takes a slot under `max_connections`, or reports the peer and returns false.
     fn reserve_slot(&self, peer_addr: SocketAddr) -> bool {
         let count = &self.shared.count;
@@ -665,5 +755,155 @@ mod tests {
             event_loop.stop();
             runner.join().unwrap();
         }
+    }
+
+    type ErrorLog = Arc<Mutex<Vec<(Option<ConnectionId>, String)>>>;
+
+    #[derive(Clone, Default)]
+    struct AcceptLog {
+        connects: Arc<std::sync::atomic::AtomicUsize>,
+        errors: ErrorLog,
+    }
+
+    impl NetworkHandler for AcceptLog {
+        fn on_connect(&self, _ctx: &ServerContext, _conn: ConnectionId) -> Result<()> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn on_data(&self, _ctx: &ServerContext, _conn: ConnectionId, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_error(&self, _ctx: &ServerContext, conn: Option<ConnectionId>, error: NetworkError) {
+            self.errors.lock().unwrap().push((conn, error.to_string()));
+        }
+    }
+
+    fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while !cond() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// A server whose listener fails with `faults`, in order, before its real accepts.
+    /// Clients connect before it starts, so the whole backlog raises a single edge.
+    fn server_with_backlog(
+        event_loop: &Arc<EventLoop>,
+        faults: Vec<io::Error>,
+        clients: usize,
+    ) -> (
+        Arc<TcpServer<AcceptLog>>,
+        AcceptLog,
+        Vec<std::net::TcpStream>,
+    ) {
+        let log = AcceptLog::default();
+        let config = TcpServerConfig::builder()
+            .address("127.0.0.1:0".parse().unwrap())
+            .build();
+        let server = Arc::new(TcpServer::new(config, log.clone()).unwrap());
+        server.accept_faults.lock().extend(faults);
+        let addr = server.local_addr().unwrap();
+        let peers = (0..clients)
+            .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            .collect();
+        Arc::clone(&server)
+            .start(event_loop, event_loop.alloc_token())
+            .unwrap();
+        (server, log, peers)
+    }
+
+    fn out_of_fds() -> io::Error {
+        io::Error::from_raw_os_error(OUT_OF_FDS[0])
+    }
+
+    #[test]
+    fn transient_accept_errors_do_not_strand_the_backlog() {
+        let event_loop = Arc::new(EventLoop::new(2, 1024, 10).unwrap());
+        let faults = vec![
+            io::ErrorKind::ConnectionAborted.into(),
+            io::ErrorKind::ConnectionReset.into(),
+            io::ErrorKind::Interrupted.into(),
+        ];
+        let (server, log, peers) = server_with_backlog(&event_loop, faults, 3);
+        let runner = {
+            let event_loop = Arc::clone(&event_loop);
+            thread::spawn(move || event_loop.run().unwrap())
+        };
+
+        assert!(
+            wait_for(Duration::from_secs(5), || log
+                .connects
+                .load(Ordering::SeqCst)
+                == 3),
+            "{} of 3 queued connections accepted",
+            log.connects.load(Ordering::SeqCst)
+        );
+        assert!(log.errors.lock().unwrap().is_empty(), "{:?}", log.errors);
+
+        event_loop.stop();
+        runner.join().unwrap();
+        drop((server, peers));
+    }
+
+    #[test]
+    fn running_out_of_fds_is_reported_once_and_retried_on_a_timer() {
+        let event_loop = Arc::new(EventLoop::new(2, 1024, 10).unwrap());
+        let faults = vec![out_of_fds(), out_of_fds(), out_of_fds()];
+        let (server, log, mut peers) = server_with_backlog(&event_loop, faults, 2);
+        let started = std::time::Instant::now();
+        let runner = {
+            let event_loop = Arc::clone(&event_loop);
+            thread::spawn(move || event_loop.run().unwrap())
+        };
+
+        assert!(
+            wait_for(Duration::from_secs(5), || log
+                .connects
+                .load(Ordering::SeqCst)
+                == 2),
+            "{} of 2 queued connections accepted",
+            log.connects.load(Ordering::SeqCst)
+        );
+        // Three failures, each retried after ACCEPT_RETRY rather than at once.
+        assert!(
+            started.elapsed() >= 2 * ACCEPT_RETRY,
+            "{:?}",
+            started.elapsed()
+        );
+        {
+            let errors = log.errors.lock().unwrap();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].0, None);
+            assert!(errors[0].1.starts_with("Accept Error"), "{errors:?}");
+        }
+
+        // The last retry timer drained the backlog on the reactor thread, so a closure posted
+        // there runs after it has finished.
+        let (done, finished) = std::sync::mpsc::channel();
+        event_loop
+            .post(move || {
+                let _ = done.send(());
+            })
+            .unwrap();
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Running out again after the backlog drained is a new episode, reported again.
+        server.accept_faults.lock().push_back(out_of_fds());
+        peers.push(std::net::TcpStream::connect(server.local_addr().unwrap()).unwrap());
+        assert!(wait_for(Duration::from_secs(5), || log
+            .connects
+            .load(Ordering::SeqCst)
+            == 3));
+        assert_eq!(log.errors.lock().unwrap().len(), 2);
+
+        event_loop.stop();
+        runner.join().unwrap();
+        drop((server, peers));
     }
 }
