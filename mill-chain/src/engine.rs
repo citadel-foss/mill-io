@@ -113,6 +113,9 @@ pub(crate) struct Call {
     pub(crate) params: Value,
     pub(crate) route: Route,
     pub(crate) deadline: Option<Instant>,
+    /// The handle set `deadline` itself, so Bitcoin Core's `request_timeout` does not
+    /// apply.
+    pub(crate) own_deadline: bool,
     pub(crate) retries: u8,
     pub(crate) cancel: Option<Arc<AtomicBool>>,
     pub(crate) reply: ReplyTx,

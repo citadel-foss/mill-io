@@ -10,8 +10,7 @@
 //! endpoint behind a TLS terminator, `RPC_TLS_PIN` (the SHA-256 of its certificate, in
 //! hex) or `RPC_TLS_CA` (a PEM file) turns TLS on; the name check is skipped for `.onion`
 //! hosts, the pin or chain is not. Reaching an onion service can take tens of seconds, so
-//! both `CoreConfig::request_timeout` (which caps every ordinary call) and the handle's
-//! deadline are long.
+//! the handle's deadline, which replaces `CoreConfig::request_timeout`, is long.
 
 mod support;
 
@@ -37,7 +36,6 @@ fn tls_from_env() -> Result<Option<TlsConfig>, Box<dyn Error>> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut config = support::core_config(None);
-    config.request_timeout = ONION_PATIENCE;
     config.transport = TransportConfig {
         socks5: Some(Socks5Config {
             proxy: env::var("TOR_SOCKS").unwrap_or_else(|_| "127.0.0.1:9050".into()),
