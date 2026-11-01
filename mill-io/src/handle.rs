@@ -1,5 +1,6 @@
 use crate::{
-    error::Result, reactor::Reactor, ComputePoolMetrics, EventHandler, TaskPriority, TimerId,
+    context::EnterGuard, error::Result, reactor::Reactor, ComputePoolMetrics, EventHandler,
+    TaskPriority, TimerId,
 };
 use mio::{Interest, Token};
 use std::{
@@ -137,10 +138,17 @@ impl Eq for Handle {}
 
 impl Handle {
     pub(crate) fn new(reactor: &Arc<Reactor>) -> Self {
-        Self {
-            reactor: Arc::downgrade(reactor),
-            gate: Arc::clone(&reactor.gate),
-        }
+        Self::from_weak(Arc::downgrade(reactor), Arc::clone(&reactor.gate))
+    }
+
+    pub(crate) fn from_weak(reactor: Weak<Reactor>, gate: Arc<Gate>) -> Self {
+        Self { reactor, gate }
+    }
+
+    /// Makes this handle's loop the current one on this thread until the guard
+    /// is dropped. See [`EventLoop::enter`](crate::EventLoop::enter).
+    pub fn enter(&self) -> EnterGuard<'_> {
+        EnterGuard::new(self.clone())
     }
 
     pub(crate) fn reactor(&self) -> std::result::Result<Upgraded, LoopGone> {

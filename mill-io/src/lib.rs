@@ -96,6 +96,7 @@
 
 use mio::{Interest, Token};
 mod builder;
+mod context;
 pub mod error;
 mod handle;
 pub mod handler;
@@ -106,6 +107,7 @@ pub mod thread_pool;
 pub mod timer_wheel;
 
 pub use builder::EventLoopBuilder;
+pub use context::{after, cancel_timer, current, every, post, try_current, EnterGuard};
 pub use handle::{Handle, LoopGone};
 pub use handler::EventHandler;
 pub use mio::event::Event;
@@ -648,6 +650,27 @@ impl EventLoop {
     pub fn stop(&self) {
         let shutdown_handler = self.reactor.get_shutdown_handle();
         shutdown_handler.shutdown();
+    }
+
+    /// Makes this loop the current one on this thread until the guard is
+    /// dropped, so the free functions ([`post`], [`after`], [`every`],
+    /// [`cancel_timer`], [`current`]) act on it.
+    ///
+    /// The loop is also current on the thread inside [`run`](Self::run) and on
+    /// its I/O and compute workers. Guards nest; see [`EnterGuard`].
+    ///
+    /// ```rust
+    /// use mill_io::EventLoop;
+    ///
+    /// let event_loop = EventLoop::default();
+    /// {
+    ///     let _guard = event_loop.enter();
+    ///     assert_eq!(mill_io::current(), event_loop.handle());
+    /// }
+    /// assert!(mill_io::try_current().is_none());
+    /// ```
+    pub fn enter(&self) -> EnterGuard<'_> {
+        EnterGuard::new(self.handle())
     }
 
     /// Returns a [`Handle`] to this loop. It does not keep the loop alive, so

@@ -1,6 +1,6 @@
 use crate::{
     error::Result,
-    handle::Gate,
+    handle::{Gate, Handle},
     poll::{PollHandle, WAKER_TOKEN},
     thread_pool::{ComputePoolMetrics, ComputeThreadPool, Task, TaskPriority, ThreadPool},
     timer_wheel::{TimerId, TimerWheel},
@@ -79,6 +79,8 @@ pub struct Reactor {
     posted: Mutex<Vec<Task>>,
     id: usize,
     pub(crate) gate: Arc<Gate>,
+    /// Set for reactors built through [`EventLoop`](crate::EventLoop); entered by `run()`.
+    handle: Option<Handle>,
 }
 
 impl Default for Reactor {
@@ -92,6 +94,7 @@ impl Default for Reactor {
             ReactorOptions {
                 direct_dispatch: false,
             },
+            None,
         )
     }
 }
@@ -121,20 +124,31 @@ impl Reactor {
             events_capacity,
             Duration::from_millis(poll_timeout_ms),
             options,
+            None,
         ))
     }
 
-    pub(crate) fn with_config(config: &ReactorConfig) -> Result<Self> {
-        Ok(Self::assemble(
-            PollHandle::new()?,
-            ThreadPool::new(config.io_workers),
-            ComputeThreadPool::new(config.compute_workers),
-            config.events_capacity,
-            config.poll_timeout,
-            ReactorOptions {
-                direct_dispatch: config.direct_dispatch,
-            },
-        ))
+    /// Builds a reactor whose `run()` thread and pool workers carry a [`Handle`]
+    /// to it as their current-loop context.
+    pub(crate) fn with_config(config: &ReactorConfig) -> Result<Arc<Self>> {
+        let poll_handle = PollHandle::new()?;
+        let gate = Arc::new(Gate::default());
+        Ok(Arc::new_cyclic(|reactor| {
+            let handle = Handle::from_weak(reactor.clone(), Arc::clone(&gate));
+            let mut reactor = Self::assemble(
+                poll_handle,
+                ThreadPool::with_context(config.io_workers, Some(handle.clone())),
+                ComputeThreadPool::with_context(config.compute_workers, Some(handle.clone())),
+                config.events_capacity,
+                config.poll_timeout,
+                ReactorOptions {
+                    direct_dispatch: config.direct_dispatch,
+                },
+                Some(handle),
+            );
+            reactor.gate = gate;
+            reactor
+        }))
     }
 
     fn assemble(
@@ -144,6 +158,7 @@ impl Reactor {
         events_capacity: usize,
         poll_timeout: Duration,
         options: ReactorOptions,
+        handle: Option<Handle>,
     ) -> Self {
         Self {
             poll_handle,
@@ -158,11 +173,13 @@ impl Reactor {
             posted: Mutex::new(Vec::new()),
             id: next_reactor_id(),
             gate: Arc::new(Gate::default()),
+            handle,
         }
     }
 
     pub fn run(&self) -> Result<()> {
         let _reactor_thread = ReactorThreadGuard::enter(self.id);
+        let _context = self.handle.as_ref().map(Handle::enter);
         // Each stop request is consumed by exactly one run: the one in progress,
         // or the next one if none is running, which then returns at once.
         while !self.stop_requested.swap(false, Ordering::SeqCst) {
