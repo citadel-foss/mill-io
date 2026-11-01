@@ -26,6 +26,7 @@ mod proto;
 pub mod testing;
 mod types;
 
+pub use backend::core::{AddressInfo, CoreWallet, ScanProgress, TxCategory, WalletTx, WalletUtxo};
 pub use backend::core::{CoreAuth, CoreConfig, ZmqConfig};
 pub use client::{ChainClient, ChainConfig, ChainHandle, MillChain};
 pub use engine::{ClientStats, EngineOptions};

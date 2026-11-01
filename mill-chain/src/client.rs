@@ -2,7 +2,7 @@
 //! [`ChainHandle`] makes calls.
 
 use crate::backend::core::chain::Query;
-use crate::backend::core::{CoreConfig, CoreRpc};
+use crate::backend::core::{CoreConfig, CoreRpc, CoreWallet};
 use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime};
 #[cfg(feature = "testing")]
 use crate::engine::{Endpoint, Engine};
@@ -395,6 +395,15 @@ impl ChainHandle {
     /// The network the node runs on.
     pub fn network(&self) -> Result<Network, ChainError> {
         Query::new(self, "network")?.network()
+    }
+
+    /// Bitcoin Core's wallet RPCs, on a clone of this handle; [`ChainError::Unsupported`]
+    /// on other backends.
+    pub fn core_wallet(&self) -> Result<CoreWallet, ChainError> {
+        if self.engine.core().is_none() {
+            return Err(ChainError::Unsupported("core_wallet"));
+        }
+        Ok(CoreWallet::new(self.clone()))
     }
 
     /// Sends `calls` as one JSON-RPC batch to Bitcoin Core's `/` and returns one result

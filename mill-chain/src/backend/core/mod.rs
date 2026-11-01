@@ -2,8 +2,10 @@
 
 pub(crate) mod chain;
 mod rpc;
+mod wallet;
 
 pub(crate) use rpc::CoreRpc;
+pub use wallet::{AddressInfo, CoreWallet, ScanProgress, TxCategory, WalletTx, WalletUtxo};
 
 use crate::layer::TransportConfig;
 use std::path::PathBuf;

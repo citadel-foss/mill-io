@@ -2,10 +2,10 @@
 //! against a scripted HTTP mock for answers a real node cannot be made to give. The
 //! binary comes from `BITCOIND_EXE`, or `bitcoind` on `PATH`.
 
-use bitcoind::bitcoincore_rpc::RpcApi;
+use bitcoind::bitcoincore_rpc::{self, RpcApi};
 use bitcoind::{BitcoinD, Conf};
 use mill_chain::bitcoin::hashes::Hash;
-use mill_chain::bitcoin::{Amount, BlockHash, Network, OutPoint, Txid};
+use mill_chain::bitcoin::{Address, Amount, BlockHash, Network, OutPoint, Txid};
 use mill_chain::testing::{
     HttpReply, HttpRequest, MockHttpServer, MockReply, MockScript, MockServer,
 };
@@ -39,6 +39,14 @@ fn connect(node: &BitcoinD, wallet: Option<&str>) -> ChainClient {
     MillChain::spawn(ChainConfig::Core(core_config(node, wallet))).unwrap()
 }
 
+/// Returns once every wallet on the node has processed the blocks and mempool transactions
+/// validated so far, which Core hands to wallets through an asynchronous queue.
+fn synced(node: &BitcoinD) {
+    node.client
+        .call::<Value>("syncwithvalidationinterfacequeue", &[])
+        .unwrap();
+}
+
 /// Mines `n` blocks to the node's default wallet.
 fn mine(node: &BitcoinD, n: u64) -> Vec<BlockHash> {
     let to = node
@@ -46,7 +54,19 @@ fn mine(node: &BitcoinD, n: u64) -> Vec<BlockHash> {
         .get_new_address(None, None)
         .unwrap()
         .assume_checked();
-    node.client.generate_to_address(n, &to).unwrap()
+    let mined = node.client.generate_to_address(n, &to).unwrap();
+    synced(node);
+    mined
+}
+
+/// Sends `amount` from the node's default wallet to `to`.
+fn pay(node: &BitcoinD, to: &Address, amount: Amount) -> Txid {
+    let txid = node
+        .client
+        .send_to_address(to, amount, None, None, None, None, None, None)
+        .unwrap();
+    synced(node);
+    txid
 }
 
 /// Sends `sats` from the node's default wallet to a fresh address of its own.
@@ -56,18 +76,7 @@ fn send(node: &BitcoinD, sats: u64) -> Txid {
         .get_new_address(None, None)
         .unwrap()
         .assume_checked();
-    node.client
-        .send_to_address(
-            &to,
-            Amount::from_sat(sats),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap()
+    pay(node, &to, Amount::from_sat(sats))
 }
 
 /// The best block hash the mocks report unless a test says otherwise.
@@ -732,4 +741,498 @@ fn typed_queries_need_bitcoin_core() {
         );
     }
     assert_eq!(server.requests_seen().len(), 0);
+}
+
+/// A wallet holding keys, apart from the default wallet that funds and mines, so the
+/// default wallet never spends what the watch-only wallet watches.
+fn key_holder(node: &BitcoinD) -> bitcoincore_rpc::Client {
+    node.create_wallet("keys").unwrap()
+}
+
+/// A descriptor for a fresh address of `keys`, with its checksum, and the address.
+fn watched_key(keys: &bitcoincore_rpc::Client) -> (String, Address) {
+    let address = keys.get_new_address(None, None).unwrap().assume_checked();
+    let info: Value = keys.call("getaddressinfo", &[json!(address)]).unwrap();
+    let pubkey = info["pubkey"].as_str().unwrap();
+    let desc = format!("wpkh({})", pubkey);
+    let info: Value = keys.call("getdescriptorinfo", &[json!(desc)]).unwrap();
+    let checksum = info["checksum"].as_str().unwrap();
+    (format!("{}#{}", desc, checksum), address)
+}
+
+fn with_checksum(node: &BitcoinD, desc: &str) -> String {
+    let info: Value = node
+        .client
+        .call("getdescriptorinfo", &[json!(desc)])
+        .unwrap();
+    format!("{}#{}", desc, info["checksum"].as_str().unwrap())
+}
+
+/// The default wallet's public receive descriptor for wpkh, ranged.
+fn ranged_descriptor(node: &BitcoinD) -> String {
+    let listed: Value = node.client.call("listdescriptors", &[]).unwrap();
+    listed["descriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["desc"].as_str().unwrap().to_string())
+        .find(|d| d.starts_with("wpkh(") && d.contains("/0/*)"))
+        .unwrap()
+}
+
+#[test]
+fn wallet_bootstrap_idempotent() {
+    let node = node(&[]);
+    let client = connect(&node, Some("watch"));
+    let h = client.handle();
+    let w = h.core_wallet().unwrap();
+    let requests = || client.stats().requests_sent;
+
+    // Neither loaded nor on disk: listwallets, listwalletdir, createwallet.
+    let before = requests();
+    w.prepare("watch").unwrap();
+    assert_eq!(requests() - before, 3);
+    let info = h.wallet_call_raw("getwalletinfo", json!([])).unwrap();
+    assert_eq!(info["walletname"], "watch");
+    assert_eq!(info["private_keys_enabled"], false);
+    assert_eq!(info["descriptors"], true);
+
+    // Loaded: listwallets only.
+    let before = requests();
+    w.prepare("watch").unwrap();
+    assert_eq!(requests() - before, 1);
+
+    // On disk only: listwallets, listwalletdir, loadwallet.
+    h.call_raw("unloadwallet", json!(["watch"])).unwrap();
+    assert!(matches!(
+        h.wallet_call_raw("getwalletinfo", json!([])),
+        Err(ChainError::Server { code: -18, .. })
+    ));
+    let before = requests();
+    w.prepare("watch").unwrap();
+    assert_eq!(requests() - before, 3);
+    let loaded = h.call_raw("listwallets", json!([])).unwrap();
+    assert!(loaded.as_array().unwrap().contains(&json!("watch")));
+    assert_eq!(
+        h.wallet_call_raw("getwalletinfo", json!([])).unwrap()["private_keys_enabled"],
+        false
+    );
+}
+
+#[test]
+fn import_descriptor_failure_is_an_error() {
+    let node = node(&[]);
+    let client = connect(&node, Some("watch"));
+    let w = client.handle().core_wallet().unwrap();
+    w.prepare("watch").unwrap();
+    let (desc, address) = watched_key(&key_holder(&node));
+    let good = json!({"desc": desc, "timestamp": "now"});
+    let (key, _) = desc.split_once('#').unwrap();
+    let bad = json!({"desc": format!("{}#00000000", key), "timestamp": "now"});
+    let unchecked = json!({"desc": "wpkh(not-a-key)", "timestamp": "now"});
+
+    for reqs in [
+        vec![bad.clone()],
+        vec![unchecked.clone()],
+        vec![good.clone(), bad.clone()],
+    ] {
+        let error = w.import_descriptors(&reqs).unwrap_err();
+        let ChainError::Server { message, .. } = &error else {
+            panic!("{:?}", error);
+        };
+        let rejected = reqs
+            .iter()
+            .filter(|r| **r != good)
+            .map(|r| r["desc"].as_str().unwrap());
+        for desc in rejected {
+            assert!(message.contains(desc), "{} does not name {}", message, desc);
+        }
+        assert!(!error.is_absence());
+    }
+
+    // The valid descriptor of the mixed batch was imported all the same.
+    assert!(w.address_info(&address).unwrap().is_mine);
+    w.import_descriptors(&[good]).unwrap();
+    w.import_descriptors(&[]).unwrap();
+}
+
+#[test]
+fn wallet_views_on_regtest() {
+    let node = node(&["-txindex=1"]);
+    let client = connect(&node, Some("watch"));
+    let h = client.handle();
+    let w = h.core_wallet().unwrap();
+    w.prepare("watch").unwrap();
+    mine(&node, 101);
+    let (desc, address) = watched_key(&key_holder(&node));
+    w.import_descriptors(&[json!({"desc": desc, "timestamp": "now"})])
+        .unwrap();
+
+    let info = w.address_info(&address).unwrap();
+    assert!(
+        info.is_mine && info.solvable && !info.is_watch_only,
+        "{:?}",
+        info
+    );
+    assert!(info.desc.as_deref().is_some_and(|d| d.starts_with("wpkh(")));
+    let elsewhere = node
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    assert!(!w.address_info(&elsewhere).unwrap().is_mine);
+    assert_eq!(
+        w.derive_addresses(&desc, None).unwrap(),
+        vec![address.as_unchecked().clone()]
+    );
+
+    let first = pay(&node, &address, Amount::ONE_BTC);
+    // minconf 0 includes the mempool.
+    let unconfirmed = w.list_unspent(0, None).unwrap();
+    assert_eq!(unconfirmed.len(), 1);
+    assert_eq!(unconfirmed[0].confirmations, 0);
+    assert_eq!(w.list_unspent(1, None), Ok(Vec::new()));
+    mine(&node, 1);
+    let second = pay(&node, &address, Amount::from_sat(30_000));
+
+    let confirmed = w.list_unspent(1, None).unwrap();
+    assert_eq!(confirmed.len(), 1);
+    let utxo = &confirmed[0];
+    assert_eq!(utxo.outpoint.txid, first);
+    assert_eq!(utxo.value, Amount::ONE_BTC);
+    assert_eq!(utxo.script_pubkey, address.script_pubkey());
+    assert_eq!(utxo.confirmations, 1);
+    assert_eq!(utxo.address.as_ref(), Some(address.as_unchecked()));
+    assert!(utxo.descriptor.is_some());
+    // A descriptor wallet calls whatever it tracks spendable, keys or not.
+    assert!(utxo.spendable && utxo.solvable && utxo.safe);
+    assert_eq!(
+        (utxo.witness_script.as_ref(), utxo.redeem_script.as_ref()),
+        (None, None)
+    );
+    let tx = h.transaction(&first).unwrap();
+    assert_eq!(
+        tx.output[utxo.outpoint.vout as usize].value,
+        Amount::ONE_BTC
+    );
+    assert_eq!(w.list_unspent(0, Some(0)).unwrap().len(), 1);
+    assert_eq!(w.list_unspent(0, None).unwrap().len(), 2);
+
+    // Oldest first, as Core orders them.
+    let history = w.list_transactions(10, 0).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!((history[0].txid, history[1].txid), (first, second));
+    let received = &history[0];
+    assert_eq!(received.category, mill_chain::TxCategory::Receive);
+    assert_eq!(received.amount, mill_chain::bitcoin::SignedAmount::ONE_BTC);
+    assert_eq!(received.confirmations, 1);
+    assert_eq!(received.block_height, Some(102));
+    assert_eq!(received.block_hash, Some(h.block_hash(102).unwrap()));
+    assert_eq!(received.address.as_ref(), Some(address.as_unchecked()));
+    assert_eq!(received.fee, None);
+    assert_eq!(history[1].confirmations, 0);
+    assert_eq!(history[1].block_hash, None);
+    assert_eq!(w.list_transactions(1, 0).unwrap()[0].txid, second);
+    assert_eq!(w.list_transactions(1, 1).unwrap()[0].txid, first);
+
+    assert_eq!(w.scanning_status(), Ok(None));
+    w.rescan_from(0).unwrap();
+    assert_eq!(w.scanning_status(), Ok(None));
+    assert_eq!(w.list_unspent(0, None).unwrap().len(), 2);
+}
+
+#[test]
+fn imported_ranges_are_checked_from_zero() {
+    // Core tops a ranged descriptor up to the keypool size; one keeps the range as imported.
+    let node = node(&["-keypool=1"]);
+    let client = connect(&node, Some("watch"));
+    let w = client.handle().core_wallet().unwrap();
+    w.prepare("watch").unwrap();
+    let ranged = ranged_descriptor(&node);
+    assert!(!w.imported_range_covers(&ranged, 0).unwrap());
+    w.import_descriptors(&[json!({"desc": ranged, "timestamp": "now", "range": [0, 20]})])
+        .unwrap();
+    assert!(w.imported_range_covers(&ranged, 20).unwrap());
+    assert!(!w.imported_range_covers(&ranged, 21).unwrap());
+    assert_eq!(w.derive_addresses(&ranged, Some([0, 2])).unwrap().len(), 3);
+
+    let change = ranged.replace("/0/*)", "/1/*)");
+    let change = with_checksum(&node, change.split_once('#').unwrap().0);
+    w.import_descriptors(&[json!({"desc": change, "timestamp": "now", "range": [5, 50]})])
+        .unwrap();
+    assert!(!w.imported_range_covers(&change, 10).unwrap());
+}
+
+/// A Core client with wallet `wallet` of a mock answering with `answer`, which also sees the
+/// request path.
+fn mock_wallet<F>(wallet: Option<&str>, answer: F) -> (MockHttpServer, ChainClient)
+where
+    F: Fn(&str, &str, &Value) -> Result<Value, (i64, String)> + Send + Sync + 'static,
+{
+    let server = MockHttpServer::start(move |req: &HttpRequest| {
+        let path = req.path.clone();
+        rpc_reply(req, &|method: &str, params: &Value| {
+            answer(&path, method, params)
+        })
+    })
+    .unwrap();
+    let mut config = CoreConfig::new(
+        server.url(),
+        CoreAuth::UserPass {
+            user: "u".into(),
+            pass: "p".into(),
+        },
+    );
+    config.wallet = wallet.map(str::to_string);
+    let client = MillChain::spawn(ChainConfig::Core(config)).unwrap();
+    (server, client)
+}
+
+fn methods(server: &MockHttpServer) -> Vec<String> {
+    server
+        .requests_seen()
+        .iter()
+        .filter_map(HttpRequest::method)
+        .collect()
+}
+
+#[test]
+fn wallet_calls_need_a_configured_wallet() {
+    let (server, client) = mock_wallet(None, |path, method, _| {
+        assert_eq!(path, "/");
+        match method {
+            "deriveaddresses" => Ok(json!(["bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m"])),
+            "listwallets" => Ok(json!(["other"])),
+            "listwalletdir" => Ok(json!({"wallets": [{"name": "other"}]})),
+            "createwallet" => Ok(json!({"name": "w"})),
+            other => panic!("unexpected {}", other),
+        }
+    });
+    let w = client.handle().core_wallet().unwrap();
+    w.prepare("w").unwrap();
+    assert_eq!(
+        methods(&server),
+        ["listwallets", "listwalletdir", "createwallet"]
+    );
+    assert_eq!(
+        server.requests_seen()[2].json().unwrap()["params"],
+        json!(["w", true, false, null, false, true])
+    );
+
+    let a = Address::p2wpkh(
+        &mill_chain::bitcoin::CompressedPublicKey::from_slice(&[2; 33]).unwrap(),
+        Network::Regtest,
+    );
+    let errors = [
+        w.list_unspent(0, None).map(drop),
+        w.list_transactions(10, 0).map(drop),
+        w.address_info(&a).map(drop),
+        w.import_descriptors(&[json!({"desc": "x"})]),
+        w.rescan_from(0),
+        w.scanning_status().map(drop),
+        w.imported_range_covers("x", 1).map(drop),
+    ];
+    for error in errors {
+        assert!(
+            matches!(error, Err(ChainError::Unsupported(_))),
+            "{:?}",
+            error
+        );
+    }
+    assert_eq!(server.requests_seen().len(), 3);
+    // A node RPC, which needs no wallet.
+    assert_eq!(w.derive_addresses("addr(x)", None).unwrap().len(), 1);
+    assert_eq!(server.requests_seen()[3].path, "/");
+}
+
+#[test]
+fn wallet_bootstrap_survives_races() {
+    // Created elsewhere between listwalletdir and createwallet.
+    let (server, client) = mock_wallet(Some("w"), |_, method, _| {
+        match method {
+        "listwallets" => Ok(json!([])),
+        "listwalletdir" => Ok(json!({"wallets": []})),
+        "createwallet" => Err((-4, "Wallet file verification failed. Failed to create database path '/x/w'. Database already exists.".into())),
+        "loadwallet" => Ok(json!({"name": "w"})),
+        other => panic!("unexpected {}", other),
+    }
+    });
+    client.handle().core_wallet().unwrap().prepare("w").unwrap();
+    assert_eq!(
+        methods(&server),
+        ["listwallets", "listwalletdir", "createwallet", "loadwallet"]
+    );
+
+    // Loaded elsewhere between listwallets and loadwallet.
+    let (_server, client) = mock_wallet(Some("w"), |_, method, _| match method {
+        "listwallets" => Ok(json!([])),
+        "listwalletdir" => Ok(json!({"wallets": [{"name": "w"}]})),
+        "loadwallet" => Err((-35, "Wallet \"w\" is already loaded.".into())),
+        other => panic!("unexpected {}", other),
+    });
+    client.handle().core_wallet().unwrap().prepare("w").unwrap();
+
+    // Any other failure is reported.
+    let (_server, client) = mock_wallet(Some("w"), |_, method, _| match method {
+        "listwallets" => Ok(json!([])),
+        "listwalletdir" => Ok(json!({"wallets": [{"name": "w"}]})),
+        "loadwallet" => Err((-4, "Wallet file verification failed.".into())),
+        other => panic!("unexpected {}", other),
+    });
+    let error = client
+        .handle()
+        .core_wallet()
+        .unwrap()
+        .prepare("w")
+        .unwrap_err();
+    assert!(
+        matches!(error, ChainError::Server { code: -4, .. }),
+        "{:?}",
+        error
+    );
+
+    // A malformed listing is not "no such wallet".
+    let (server, client) = mock_wallet(Some("w"), |_, method, _| match method {
+        "listwallets" => Ok(json!({"w": true})),
+        other => panic!("unexpected {}", other),
+    });
+    let error = client
+        .handle()
+        .core_wallet()
+        .unwrap()
+        .prepare("w")
+        .unwrap_err();
+    assert!(matches!(error, ChainError::Protocol(_)), "{:?}", error);
+    assert_eq!(methods(&server), ["listwallets"]);
+}
+
+#[test]
+fn wallet_failures_are_errors() {
+    let (server, client) = mock_wallet(Some("w"), |path, method, params| {
+        let node_rpc = method == "deriveaddresses";
+        assert_eq!(path == "/", node_rpc, "{} on {}", method, path);
+        match (method, params[0].as_array().map(Vec::len)) {
+            ("importdescriptors", Some(1)) => match params[0][0]["desc"].as_str() {
+                Some("short") => Ok(json!([])),
+                Some("no-success") => Ok(json!([{}])),
+                Some("bare") => Ok(json!([{"success": false}])),
+                _ => Ok(json!([{"success": true, "warnings": ["Range not given"]}])),
+            },
+            ("listtransactions", _) => Ok(json!([{"txid": "11".repeat(32), "vout": 0,
+                "category": "conflicted", "amount": 1.0, "confirmations": 1, "time": 1}])),
+            ("listunspent", _) => Ok(json!([{"txid": "11".repeat(32), "vout": 0}])),
+            ("getwalletinfo", _) => Ok(json!({"walletname": "w"})),
+            ("rescanblockchain", _) => Ok(json!(null)),
+            ("deriveaddresses", _) => Ok(json!(["not an address"])),
+            ("getaddressinfo", _) => Ok(json!({"ismine": "yes"})),
+            (other, _) => panic!("unexpected {}", other),
+        }
+    });
+    let w = client.handle().core_wallet().unwrap();
+    let import = |desc: &str| w.import_descriptors(&[json!({"desc": desc})]);
+    assert!(matches!(import("short"), Err(ChainError::Protocol(_))));
+    assert!(matches!(import("no-success"), Err(ChainError::Protocol(_))));
+    assert!(matches!(
+        import("bare"),
+        Err(ChainError::Server { code: -1, message }) if message.contains("bare")
+    ));
+    assert_eq!(import("fine"), Ok(()));
+    assert!(matches!(
+        w.list_transactions(10, 0),
+        Err(ChainError::Protocol(_))
+    ));
+    assert!(matches!(
+        w.list_unspent(0, None),
+        Err(ChainError::Protocol(_))
+    ));
+    assert!(matches!(w.scanning_status(), Err(ChainError::Protocol(_))));
+    assert!(matches!(w.rescan_from(0), Err(ChainError::Protocol(_))));
+    assert!(matches!(
+        w.derive_addresses("x", None),
+        Err(ChainError::Protocol(_))
+    ));
+    let a = Address::p2wpkh(
+        &mill_chain::bitcoin::CompressedPublicKey::from_slice(&[2; 33]).unwrap(),
+        Network::Regtest,
+    );
+    assert!(matches!(w.address_info(&a), Err(ChainError::Protocol(_))));
+    // Not a descriptor wallet, as far as the reply says.
+    assert!(matches!(
+        w.imported_range_covers("x", 1),
+        Err(ChainError::Unsupported(_))
+    ));
+    assert!(methods(&server).iter().all(|m| m != "listdescriptors"));
+
+    let server = MockHttpServer::start(|_| HttpReply::drop_connection()).unwrap();
+    let mut config = CoreConfig::new(
+        server.url(),
+        CoreAuth::UserPass {
+            user: "u".into(),
+            pass: "p".into(),
+        },
+    );
+    config.wallet = Some("w".into());
+    let options = EngineOptions {
+        backoff_max: Duration::from_millis(50),
+        ..EngineOptions::default()
+    };
+    let client = MillChain::spawn_with(ChainConfig::Core(config), options).unwrap();
+    let w = client.handle().core_wallet().unwrap();
+    let errors = [
+        w.prepare("w"),
+        w.list_unspent(0, None).map(drop),
+        w.list_transactions(10, 0).map(drop),
+        w.address_info(&a).map(drop),
+        w.derive_addresses("addr(x)", None).map(drop),
+        w.import_descriptors(&[json!({"desc": "x"})]),
+        w.rescan_from(0),
+        w.scanning_status().map(drop),
+        w.imported_range_covers("x", 1).map(drop),
+    ];
+    for error in errors {
+        assert!(
+            matches!(error, Err(ChainError::Transport(_))),
+            "{:?}",
+            error
+        );
+    }
+}
+
+#[test]
+fn rescan_progress_and_ranges_from_listings() {
+    let (_server, client) = mock_wallet(Some("w"), |_, method, _| match method {
+        "getwalletinfo" => Ok(json!({"walletname": "w", "descriptors": true,
+            "scanning": {"duration": 12, "progress": 0.25}})),
+        "listdescriptors" => Ok(json!({"wallet_name": "w", "descriptors": [
+            {"desc": "a", "range": [20, 200]},
+            {"desc": "b", "range": [0, 200]},
+            {"desc": "c", "range": [0, 100]},
+            {"desc": "d", "range": [0, 99]},
+            {"desc": "e"},
+            {"desc": "f", "range": [0]},
+        ]})),
+        other => panic!("unexpected {}", other),
+    });
+    let w = client.handle().core_wallet().unwrap();
+    assert_eq!(
+        w.scanning_status(),
+        Ok(Some(mill_chain::ScanProgress {
+            duration: Duration::from_secs(12),
+            progress: 0.25
+        }))
+    );
+    for (desc, covers) in [
+        ("a", false),
+        ("b", true),
+        ("c", true),
+        ("d", false),
+        ("e", false),
+        ("missing", false),
+    ] {
+        assert_eq!(w.imported_range_covers(desc, 100), Ok(covers), "{}", desc);
+    }
+    assert!(matches!(
+        w.imported_range_covers("f", 100),
+        Err(ChainError::Protocol(_))
+    ));
 }
