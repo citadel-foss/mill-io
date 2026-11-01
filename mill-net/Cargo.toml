@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "comparison"
 harness = false
+
+[[example]]
+name = "chaos_proxy"
+required-features = ["testing"]
