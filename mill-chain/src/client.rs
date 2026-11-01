@@ -3,23 +3,23 @@
 
 use crate::backend::core::chain::Query;
 use crate::backend::core::{CoreConfig, CoreRpc, CoreWallet, NodeInfo};
-use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime};
+use crate::engine::{Call, ClientStats, EngineOptions, EventReceiver, EventSink, Route, Runtime};
 #[cfg(feature = "testing")]
 use crate::engine::{Endpoint, Engine};
 #[cfg(feature = "testing")]
 use crate::layer::{Dialer, TransportConfig};
 #[cfg(feature = "testing")]
 use crate::proto::line::LineJsonRpc;
-use crate::{ChainError, ChainEvent, FeeRate, Tip, TxOutInfo, TxStatus};
+use crate::{ChainError, FeeRate, Tip, TxOutInfo, TxStatus};
 use bitcoin::block::Header;
 use bitcoin::{Block, BlockHash, Network, OutPoint, Script, Transaction, Txid};
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 use mill_io::EventLoop;
 use serde_json::Value;
 use std::fmt;
 #[cfg(feature = "testing")]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -165,7 +165,7 @@ impl Chain {
             inner: Arc::new(Inner {
                 engine,
                 thread: Mutex::new(Some(thread)),
-                events: events_rx,
+                events: Mutex::new(Some(events_rx)),
             }),
         })
     }
@@ -183,7 +183,7 @@ pub struct ChainClient {
 struct Inner {
     engine: Arc<dyn Runtime>,
     thread: Mutex<Option<JoinHandle<()>>>,
-    events: Receiver<ChainEvent>,
+    events: Mutex<Option<EventReceiver>>,
 }
 
 impl ChainClient {
@@ -198,10 +198,19 @@ impl ChainClient {
         }
     }
 
-    /// The events channel. Every clone of the receiver reads from the same queue; it
-    /// disconnects after shutdown.
-    pub fn events(&self) -> Receiver<ChainEvent> {
-        self.inner.events.clone()
+    /// The events channel, which has a single consumer: the first call, on any clone,
+    /// takes it. It disconnects after shutdown.
+    ///
+    /// # Panics
+    ///
+    /// When the receiver was already taken.
+    pub fn events(&self) -> EventReceiver {
+        self.inner
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .expect("mill-chain: ChainClient::events called twice")
     }
 
     /// Current counters.
@@ -502,7 +511,7 @@ impl ChainHandle {
         if deadline.is_some_and(|d| d <= Instant::now()) {
             return Err(ChainError::Timeout);
         }
-        let (reply, replies) = crossbeam_channel::bounded(1);
+        let (reply, replies) = mpsc::sync_channel(1);
         let id = self.engine.submit(Call {
             method: method.to_string(),
             params,

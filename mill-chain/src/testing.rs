@@ -11,7 +11,7 @@ use std::net::ToSocketAddrs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -369,7 +369,7 @@ pub fn on_reactor<R: Send + 'static>(c: &ChainClient, f: impl FnOnce() -> R + Se
     if engine.is_loop_thread() {
         return f();
     }
-    let (tx, rx) = crossbeam_channel::bounded(1);
+    let (tx, rx) = mpsc::sync_channel(1);
     let posted = engine.post(Box::new(move || {
         match panic::catch_unwind(AssertUnwindSafe(f)) {
             Ok(result) => {
@@ -400,7 +400,7 @@ pub fn inject_events(c: &ChainClient, n: usize) {
         engine.inject_events(n);
         return;
     }
-    let (tx, rx) = crossbeam_channel::bounded(1);
+    let (tx, rx) = mpsc::sync_channel(1);
     let loop_engine = Arc::clone(engine);
     let posted = engine.post(Box::new(move || {
         loop_engine.inject_events(n);

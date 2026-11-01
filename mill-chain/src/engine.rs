@@ -14,7 +14,6 @@
 use crate::backend::core::CoreShared;
 use crate::layer::{Dialer, Hop};
 use crate::{ChainError, ChainEvent};
-use crossbeam_channel::{Receiver, Sender};
 use mill_io::{EventLoop, TaskPriority, TimerId};
 use mill_net::errors::{NetworkError, Result as NetResult};
 use mill_net::tcp::{ConnSender, ConnectionId, SendError, ServerContext};
@@ -22,9 +21,11 @@ use mill_net::tcp::{NetworkHandler, TcpClient, TcpClientConfig};
 use serde_json::Value;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
@@ -93,7 +94,7 @@ pub(crate) trait Codec: Send {
     fn reset(&mut self);
 }
 
-pub(crate) type ReplyTx = Sender<Result<Value, ChainError>>;
+pub(crate) type ReplyTx = SyncSender<Result<Value, ChainError>>;
 
 /// Where a call goes. Only Bitcoin Core tells chain and wallet calls apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,9 +205,65 @@ impl Stats {
     }
 }
 
+/// The receiving side of a client's events channel, from
+/// [`ChainClient::events`](crate::ChainClient::events).
+///
+/// It has a single consumer: it is neither `Clone` nor `Sync`. It disconnects once the
+/// client shuts down.
+pub struct EventReceiver {
+    events: Receiver<ChainEvent>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl EventReceiver {
+    /// Blocks until an event arrives; fails once the client shut down and every event was
+    /// read.
+    pub fn recv(&self) -> Result<ChainEvent, RecvError> {
+        self.events.recv().map(|event| self.took(event))
+    }
+
+    /// Like [`recv`](Self::recv), giving up after `timeout`.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<ChainEvent, RecvTimeoutError> {
+        self.events
+            .recv_timeout(timeout)
+            .map(|event| self.took(event))
+    }
+
+    /// The next event if one is queued, without blocking.
+    pub fn try_recv(&self) -> Result<ChainEvent, TryRecvError> {
+        self.events.try_recv().map(|event| self.took(event))
+    }
+
+    /// The events queued now, without blocking.
+    pub fn try_iter(&self) -> impl Iterator<Item = ChainEvent> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+
+    /// Blocks for each event in turn, until the client shut down.
+    pub fn iter(&self) -> impl Iterator<Item = ChainEvent> + '_ {
+        std::iter::from_fn(|| self.recv().ok())
+    }
+
+    fn took(&self, event: ChainEvent) -> ChainEvent {
+        self.queued.fetch_sub(1, Ordering::SeqCst);
+        event
+    }
+}
+
+impl fmt::Debug for EventReceiver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventReceiver")
+            .field("queued", &self.queued.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
 /// The sending side of the events channel.
 pub(crate) struct EventSink {
-    events: Option<Sender<ChainEvent>>,
+    events: Option<SyncSender<ChainEvent>>,
+    /// Events on the channel, never fewer than are really there: it goes up before a send
+    /// and down after a receive.
+    queued: Arc<AtomicUsize>,
     capacity: usize,
     /// A `Resync` is the last item on the channel and has not been read yet.
     resync_pending: bool,
@@ -214,12 +271,18 @@ pub(crate) struct EventSink {
 
 impl EventSink {
     /// Sends of `events` beyond `capacity` turn into one `Resync`, which needs a slot.
-    pub(crate) fn channel(capacity: usize) -> (Self, Receiver<ChainEvent>) {
-        let (events, receiver) = crossbeam_channel::bounded(capacity.saturating_add(1));
+    pub(crate) fn channel(capacity: usize) -> (Self, EventReceiver) {
+        let (events, receiver) = mpsc::sync_channel(capacity.saturating_add(1));
+        let queued = Arc::new(AtomicUsize::new(0));
         let sink = Self {
             events: Some(events),
+            queued: Arc::clone(&queued),
             capacity,
             resync_pending: false,
+        };
+        let receiver = EventReceiver {
+            events: receiver,
+            queued,
         };
         (sink, receiver)
     }
@@ -232,14 +295,15 @@ impl EventSink {
         let Some(events) = &self.events else {
             return;
         };
+        let queued = self.queued.load(Ordering::SeqCst);
         if self.resync_pending {
             // Nothing is sent behind the `Resync`, so an empty channel means it was read.
-            if !events.is_empty() {
+            if queued != 0 {
                 return;
             }
             self.resync_pending = false;
         }
-        let event = if events.len() < self.capacity {
+        let event = if queued < self.capacity {
             event
         } else {
             self.resync_pending = true;
@@ -248,7 +312,10 @@ impl EventSink {
             }
         };
         let is_resync = matches!(event, ChainEvent::Resync { .. });
-        if events.try_send(event).is_ok() && is_resync {
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        if events.try_send(event).is_err() {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+        } else if is_resync {
             resyncs.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -266,7 +333,7 @@ impl EventSink {
         }
     }
 
-    /// Disconnects the receivers.
+    /// Disconnects the receiver.
     pub(crate) fn close(&mut self) {
         self.events = None;
     }

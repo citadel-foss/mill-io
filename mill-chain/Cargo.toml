@@ -16,7 +16,6 @@ categories = ["network-programming", "cryptography::cryptocurrencies"]
 [dependencies]
 base64 = "0.22"
 bitcoin = { version = "0.32", features = ["serde"] }
-crossbeam-channel = "0.5"
 log = "0.4"
 mill-io.workspace = true
 mill-net.workspace = true
