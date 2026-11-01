@@ -42,6 +42,19 @@ pub struct Utxo {
     pub height: Option<u64>,
 }
 
+/// An unspent output as `gettxout` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TxOutInfo {
+    /// Its value.
+    pub value: Amount,
+    /// The script it pays to.
+    pub script_pubkey: ScriptBuf,
+    /// Confirmations of the transaction that created it; 0 while in the mempool.
+    pub confirmations: u32,
+    /// Created by a coinbase transaction.
+    pub coinbase: bool,
+}
+
 /// A transaction that touches a watched script.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HistoryItem {

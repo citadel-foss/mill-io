@@ -11,10 +11,11 @@
 //! - A caller's reply channel is completed only after the call left `State` and the
 //!   `pending` gauge was updated, so `stats()` read after a call returns includes it.
 
+use crate::backend::core::CoreShared;
 use crate::layer::{Dialer, Hop};
 use crate::{ChainError, ChainEvent};
 use crossbeam_channel::{Receiver, Sender};
-use mill_io::{EventLoop, TimerId};
+use mill_io::{EventLoop, TaskPriority, TimerId};
 use mill_net::errors::{NetworkError, Result as NetResult};
 use mill_net::tcp::{ConnSender, ConnectionId, SendError, ServerContext};
 use mill_net::tcp::{NetworkHandler, TcpClient, TcpClientConfig};
@@ -294,6 +295,13 @@ pub(crate) trait Runtime: Send + Sync {
     fn close_all(&self);
     /// Drops the runtime's reference to the loop.
     fn release_loop(&self) -> Option<Arc<EventLoop>>;
+    /// Runs `task` on the loop's compute pool at high priority. Fails with `Shutdown` once
+    /// the loop is gone.
+    fn spawn_compute(&self, task: Box<dyn FnOnce() + Send>) -> Result<(), ChainError>;
+    /// Bitcoin Core's state shared by typed queries; `None` on other backends.
+    fn core(&self) -> Option<&CoreShared> {
+        None
+    }
     /// Emits `n` placeholder events from the loop thread.
     #[cfg(feature = "testing")]
     fn inject_events(&self, n: usize);
@@ -1067,6 +1075,12 @@ impl Runtime for Engine {
 
     fn release_loop(&self) -> Option<Arc<EventLoop>> {
         Engine::release_loop(self)
+    }
+
+    fn spawn_compute(&self, task: Box<dyn FnOnce() + Send>) -> Result<(), ChainError> {
+        let event_loop = self.event_loop().ok_or(ChainError::Shutdown)?;
+        event_loop.spawn_compute_with_priority(task, TaskPriority::High);
+        Ok(())
     }
 
     #[cfg(feature = "testing")]

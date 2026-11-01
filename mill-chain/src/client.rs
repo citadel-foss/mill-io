@@ -1,6 +1,7 @@
 //! The blocking facade: [`MillChain`] starts a client, [`ChainClient`] owns it and
 //! [`ChainHandle`] makes calls.
 
+use crate::backend::core::chain::Query;
 use crate::backend::core::{CoreConfig, CoreRpc};
 use crate::engine::{Call, ClientStats, EngineOptions, EventSink, Route, Runtime};
 #[cfg(feature = "testing")]
@@ -9,7 +10,9 @@ use crate::engine::{Endpoint, Engine};
 use crate::layer::{Dialer, TransportConfig};
 #[cfg(feature = "testing")]
 use crate::proto::line::LineJsonRpc;
-use crate::{ChainError, ChainEvent};
+use crate::{ChainError, ChainEvent, FeeRate, Tip, TxOutInfo, TxStatus};
+use bitcoin::block::Header;
+use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use mill_io::EventLoop;
 use serde_json::Value;
@@ -318,6 +321,82 @@ impl ChainHandle {
         self.call(method, params, Route::Wallet)
     }
 
+    /// The best block. One deadline covers every call a typed query makes.
+    pub fn tip(&self) -> Result<Tip, ChainError> {
+        Query::new(self, "tip")?.tip()
+    }
+
+    /// The hash of the best chain's block at `height`; [`ChainError::NotFound`] above the
+    /// tip.
+    pub fn block_hash(&self, height: u64) -> Result<BlockHash, ChainError> {
+        Query::new(self, "block_hash")?.block_hash(height)
+    }
+
+    /// The header of the best chain's block at `height`; [`ChainError::NotFound`] above the
+    /// tip. A reorg during the call can return a header that just left the best chain.
+    pub fn header(&self, height: u64) -> Result<Header, ChainError> {
+        Query::new(self, "header")?.header(height)
+    }
+
+    /// The best chain's block at `height`, decoded on the compute pool and checked against
+    /// its header. A reorg during the call can return a block that just left the best chain.
+    /// [`ChainError::NotFound`] above the tip, [`ChainError::Unsupported`] when the node
+    /// pruned it, or on a backend without full blocks.
+    pub fn block(&self, height: u64) -> Result<Arc<Block>, ChainError> {
+        Query::new(self, "block")?.block(height)
+    }
+
+    /// A transaction from the mempool or the txindex.
+    ///
+    /// [`ChainError::NotFound`] only when the node says it is in neither and its txindex is
+    /// complete; without `-txindex`, or while it syncs, the node's error is returned as
+    /// [`ChainError::Server`].
+    pub fn transaction(&self, txid: &Txid) -> Result<Arc<Transaction>, ChainError> {
+        Query::new(self, "transaction")?.transaction(txid)
+    }
+
+    /// Where a transaction stands. Bitcoin Core never answers [`TxStatus::Unknown`]: a
+    /// transaction in neither the mempool nor the best chain is [`ChainError::NotFound`],
+    /// under the same txindex rule as [`transaction`](Self::transaction).
+    pub fn tx_status(&self, txid: &Txid) -> Result<TxStatus, ChainError> {
+        Query::new(self, "tx_status")?.tx_status(txid)
+    }
+
+    /// The output `outpoint` if it is unspent, as `gettxout` sees it; `Ok(None)` when it is
+    /// spent or never existed.
+    ///
+    /// With `include_mempool`, mempool outputs count and mempool spends remove outputs.
+    /// Without it, an output spent only in the mempool is still reported unspent.
+    pub fn tx_out(
+        &self,
+        outpoint: &OutPoint,
+        include_mempool: bool,
+    ) -> Result<Option<TxOutInfo>, ChainError> {
+        Query::new(self, "tx_out")?.tx_out(outpoint, include_mempool)
+    }
+
+    /// Broadcasts `tx` and returns its txid. A transaction the node already has, in its
+    /// mempool or in a block, counts as broadcast.
+    pub fn broadcast(&self, tx: &Transaction) -> Result<Txid, ChainError> {
+        Query::new(self, "broadcast")?.broadcast(tx)
+    }
+
+    /// The fee rate to confirm within `conf_target` blocks, in sat/vB.
+    /// [`ChainError::NotFound`] when the node has no estimate, never a zero rate.
+    pub fn estimate_fee(&self, conf_target: u16) -> Result<FeeRate, ChainError> {
+        Query::new(self, "estimate_fee")?.estimate_fee(conf_target)
+    }
+
+    /// The txids in the node's mempool.
+    pub fn mempool_txids(&self) -> Result<Vec<Txid>, ChainError> {
+        Query::new(self, "mempool_txids")?.mempool_txids()
+    }
+
+    /// The network the node runs on.
+    pub fn network(&self) -> Result<Network, ChainError> {
+        Query::new(self, "network")?.network()
+    }
+
     /// Sends `calls` as one JSON-RPC batch to Bitcoin Core's `/` and returns one result
     /// per call, in order, whatever order the server answered in. Treated as idempotent
     /// for retries; a batch holding a long-lane method takes the long-call lane.
@@ -328,6 +407,15 @@ impl ChainHandle {
         &self,
         calls: &[(&str, Value)],
     ) -> Result<Vec<Result<Value, ChainError>>, ChainError> {
+        self.batch_by(calls, self.deadline_from_now())
+    }
+
+    /// [`batch_raw`](Self::batch_raw) ending at `deadline`.
+    pub(crate) fn batch_by(
+        &self,
+        calls: &[(&str, Value)],
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Result<Value, ChainError>>, ChainError> {
         if calls.is_empty() {
             return Ok(Vec::new());
         }
@@ -335,11 +423,33 @@ impl ChainHandle {
             .iter()
             .map(|(method, params)| serde_json::json!({"method": method, "params": params}))
             .collect();
-        let replies = self.call("", Value::Array(requests), Route::ChainBatch)?;
+        let replies = self.call_by("", Value::Array(requests), Route::ChainBatch, deadline)?;
         crate::proto::jsonrpc::split_batch_reply(replies, calls.len())
     }
 
     fn call(&self, method: &str, params: Value, route: Route) -> Result<Value, ChainError> {
+        self.call_by(method, params, route, self.deadline_from_now())
+    }
+
+    /// When a call made now must end; `None` for a deadline too far away to represent.
+    pub(crate) fn deadline_from_now(&self) -> Option<Instant> {
+        Instant::now().checked_add(self.deadline)
+    }
+
+    /// The client's runtime.
+    pub(crate) fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.engine
+    }
+
+    /// Makes one call that must end by `deadline`, so a typed query made of several calls
+    /// keeps to the handle's deadline as a whole.
+    pub(crate) fn call_by(
+        &self,
+        method: &str,
+        params: Value,
+        route: Route,
+        deadline: Option<Instant>,
+    ) -> Result<Value, ChainError> {
         if self.engine.is_loop_thread() {
             if cfg!(debug_assertions) {
                 panic!("mill-chain: blocking call on the event loop thread (WouldDeadlock)");
@@ -352,10 +462,9 @@ impl ChainHandle {
         if self.is_cancelled() {
             return Err(ChainError::Cancelled);
         }
-        if self.deadline.is_zero() {
+        if deadline.is_some_and(|d| d <= Instant::now()) {
             return Err(ChainError::Timeout);
         }
-        let deadline = Instant::now().checked_add(self.deadline);
         let (reply, replies) = crossbeam_channel::bounded(1);
         let id = self.engine.submit(Call {
             method: method.to_string(),
@@ -369,7 +478,8 @@ impl ChainHandle {
         self.wait(id, deadline, &replies)
     }
 
-    fn is_cancelled(&self) -> bool {
+    /// The handle's cancel flag is set.
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
