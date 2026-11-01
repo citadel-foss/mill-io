@@ -1,0 +1,5 @@
+error: expected a timeout such as "500ms", "10s" or "2m"
+ --> tests/ui/test_bad_timeout.rs:1:27
+  |
+1 | #[mill_io::test(timeout = "10 seconds")]
+  |                           ^^^^^^^^^^^^

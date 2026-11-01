@@ -100,6 +100,8 @@ mod context;
 pub mod error;
 mod handle;
 pub mod handler;
+#[cfg(feature = "macros")]
+mod macro_support;
 pub mod object_pool;
 pub mod poll;
 pub mod reactor;
@@ -111,6 +113,8 @@ pub use builder::EventLoopBuilder;
 pub use context::{after, cancel_timer, current, every, post, try_current, EnterGuard};
 pub use handle::{Handle, LoopGone};
 pub use handler::EventHandler;
+#[cfg(feature = "macros")]
+pub use mill_io_macros::{main, test};
 pub use mio::event::Event;
 pub use object_pool::{ObjectPool, PooledObject};
 pub use task::{spawn, spawn_with_priority, JoinError, JoinHandle, JoinTimeout};
@@ -122,6 +126,12 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
+
+#[cfg(feature = "macros")]
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::macro_support::{run_main, run_test, Mode, TestResult};
+}
 
 /// A convenient prelude module that re-exports commonly used types and traits.
 ///

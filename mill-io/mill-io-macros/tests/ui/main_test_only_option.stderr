@@ -1,0 +1,5 @@
+error: unknown #[mill_io::main] option `modes`; expected one of: workers, compute_workers, low_latency, events, poll_timeout_ms
+ --> tests/ui/main_test_only_option.rs:1:17
+  |
+1 | #[mill_io::main(modes = "both")]
+  |                 ^^^^^

@@ -1,0 +1,5 @@
+error: #[mill_io::main] functions take no parameter, or one for the loop: `&Arc<EventLoop>`, `&EventLoop` or `Arc<EventLoop>`
+ --> tests/ui/main_two_parameters.rs:5:10
+  |
+5 | fn serve(first: &EventLoop, second: &EventLoop) {
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

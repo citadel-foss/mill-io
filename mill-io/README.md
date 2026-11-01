@@ -120,6 +120,28 @@ assert_eq!(sum.join(), Ok(5050));
 
 `JoinHandle::join` returns `Err(JoinError::Panicked(msg))` if the task panicked; calling it on the loop's own reactor thread panics instead of deadlocking.
 
+### `#[mill_io::main]` and `#[mill_io::test]`
+
+The attributes build a loop, run it on a background thread, enter it for the body, and stop and join it when the body returns or panics:
+
+```rust
+#[mill_io::main(compute_workers = 4)]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let total = mill_io::spawn(|| expensive_sum()).join()?;
+    println!("{total}");
+    Ok(())
+}
+
+#[mill_io::test(modes = "both", timeout = "10s")]
+fn handlers_see_the_loop() {
+    // runs once with pool dispatch and once with handlers on the reactor thread
+}
+```
+
+They come with the default `macros` feature; `default-features = false` leaves them, and their `syn` dependency, out.
+
+Options: `workers`, `compute_workers`, `low_latency`, `events`, `poll_timeout_ms`; tests also take `modes = "pool" | "direct" | "both"` and `timeout`. The function may take the loop as a parameter (`&Arc<EventLoop>`, `&EventLoop` or `Arc<EventLoop>`), for APIs that need it.
+
 ## Compute Thread Pool
 
 Mill-IO includes a dedicated thread pool for CPU-intensive operations, keeping the I/O event loop responsive.

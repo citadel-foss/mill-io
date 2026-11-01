@@ -17,6 +17,7 @@ categories = ["network-programming", "asynchronous", "concurrency"]
 mio.workspace = true
 lock_freedom.workspace = true
 parking_lot.workspace = true
+mill-io-macros = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
@@ -25,7 +26,9 @@ mill-net = { path = "../mill-net" }
 criterion.workspace = true
 
 [features]
-default = []
+default = ["macros"]
+# The #[mill_io::main] and #[mill_io::test] attributes (pulls in syn).
+macros = ["dep:mill-io-macros"]
 unstable-mpmc = []
 unstable = ["unstable-mpmc"]
 

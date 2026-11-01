@@ -1,0 +1,5 @@
+error: #[mill_io::test] can only be applied to a function
+ --> tests/ui/test_on_const.rs:2:1
+  |
+2 | const LIMIT: usize = 4;
+  | ^^^^^^^^^^^^^^^^^^^^^^^

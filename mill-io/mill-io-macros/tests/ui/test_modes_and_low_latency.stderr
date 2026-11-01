@@ -1,0 +1,5 @@
+error: #[mill_io::test] takes either `modes` or `low_latency`, not both
+ --> tests/ui/test_modes_and_low_latency.rs:1:25
+  |
+1 | #[mill_io::test(modes = "both", low_latency)]
+  |                         ^^^^^^
