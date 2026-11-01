@@ -99,7 +99,11 @@ impl Drop for ThreadPool {
         }
         for worker in &mut self.workers {
             if let Some(t) = worker.take_thread() {
-                let _ = t.join();
+                // The pool can be dropped from one of its own workers when that
+                // worker held the last reference to its loop; it exits on `Terminate`.
+                if t.thread().id() != std::thread::current().id() {
+                    let _ = t.join();
+                }
             }
         }
     }
@@ -404,7 +408,11 @@ impl Drop for ComputeThreadPool {
         }
 
         for worker in self.workers.drain(..) {
-            let _ = worker.join();
+            // As in `ThreadPool`'s drop: never join the current thread; it drains
+            // the queue and exits once its task returns.
+            if worker.thread().id() != std::thread::current().id() {
+                let _ = worker.join();
+            }
         }
     }
 }

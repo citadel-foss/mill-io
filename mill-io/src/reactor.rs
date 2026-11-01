@@ -2,7 +2,7 @@ use crate::{
     error::Result,
     poll::{PollHandle, WAKER_TOKEN},
     thread_pool::{ComputePoolMetrics, ComputeThreadPool, Task, TaskPriority, ThreadPool},
-    timer_wheel::TimerWheel,
+    timer_wheel::{TimerId, TimerWheel},
 };
 use mio::{event::Event, Events};
 use parking_lot::Mutex;
@@ -280,6 +280,25 @@ impl Reactor {
                 }
             })
         }
+    }
+
+    pub(crate) fn schedule_once<F>(&self, delay: Duration, callback: F) -> TimerId
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let id = self.timer_wheel.schedule_once(delay, callback);
+        // Wake the reactor so it can recalculate its poll timeout.
+        let _ = self.poll_handle.wake();
+        id
+    }
+
+    pub(crate) fn schedule_repeating<F>(&self, interval: Duration, callback: F) -> TimerId
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let id = self.timer_wheel.schedule_repeating(interval, callback);
+        let _ = self.poll_handle.wake();
+        id
     }
 
     pub fn spawn_compute<F>(&self, task: F, priority: TaskPriority)

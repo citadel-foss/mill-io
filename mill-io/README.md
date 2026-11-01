@@ -89,6 +89,18 @@ let event_loop = EventLoop::builder()
     .build()?;
 ```
 
+### Handles
+
+`EventLoop::handle()` returns a cheap, cloneable `Handle` with the loop's methods except `run`. It does not keep the loop alive, so handlers and timer callbacks stored in the loop can capture one; once the loop is dropped its methods return `LoopGone`.
+
+```rust
+let handle = event_loop.handle();
+let timer_handle = handle.clone();
+handle.schedule_once(Duration::from_millis(10), move || {
+    let _ = timer_handle.post(|| println!("posted from a timer"));
+})?;
+```
+
 ## Compute Thread Pool
 
 Mill-IO includes a dedicated thread pool for CPU-intensive operations, keeping the I/O event loop responsive.

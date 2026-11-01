@@ -97,6 +97,7 @@
 use mio::{Interest, Token};
 mod builder;
 pub mod error;
+mod handle;
 pub mod handler;
 pub mod object_pool;
 pub mod poll;
@@ -105,6 +106,7 @@ pub mod thread_pool;
 pub mod timer_wheel;
 
 pub use builder::EventLoopBuilder;
+pub use handle::{Handle, LoopGone};
 pub use handler::EventHandler;
 pub use mio::event::Event;
 pub use object_pool::{ObjectPool, PooledObject};
@@ -112,7 +114,7 @@ pub use thread_pool::{ComputePoolMetrics, TaskPriority};
 pub use timer_wheel::TimerId;
 
 use crate::error::Result;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 /// A convenient prelude module that re-exports commonly used types and traits.
 ///
@@ -183,7 +185,7 @@ pub mod prelude {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct EventLoop {
-    reactor: reactor::Reactor,
+    reactor: Arc<reactor::Reactor>,
 }
 
 impl Default for EventLoop {
@@ -533,10 +535,7 @@ impl EventLoop {
     where
         F: FnOnce() + Send + 'static,
     {
-        let id = self.reactor.timer_wheel.schedule_once(delay, callback);
-        // Wake the reactor so it can recalculate its poll timeout.
-        let _ = self.reactor.poll_handle.wake();
-        id
+        self.reactor.schedule_once(delay, callback)
     }
 
     /// Schedule a repeating timer that fires every `interval`.
@@ -562,12 +561,7 @@ impl EventLoop {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        let id = self
-            .reactor
-            .timer_wheel
-            .schedule_repeating(interval, callback);
-        let _ = self.reactor.poll_handle.wake();
-        id
+        self.reactor.schedule_repeating(interval, callback)
     }
 
     /// Cancel a pending timer. Returns true if the timer was found and cancelled.
@@ -651,5 +645,25 @@ impl EventLoop {
     pub fn stop(&self) {
         let shutdown_handler = self.reactor.get_shutdown_handle();
         shutdown_handler.shutdown();
+    }
+
+    /// Returns a [`Handle`] to this loop. It does not keep the loop alive, so
+    /// handlers and timers stored in the loop can hold one without a cycle.
+    pub fn handle(&self) -> Handle {
+        Handle::new(&self.reactor)
+    }
+}
+
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        // A `Handle` call upgrades its `Weak` for the length of the call. Waiting
+        // those out keeps the reactor's drop, which joins the worker threads, on
+        // this thread instead of a worker that happened to hold the last upgrade.
+        // Upgrades held by this thread are not waited for: they end only after
+        // this drop returns, and the reactor is then freed here when they do.
+        let own = handle::upgrades_held_here(&self.reactor);
+        while Arc::strong_count(&self.reactor) > 1 + own {
+            std::thread::yield_now();
+        }
     }
 }
