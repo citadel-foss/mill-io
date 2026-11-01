@@ -47,6 +47,11 @@ impl Drop for ReactorThreadGuard {
     }
 }
 
+/// Id of the reactor whose `run()` is on this thread's stack; 0 if none.
+pub(crate) fn current_reactor_id() -> usize {
+    CURRENT_REACTOR.try_with(Cell::get).unwrap_or(0)
+}
+
 fn next_reactor_id() -> usize {
     NEXT_REACTOR_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -239,6 +244,14 @@ impl Reactor {
         CURRENT_REACTOR
             .try_with(|current| current.get() == self.id)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn compute_pool(&self) -> &ComputeThreadPool {
+        &self.compute_pool
     }
 
     fn run_posted(&self) {

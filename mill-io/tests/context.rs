@@ -367,3 +367,24 @@ fn outside_context_cancel_timer_panics() {
         mill_io::cancel_timer(id);
     });
 }
+
+#[test]
+fn outside_context_spawn_panics() {
+    assert_outside_message("spawn", || {
+        mill_io::spawn(|| 1);
+    });
+}
+
+#[test]
+fn outside_context_spawn_with_priority_panics() {
+    assert_outside_message("spawn_with_priority", || {
+        mill_io::spawn_with_priority(mill_io::TaskPriority::Low, || 1);
+    });
+}
+
+#[test]
+fn outside_context_join_macro_panics() {
+    assert_outside_message("spawn", || {
+        let _ = mill_io::join!(|| 1, || 2);
+    });
+}
