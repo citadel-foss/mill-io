@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     io::{self, Read, Write},
     net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 static EVENT_LOOP: OnceLock<EventLoop> = OnceLock::new();
@@ -16,24 +16,6 @@ fn event_loop() -> &'static EventLoop {
     EVENT_LOOP.get_or_init(EventLoop::default)
 }
 const LISTENER: Token = Token(1);
-static CURRENT_TOKEN: OnceLock<RwLock<NextToken>> = OnceLock::new();
-fn current_token_lock() -> &'static RwLock<NextToken> {
-    CURRENT_TOKEN.get_or_init(|| RwLock::new(NextToken::new()))
-}
-
-struct NextToken(usize);
-
-impl NextToken {
-    fn new() -> Self {
-        NextToken(2)
-    }
-
-    fn next(&mut self) -> Token {
-        let next = self.0;
-        self.0 += 1;
-        Token(next)
-    }
-}
 
 pub struct EchoServerHandler {
     listener: Arc<Mutex<TcpListener>>,
@@ -60,7 +42,7 @@ impl EchoServerHandler {
             match self.listener.lock().unwrap().accept() {
                 Ok((mut stream, _)) => {
                     println!("handling stream: addr={:#?}", stream.local_addr());
-                    let token = current_token_lock().write()?.next();
+                    let token = event_loop().alloc_token();
                     let connections_clone = connections.clone();
                     let buffer_pool_clone = buffer_pool.clone();
 

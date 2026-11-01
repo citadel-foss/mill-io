@@ -4,8 +4,6 @@ use mill_net::tcp::{
     traits::{ConnectionId, NetworkHandler},
     ServerContext, TcpServer, TcpServerConfig,
 };
-
-use mio::Token;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
@@ -412,7 +410,7 @@ fn main() -> Result<()> {
     println!("  {url}/metrics       - Pool metrics (JSON)");
     println!();
 
-    server.start(event_loop(), Token(1))?;
+    server.start(event_loop(), event_loop().alloc_token())?;
 
     println!("Server started. Press Ctrl+C to stop.");
 
