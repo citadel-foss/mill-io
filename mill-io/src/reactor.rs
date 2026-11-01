@@ -54,13 +54,21 @@ pub struct ReactorOptions {
     pub direct_dispatch: bool,
 }
 
+pub(crate) struct ReactorConfig {
+    pub(crate) io_workers: usize,
+    pub(crate) compute_workers: usize,
+    pub(crate) events_capacity: usize,
+    pub(crate) poll_timeout: Duration,
+    pub(crate) direct_dispatch: bool,
+}
+
 pub struct Reactor {
     pub(crate) poll_handle: PollHandle,
     events: Arc<RwLock<Events>>,
     pool: ThreadPool,
     compute_pool: ComputeThreadPool,
     stop_requested: AtomicBool,
-    poll_timeout_ms: u64,
+    poll_timeout: Duration,
     options: ReactorOptions,
     pub(crate) timer_wheel: Arc<TimerWheel>,
     /// Panics caught on the reactor thread; pool-mode panics are counted by the pool.
@@ -73,45 +81,29 @@ pub struct Reactor {
 
 impl Default for Reactor {
     fn default() -> Self {
-        Self {
-            poll_handle: PollHandle::new().unwrap(),
-            events: Arc::new(RwLock::new(Events::with_capacity(DEFAULT_EVENTS_CAPACITY))),
-            pool: ThreadPool::default(),
-            compute_pool: ComputeThreadPool::new(
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4),
-            ),
-            stop_requested: AtomicBool::new(false),
-            poll_timeout_ms: DEFAULT_POLL_TIMEOUT_MS,
-            options: ReactorOptions {
+        Self::assemble(
+            PollHandle::new().unwrap(),
+            ThreadPool::default(),
+            ComputeThreadPool::default(),
+            DEFAULT_EVENTS_CAPACITY,
+            Duration::from_millis(DEFAULT_POLL_TIMEOUT_MS),
+            ReactorOptions {
                 direct_dispatch: false,
             },
-            timer_wheel: Arc::new(TimerWheel::new()),
-            direct_panics: AtomicU64::new(0),
-            posted: Mutex::new(Vec::new()),
-            id: next_reactor_id(),
-        }
+        )
     }
 }
 
 impl Reactor {
     pub fn new(pool_size: usize, events_capacity: usize, poll_timeout_ms: u64) -> Result<Self> {
-        Ok(Self {
-            poll_handle: PollHandle::new()?,
-            events: Arc::new(RwLock::new(Events::with_capacity(events_capacity))),
-            pool: ThreadPool::new(pool_size),
-            compute_pool: ComputeThreadPool::default(),
-            stop_requested: AtomicBool::new(false),
+        Self::new_with_options(
+            pool_size,
+            events_capacity,
             poll_timeout_ms,
-            options: ReactorOptions {
+            ReactorOptions {
                 direct_dispatch: false,
             },
-            timer_wheel: Arc::new(TimerWheel::new()),
-            direct_panics: AtomicU64::new(0),
-            posted: Mutex::new(Vec::new()),
-            id: next_reactor_id(),
-        })
+        )
     }
 
     pub fn new_with_options(
@@ -120,19 +112,50 @@ impl Reactor {
         poll_timeout_ms: u64,
         options: ReactorOptions,
     ) -> Result<Self> {
-        Ok(Self {
-            poll_handle: PollHandle::new()?,
+        Ok(Self::assemble(
+            PollHandle::new()?,
+            ThreadPool::new(pool_size),
+            ComputeThreadPool::default(),
+            events_capacity,
+            Duration::from_millis(poll_timeout_ms),
+            options,
+        ))
+    }
+
+    pub(crate) fn with_config(config: &ReactorConfig) -> Result<Self> {
+        Ok(Self::assemble(
+            PollHandle::new()?,
+            ThreadPool::new(config.io_workers),
+            ComputeThreadPool::new(config.compute_workers),
+            config.events_capacity,
+            config.poll_timeout,
+            ReactorOptions {
+                direct_dispatch: config.direct_dispatch,
+            },
+        ))
+    }
+
+    fn assemble(
+        poll_handle: PollHandle,
+        pool: ThreadPool,
+        compute_pool: ComputeThreadPool,
+        events_capacity: usize,
+        poll_timeout: Duration,
+        options: ReactorOptions,
+    ) -> Self {
+        Self {
+            poll_handle,
             events: Arc::new(RwLock::new(Events::with_capacity(events_capacity))),
-            pool: ThreadPool::new(pool_size),
-            compute_pool: ComputeThreadPool::default(),
+            pool,
+            compute_pool,
             stop_requested: AtomicBool::new(false),
-            poll_timeout_ms,
+            poll_timeout,
             options,
             timer_wheel: Arc::new(TimerWheel::new()),
             direct_panics: AtomicU64::new(0),
             posted: Mutex::new(Vec::new()),
             id: next_reactor_id(),
-        })
+        }
     }
 
     pub fn run(&self) -> Result<()> {
@@ -142,11 +165,8 @@ impl Reactor {
         while !self.stop_requested.swap(false, Ordering::SeqCst) {
             // Shorten the poll timeout if a timer is due soon.
             let poll_timeout = match self.timer_wheel.time_until_next() {
-                Some(until_next) => {
-                    let configured = Duration::from_millis(self.poll_timeout_ms);
-                    until_next.min(configured)
-                }
-                None => Duration::from_millis(self.poll_timeout_ms),
+                Some(until_next) => until_next.min(self.poll_timeout),
+                None => self.poll_timeout,
             };
 
             // Handler panics are caught, so these locks are never poisoned in practice.
