@@ -77,6 +77,10 @@ pub struct Reactor {
     /// every iteration, so it only grows while producers outpace the loop.
     posted: Mutex<Vec<Task>>,
     id: usize,
+    /// Set when the owning `EventLoop` starts dropping; `Handle` calls are refused from then on.
+    pub(crate) closing: AtomicBool,
+    /// `Handle` calls admitted before `closing` was set and not yet finished.
+    pub(crate) admitted: AtomicUsize,
 }
 
 impl Default for Reactor {
@@ -155,6 +159,8 @@ impl Reactor {
             direct_panics: AtomicU64::new(0),
             posted: Mutex::new(Vec::new()),
             id: next_reactor_id(),
+            closing: AtomicBool::new(false),
+            admitted: AtomicUsize::new(0),
         }
     }
 

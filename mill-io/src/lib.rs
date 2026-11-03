@@ -114,7 +114,10 @@ pub use thread_pool::{ComputePoolMetrics, TaskPriority};
 pub use timer_wheel::TimerId;
 
 use crate::error::Result;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 /// A convenient prelude module that re-exports commonly used types and traits.
 ///
@@ -656,13 +659,16 @@ impl EventLoop {
 
 impl Drop for EventLoop {
     fn drop(&mut self) {
-        // A `Handle` call upgrades its `Weak` for the length of the call. Waiting
-        // those out keeps the reactor's drop, which joins the worker threads, on
-        // this thread instead of a worker that happened to hold the last upgrade.
-        // Upgrades held by this thread are not waited for: they end only after
-        // this drop returns, and the reactor is then freed here when they do.
+        // Waiting for the `Handle` calls admitted before `closing` keeps the
+        // reactor's drop, which joins the worker threads, on this thread rather
+        // than on a worker holding the last reference. `closing` stops new
+        // admissions, so the wait ends even while other threads keep calling;
+        // waiting on the strong count instead livelocks, since refused calls
+        // still upgrade. Calls admitted on this thread end after this drop
+        // returns, and the reactor is freed here when they do.
+        self.reactor.closing.store(true, Ordering::SeqCst);
         let own = handle::upgrades_held_here(&self.reactor);
-        while Arc::strong_count(&self.reactor) > 1 + own {
+        while self.reactor.admitted.load(Ordering::SeqCst) > own {
             std::thread::yield_now();
         }
     }

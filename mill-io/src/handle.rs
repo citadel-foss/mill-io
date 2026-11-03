@@ -7,7 +7,7 @@ use std::{
     error::Error,
     fmt,
     ops::Deref,
-    sync::{Arc, Weak},
+    sync::{atomic::Ordering, Arc, Weak},
     time::Duration,
 };
 
@@ -16,17 +16,26 @@ thread_local! {
     static UPGRADED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A `Handle`'s strong reference to its reactor, held for one call. Counted per
-/// thread so that an `EventLoop` dropped during the call, on the same thread
-/// (a cancelled timer or a rejected handler owning the last `Arc<EventLoop>`),
-/// does not wait for this reference to go away.
+/// A `Handle`'s strong reference to its reactor, held for one call. Counted in
+/// the reactor's `admitted`, which `EventLoop::drop` waits on, and per thread so
+/// that an `EventLoop` dropped during the call, on the same thread (a cancelled
+/// timer or a rejected handler owning the last `Arc<EventLoop>`), does not wait
+/// for this call to end.
 pub(crate) struct Upgraded(Arc<Reactor>);
 
 impl Upgraded {
-    fn new(reactor: Arc<Reactor>) -> Self {
+    /// `None` once the loop has started dropping.
+    fn admit(reactor: Arc<Reactor>) -> Option<Self> {
+        // SeqCst pairs with `EventLoop::drop`, which sets `closing` before reading
+        // `admitted`: either the drop waits for this call, or this call sees `closing`.
+        reactor.admitted.fetch_add(1, Ordering::SeqCst);
+        if reactor.closing.load(Ordering::SeqCst) {
+            reactor.admitted.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
         let address = Arc::as_ptr(&reactor) as usize;
         let _ = UPGRADED.try_with(|held| held.borrow_mut().push(address));
-        Self(reactor)
+        Some(Self(reactor))
     }
 }
 
@@ -47,6 +56,7 @@ impl Drop for Upgraded {
                 held.swap_remove(position);
             }
         });
+        self.0.admitted.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -118,7 +128,10 @@ impl Handle {
     }
 
     pub(crate) fn reactor(&self) -> std::result::Result<Upgraded, LoopGone> {
-        self.reactor.upgrade().map(Upgraded::new).ok_or(LoopGone)
+        self.reactor
+            .upgrade()
+            .and_then(Upgraded::admit)
+            .ok_or(LoopGone)
     }
 
     /// See [`EventLoop::register`](crate::EventLoop::register). The outer
