@@ -659,16 +659,20 @@ impl EventLoop {
 
 impl Drop for EventLoop {
     fn drop(&mut self) {
-        // Waiting for the `Handle` calls admitted before `closing` keeps the
+        // Waiting out the `Handle` calls admitted before `closing`, and then the
+        // strong references they release just after leaving the gate, keeps the
         // reactor's drop, which joins the worker threads, on this thread rather
-        // than on a worker holding the last reference. `closing` stops new
-        // admissions, so the wait ends even while other threads keep calling;
-        // waiting on the strong count instead livelocks, since refused calls
-        // still upgrade. Calls admitted on this thread end after this drop
-        // returns, and the reactor is freed here when they do.
-        self.reactor.closing.store(true, Ordering::SeqCst);
+        // than on a worker holding the last reference. Both waits end even while
+        // other threads keep calling: `closing` stops new admissions, and no call
+        // upgrades without one, so the strong count only falls. Calls admitted on
+        // this thread end after this drop returns, and the reactor is freed here
+        // when they do.
+        let gate = &self.reactor.gate;
+        gate.closing.store(true, Ordering::SeqCst);
         let own = handle::upgrades_held_here(&self.reactor);
-        while self.reactor.admitted.load(Ordering::SeqCst) > own {
+        while gate.admitted.load(Ordering::SeqCst) > own
+            || Arc::strong_count(&self.reactor) > 1 + own
+        {
             std::thread::yield_now();
         }
     }

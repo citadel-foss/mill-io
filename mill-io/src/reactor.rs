@@ -1,5 +1,6 @@
 use crate::{
     error::Result,
+    handle::Gate,
     poll::{PollHandle, WAKER_TOKEN},
     thread_pool::{ComputePoolMetrics, ComputeThreadPool, Task, TaskPriority, ThreadPool},
     timer_wheel::{TimerId, TimerWheel},
@@ -77,10 +78,7 @@ pub struct Reactor {
     /// every iteration, so it only grows while producers outpace the loop.
     posted: Mutex<Vec<Task>>,
     id: usize,
-    /// Set when the owning `EventLoop` starts dropping; `Handle` calls are refused from then on.
-    pub(crate) closing: AtomicBool,
-    /// `Handle` calls admitted before `closing` was set and not yet finished.
-    pub(crate) admitted: AtomicUsize,
+    pub(crate) gate: Arc<Gate>,
 }
 
 impl Default for Reactor {
@@ -159,8 +157,7 @@ impl Reactor {
             direct_panics: AtomicU64::new(0),
             posted: Mutex::new(Vec::new()),
             id: next_reactor_id(),
-            closing: AtomicBool::new(false),
-            admitted: AtomicUsize::new(0),
+            gate: Arc::new(Gate::default()),
         }
     }
 
@@ -326,6 +323,22 @@ impl Reactor {
 
     pub fn get_events(&self) -> Arc<RwLock<Events>> {
         self.events.clone()
+    }
+}
+
+/// Where each reactor was dropped, by address, so tests can check the thread.
+#[cfg(test)]
+pub(crate) static DROPPED_ON: std::sync::Mutex<Vec<(usize, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        let address = self as *const Reactor as usize;
+        DROPPED_ON
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((address, std::thread::current().id()));
     }
 }
 

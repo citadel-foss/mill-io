@@ -7,7 +7,10 @@ use std::{
     error::Error,
     fmt,
     ops::Deref,
-    sync::{atomic::Ordering, Arc, Weak},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Weak,
+    },
     time::Duration,
 };
 
@@ -16,28 +19,39 @@ thread_local! {
     static UPGRADED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A `Handle`'s strong reference to its reactor, held for one call. Counted in
-/// the reactor's `admitted`, which `EventLoop::drop` waits on, and per thread so
-/// that an `EventLoop` dropped during the call, on the same thread (a cancelled
-/// timer or a rejected handler owning the last `Arc<EventLoop>`), does not wait
-/// for this call to end.
-pub(crate) struct Upgraded(Arc<Reactor>);
+/// Admission for `Handle` calls, shared by a loop's reactor and its handles.
+/// Handles hold it next to their `Weak`, so a call is admitted before it upgrades.
+#[derive(Debug, Default)]
+pub(crate) struct Gate {
+    /// Set when the owning `EventLoop` starts dropping; calls are refused from then on.
+    pub(crate) closing: AtomicBool,
+    /// Calls admitted before `closing` was set and not yet finished.
+    pub(crate) admitted: AtomicUsize,
+}
 
-impl Upgraded {
-    /// `None` once the loop has started dropping.
-    fn admit(reactor: Arc<Reactor>) -> Option<Self> {
+impl Gate {
+    fn enter(&self) -> bool {
         // SeqCst pairs with `EventLoop::drop`, which sets `closing` before reading
         // `admitted`: either the drop waits for this call, or this call sees `closing`.
-        reactor.admitted.fetch_add(1, Ordering::SeqCst);
-        if reactor.closing.load(Ordering::SeqCst) {
-            reactor.admitted.fetch_sub(1, Ordering::SeqCst);
-            return None;
+        self.admitted.fetch_add(1, Ordering::SeqCst);
+        if self.closing.load(Ordering::SeqCst) {
+            self.leave();
+            return false;
         }
-        let address = Arc::as_ptr(&reactor) as usize;
-        let _ = UPGRADED.try_with(|held| held.borrow_mut().push(address));
-        Some(Self(reactor))
+        true
+    }
+
+    fn leave(&self) {
+        self.admitted.fetch_sub(1, Ordering::SeqCst);
     }
 }
+
+/// A `Handle`'s strong reference to its reactor, held for one admitted call.
+/// Counted in the gate's `admitted`, which `EventLoop::drop` waits on, and per
+/// thread so that an `EventLoop` dropped during the call, on the same thread (a
+/// cancelled timer or a rejected handler owning the last `Arc<EventLoop>`), does
+/// not wait for this call to end.
+pub(crate) struct Upgraded(Arc<Reactor>);
 
 impl Deref for Upgraded {
     type Target = Reactor;
@@ -56,7 +70,7 @@ impl Drop for Upgraded {
                 held.swap_remove(position);
             }
         });
-        self.0.admitted.fetch_sub(1, Ordering::SeqCst);
+        self.0.gate.leave();
     }
 }
 
@@ -109,6 +123,7 @@ impl Error for LoopGone {}
 #[derive(Clone, Debug)]
 pub struct Handle {
     reactor: Weak<Reactor>,
+    gate: Arc<Gate>,
 }
 
 impl PartialEq for Handle {
@@ -124,14 +139,23 @@ impl Handle {
     pub(crate) fn new(reactor: &Arc<Reactor>) -> Self {
         Self {
             reactor: Arc::downgrade(reactor),
+            gate: Arc::clone(&reactor.gate),
         }
     }
 
     pub(crate) fn reactor(&self) -> std::result::Result<Upgraded, LoopGone> {
-        self.reactor
-            .upgrade()
-            .and_then(Upgraded::admit)
-            .ok_or(LoopGone)
+        // Admitted before upgrading: once the loop is closing, no call upgrades,
+        // so the reactor's strong count can only fall.
+        if !self.gate.enter() {
+            return Err(LoopGone);
+        }
+        let Some(reactor) = self.reactor.upgrade() else {
+            self.gate.leave();
+            return Err(LoopGone);
+        };
+        let address = Arc::as_ptr(&reactor) as usize;
+        let _ = UPGRADED.try_with(|held| held.borrow_mut().push(address));
+        Ok(Upgraded(reactor))
     }
 
     /// See [`EventLoop::register`](crate::EventLoop::register). The outer
@@ -283,5 +307,63 @@ impl Handle {
         if let Ok(reactor) = self.reactor() {
             reactor.get_shutdown_handle().shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{reactor::DROPPED_ON, EventLoop};
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, PoisonError,
+        },
+        thread,
+    };
+
+    fn dropped_on(address: usize) -> Option<thread::ThreadId> {
+        DROPPED_ON
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|(dropped, _)| *dropped == address)
+            .map(|(_, thread)| *thread)
+    }
+
+    #[test]
+    fn reactor_drops_on_the_thread_that_drops_the_loop() {
+        const ROUNDS: usize = 1000;
+        const CALLERS: usize = 2;
+        let mut elsewhere = 0;
+        for _ in 0..ROUNDS {
+            let event_loop = EventLoop::builder()
+                .io_workers(1)
+                .compute_workers(CALLERS)
+                .build()
+                .unwrap();
+            let address = Arc::as_ptr(&event_loop.reactor) as usize;
+            let started = Arc::new(AtomicUsize::new(0));
+            for _ in 0..CALLERS {
+                let (handle, started) = (event_loop.handle(), Arc::clone(&started));
+                // Compute workers calling their own loop are where a last reference
+                // would make the reactor's drop join the thread running it.
+                event_loop.spawn_compute(move || {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    while handle.alloc_token().is_ok() {}
+                });
+            }
+            while started.load(Ordering::SeqCst) < CALLERS {
+                thread::yield_now();
+            }
+            drop(event_loop);
+            if dropped_on(address) != Some(thread::current().id()) {
+                elsewhere += 1;
+            }
+        }
+        assert_eq!(
+            elsewhere, 0,
+            "{elsewhere} of {ROUNDS} reactors dropped on another thread"
+        );
     }
 }
