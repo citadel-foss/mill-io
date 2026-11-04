@@ -4,7 +4,7 @@ use crate::{
     thread_pool::DEFAULT_POOL_CAPACITY,
     EventLoop,
 };
-use std::{io, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 /// Configures an [`EventLoop`]. Created by [`EventLoop::builder`].
 ///
@@ -111,7 +111,7 @@ impl EventLoopBuilder {
 
     fn finish(config: &ReactorConfig) -> Result<EventLoop> {
         Ok(EventLoop {
-            reactor: Reactor::with_config(config)?,
+            reactor: Arc::new(Reactor::with_config(config)?),
         })
     }
 

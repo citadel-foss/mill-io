@@ -1,8 +1,9 @@
 use crate::{
     error::Result,
+    handle::Gate,
     poll::{PollHandle, WAKER_TOKEN},
     thread_pool::{ComputePoolMetrics, ComputeThreadPool, Task, TaskPriority, ThreadPool},
-    timer_wheel::TimerWheel,
+    timer_wheel::{TimerId, TimerWheel},
 };
 use mio::{event::Event, Events};
 use parking_lot::Mutex;
@@ -77,6 +78,7 @@ pub struct Reactor {
     /// every iteration, so it only grows while producers outpace the loop.
     posted: Mutex<Vec<Task>>,
     id: usize,
+    pub(crate) gate: Arc<Gate>,
 }
 
 impl Default for Reactor {
@@ -155,6 +157,7 @@ impl Reactor {
             direct_panics: AtomicU64::new(0),
             posted: Mutex::new(Vec::new()),
             id: next_reactor_id(),
+            gate: Arc::new(Gate::default()),
         }
     }
 
@@ -282,6 +285,25 @@ impl Reactor {
         }
     }
 
+    pub(crate) fn schedule_once<F>(&self, delay: Duration, callback: F) -> TimerId
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let id = self.timer_wheel.schedule_once(delay, callback);
+        // Wake the reactor so it can recalculate its poll timeout.
+        let _ = self.poll_handle.wake();
+        id
+    }
+
+    pub(crate) fn schedule_repeating<F>(&self, interval: Duration, callback: F) -> TimerId
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let id = self.timer_wheel.schedule_repeating(interval, callback);
+        let _ = self.poll_handle.wake();
+        id
+    }
+
     pub fn spawn_compute<F>(&self, task: F, priority: TaskPriority)
     where
         F: FnOnce() + Send + 'static,
@@ -301,6 +323,22 @@ impl Reactor {
 
     pub fn get_events(&self) -> Arc<RwLock<Events>> {
         self.events.clone()
+    }
+}
+
+/// Where each reactor was dropped, by address, so tests can check the thread.
+#[cfg(test)]
+pub(crate) static DROPPED_ON: std::sync::Mutex<Vec<(usize, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        let address = self as *const Reactor as usize;
+        DROPPED_ON
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((address, std::thread::current().id()));
     }
 }
 
