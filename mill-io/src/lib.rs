@@ -103,6 +103,7 @@ pub mod handler;
 pub mod object_pool;
 pub mod poll;
 pub mod reactor;
+mod task;
 pub mod thread_pool;
 pub mod timer_wheel;
 
@@ -112,6 +113,7 @@ pub use handle::{Handle, LoopGone};
 pub use handler::EventHandler;
 pub use mio::event::Event;
 pub use object_pool::{ObjectPool, PooledObject};
+pub use task::{spawn, spawn_with_priority, JoinError, JoinHandle, JoinTimeout};
 pub use thread_pool::{ComputePoolMetrics, TaskPriority};
 pub use timer_wheel::TimerId;
 
@@ -653,8 +655,8 @@ impl EventLoop {
     }
 
     /// Makes this loop the current one on this thread until the guard is
-    /// dropped, so the free functions ([`post`], [`after`], [`every`],
-    /// [`cancel_timer`], [`current`]) act on it.
+    /// dropped, so the free functions ([`spawn`], [`post`], [`after`],
+    /// [`every`], [`cancel_timer`], [`current`], [`join!`]) act on it.
     ///
     /// The loop is also current on the thread inside [`run`](Self::run) and on
     /// its I/O and compute workers. Guards nest; see [`EnterGuard`].

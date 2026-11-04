@@ -101,6 +101,25 @@ handle.schedule_once(Duration::from_millis(10), move || {
 })?;
 ```
 
+### The current loop
+
+Code running on a loop's threads (the thread inside `run()`, its I/O and compute workers) or on a thread that called `enter()` can use free functions instead of passing the loop around:
+
+```rust
+let event_loop = EventLoop::default();
+let _guard = event_loop.enter();
+
+let sum = mill_io::spawn(|| (1..=100).sum::<u64>());       // compute pool, returns a JoinHandle
+let (a, b) = mill_io::join!(|| 1, || 2);                    // spawn several, wait for all
+mill_io::post(|| println!("on the reactor thread"));
+let id = mill_io::after(Duration::from_secs(1), || println!("later"));
+mill_io::cancel_timer(id);
+
+assert_eq!(sum.join(), Ok(5050));
+```
+
+`JoinHandle::join` returns `Err(JoinError::Panicked(msg))` if the task panicked; calling it on the loop's own reactor thread panics instead of deadlocking.
+
 ## Compute Thread Pool
 
 Mill-IO includes a dedicated thread pool for CPU-intensive operations, keeping the I/O event loop responsive.

@@ -308,7 +308,70 @@ fn bench_stress_max_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_spawn_overhead(c: &mut Criterion) {
+    const BATCH: usize = 1000;
+    let mut group = c.benchmark_group("spawn_overhead");
+    group.throughput(Throughput::Elements(BATCH as u64));
+    let event_loop = EventLoop::builder()
+        .io_workers(1)
+        .compute_workers(4)
+        .build()
+        .unwrap();
+    let done = Arc::new(AtomicUsize::new(0));
+
+    let wait_for = |target: usize| {
+        while done.load(Ordering::Acquire) < target {
+            thread::yield_now();
+        }
+    };
+
+    group.bench_function("spawn_compute", |b| {
+        b.iter(|| {
+            let target = done.load(Ordering::Acquire) + BATCH;
+            for _ in 0..BATCH {
+                let done = Arc::clone(&done);
+                event_loop.spawn_compute(move || {
+                    done.fetch_add(1, Ordering::Release);
+                });
+            }
+            wait_for(target);
+        });
+    });
+
+    group.bench_function("handle_spawn", |b| {
+        let handle = event_loop.handle();
+        b.iter(|| {
+            let target = done.load(Ordering::Acquire) + BATCH;
+            for _ in 0..BATCH {
+                let done = Arc::clone(&done);
+                handle.spawn(move || {
+                    done.fetch_add(1, Ordering::Release);
+                });
+            }
+            wait_for(target);
+        });
+    });
+
+    group.bench_function("context_spawn", |b| {
+        let _guard = event_loop.enter();
+        b.iter(|| {
+            let target = done.load(Ordering::Acquire) + BATCH;
+            for _ in 0..BATCH {
+                let done = Arc::clone(&done);
+                mill_io::spawn(move || {
+                    done.fetch_add(1, Ordering::Release);
+                });
+            }
+            wait_for(target);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(threadpool_benches, bench_threadpool_latency,);
+
+criterion_group!(spawn_benches, bench_spawn_overhead,);
 
 criterion_group!(
     compute_benches,
@@ -332,6 +395,7 @@ criterion_group!(stress_benches, bench_stress_max_throughput,);
 
 criterion_main!(
     threadpool_benches,
+    spawn_benches,
     compute_benches,
     pool_benches,
     reactor_benches,

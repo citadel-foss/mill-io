@@ -5,6 +5,7 @@ use std::sync::mpsc as channel;
 
 use parking_lot::{Condvar, Mutex};
 use std::{
+    cell::Cell,
     cmp::Ordering as CmpOrdering,
     collections::BinaryHeap,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -220,8 +221,43 @@ impl ComputePoolMetrics {
     }
 }
 
+/// A task shared with the code waiting for it; run at most once.
+pub(crate) trait SharedTask: Send + Sync {
+    fn run(&self);
+    /// Called instead of `run` when the task is dropped from the queue unrun.
+    fn abandon(&self);
+}
+
+enum Job {
+    Boxed(Task),
+    Shared(SharedJob),
+}
+
+impl Job {
+    fn run(self) {
+        match self {
+            Job::Boxed(task) => task(),
+            Job::Shared(mut job) => {
+                if let Some(task) = job.0.take() {
+                    task.run();
+                }
+            }
+        }
+    }
+}
+
+struct SharedJob(Option<Arc<dyn SharedTask>>);
+
+impl Drop for SharedJob {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abandon();
+        }
+    }
+}
+
 struct PriorityTask {
-    task: Task,
+    task: Job,
     priority: TaskPriority,
     sequence: u64,
 }
@@ -255,11 +291,38 @@ struct ComputeSharedState {
     shutdown: AtomicBool,
 }
 
+static NEXT_COMPUTE_POOL_ID: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    /// Id of the compute pool this thread works for; 0 on other threads.
+    static COMPUTE_POOL: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Lets a `JoinHandle::join` on one of the pool's own workers tell when no
+/// worker is left to run the task it waits for. Only debug builds check.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub(crate) struct JoinWatch {
+    id: usize,
+    pub(crate) workers: usize,
+    /// Workers blocked in `join` on a task of this pool that has not finished.
+    pub(crate) blocked: Mutex<usize>,
+}
+
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+impl JoinWatch {
+    pub(crate) fn on_worker(&self) -> bool {
+        COMPUTE_POOL
+            .try_with(|pool| pool.get() == self.id)
+            .unwrap_or(false)
+    }
+}
+
 pub struct ComputeThreadPool {
     workers: Vec<JoinHandle<()>>,
     state: Arc<ComputeSharedState>,
     sequence: AtomicU64,
     metrics: Arc<ComputePoolMetrics>,
+    join_watch: Arc<JoinWatch>,
 }
 
 impl Default for ComputeThreadPool {
@@ -284,6 +347,11 @@ impl ComputeThreadPool {
             shutdown: AtomicBool::new(false),
         });
         let metrics = Arc::new(ComputePoolMetrics::default());
+        let join_watch = Arc::new(JoinWatch {
+            id: NEXT_COMPUTE_POOL_ID.fetch_add(1, Ordering::Relaxed),
+            workers: capacity,
+            blocked: Mutex::new(0),
+        });
 
         let mut workers = Vec::with_capacity(capacity);
         // barrier to ensure all workers are started before returning
@@ -294,9 +362,11 @@ impl ComputeThreadPool {
             let barrier_clone = Arc::clone(&barrier);
             let metrics_clone = Arc::clone(&metrics);
             let context = context.clone();
+            let pool_id = join_watch.id;
             let thread = Builder::new()
                 .name(format!("compute-worker-{id}"))
                 .spawn(move || {
+                    COMPUTE_POOL.with(|pool| pool.set(pool_id));
                     let _context = context.as_ref().map(Handle::enter);
                     // wait for all workers to be ready
                     barrier_clone.wait();
@@ -338,7 +408,8 @@ impl ComputeThreadPool {
                             metrics_clone.active_workers.fetch_add(1, Ordering::Relaxed);
                             let start = Instant::now();
 
-                            let result = catch_unwind(AssertUnwindSafe(|| (priority_task.task)()));
+                            let result =
+                                catch_unwind(AssertUnwindSafe(|| priority_task.task.run()));
 
                             let duration = start.elapsed();
                             metrics_clone
@@ -368,16 +439,30 @@ impl ComputeThreadPool {
             state,
             sequence: AtomicU64::new(0),
             metrics,
+            join_watch,
         }
+    }
+
+    pub(crate) fn join_watch(&self) -> &Arc<JoinWatch> {
+        &self.join_watch
     }
 
     pub fn spawn<F>(&self, task: F, priority: TaskPriority)
     where
         F: FnOnce() + Send + 'static,
     {
+        self.push(Job::Boxed(Box::new(task)), priority);
+    }
+
+    /// Queues a task the caller keeps a reference to, without boxing it again.
+    pub(crate) fn spawn_shared(&self, task: Arc<dyn SharedTask>, priority: TaskPriority) {
+        self.push(Job::Shared(SharedJob(Some(task))), priority);
+    }
+
+    fn push(&self, task: Job, priority: TaskPriority) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let priority_task = PriorityTask {
-            task: Box::new(task),
+            task,
             priority,
             sequence,
         };
