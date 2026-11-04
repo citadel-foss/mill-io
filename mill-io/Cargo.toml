@@ -38,3 +38,11 @@ inotify = "0.10"
 [[bench]]
 name = "comprehensive"
 harness = false
+
+[[example]]
+name = "spawn_join"
+required-features = ["macros"]
+
+[[example]]
+name = "timers_in_context"
+required-features = ["macros"]
