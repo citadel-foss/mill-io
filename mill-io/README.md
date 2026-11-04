@@ -73,6 +73,22 @@ let event_loop = EventLoop::new(
 )?;
 ```
 
+### Builder
+
+The builder also sizes the compute pool, which the constructors above leave at the number of CPUs.
+
+```rust
+use mill_io::EventLoop;
+use std::time::Duration;
+
+let event_loop = EventLoop::builder()
+    .io_workers(4)
+    .compute_workers(2)
+    .events_capacity(1024)
+    .poll_timeout(Duration::from_millis(50))
+    .build()?;
+```
+
 ## Compute Thread Pool
 
 Mill-IO includes a dedicated thread pool for CPU-intensive operations, keeping the I/O event loop responsive.

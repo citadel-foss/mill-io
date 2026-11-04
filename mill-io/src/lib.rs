@@ -95,6 +95,7 @@
 #![cfg_attr(feature = "unstable-mpmc", feature(mpmc_channel))]
 
 use mio::{Interest, Token};
+mod builder;
 pub mod error;
 pub mod handler;
 pub mod object_pool;
@@ -103,13 +104,14 @@ pub mod reactor;
 pub mod thread_pool;
 pub mod timer_wheel;
 
+pub use builder::EventLoopBuilder;
 pub use handler::EventHandler;
 pub use mio::event::Event;
 pub use object_pool::{ObjectPool, PooledObject};
 pub use thread_pool::{ComputePoolMetrics, TaskPriority};
 pub use timer_wheel::TimerId;
 
-use crate::{error::Result, reactor::ReactorOptions};
+use crate::error::Result;
 use std::time::Duration;
 
 /// A convenient prelude module that re-exports commonly used types and traits.
@@ -196,12 +198,26 @@ impl Default for EventLoop {
     ///
     /// Panics if the reactor cannot be initialized with default settings.
     fn default() -> Self {
-        let reactor = reactor::Reactor::default();
-        Self { reactor }
+        Self::builder()
+            .build_unchecked()
+            .unwrap_or_else(|e| panic!("mill-io: cannot create the default event loop: {e}"))
     }
 }
 
 impl EventLoop {
+    /// Returns a builder that also sets the compute pool size, which the other
+    /// constructors leave at the number of CPUs.
+    ///
+    /// ```rust
+    /// use mill_io::EventLoop;
+    ///
+    /// let event_loop = EventLoop::builder().io_workers(2).compute_workers(2).build()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn builder() -> EventLoopBuilder {
+        EventLoopBuilder::default()
+    }
+
     /// Creates a new `EventLoop` with custom configuration.
     ///
     /// ## Arguments
@@ -229,8 +245,11 @@ impl EventLoop {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn new(workers: usize, events_capacity: usize, poll_timeout_ms: u64) -> Result<Self> {
-        let reactor = reactor::Reactor::new(workers, events_capacity, poll_timeout_ms)?;
-        Ok(Self { reactor })
+        Self::builder()
+            .io_workers(workers)
+            .events_capacity(events_capacity)
+            .poll_timeout(Duration::from_millis(poll_timeout_ms))
+            .build_unchecked()
     }
 
     /// Creates a new EventLoop optimized for low latency.
@@ -242,15 +261,11 @@ impl EventLoop {
     ///
     /// WARNING: Slow handlers will block all I/O processing!
     pub fn new_low_latency(events_capacity: usize, poll_timeout_ms: u64) -> Result<Self> {
-        let reactor = reactor::Reactor::new_with_options(
-            1, // Minimal pool for compute tasks
-            events_capacity,
-            poll_timeout_ms,
-            ReactorOptions {
-                direct_dispatch: true,
-            },
-        )?;
-        Ok(Self { reactor })
+        Self::builder()
+            .low_latency()
+            .events_capacity(events_capacity)
+            .poll_timeout(Duration::from_millis(poll_timeout_ms))
+            .build_unchecked()
     }
 
     /// Registers an I/O source with the event loop and associates it with a handler.
