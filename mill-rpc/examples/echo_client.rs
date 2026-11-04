@@ -6,8 +6,6 @@
 use mill_io::EventLoop;
 use mill_rpc::prelude::*;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 mill_rpc::service! {
     #[client]
@@ -19,19 +17,12 @@ mill_rpc::service! {
     }
 }
 
-fn main() {
+#[mill_io::main(workers = 2, poll_timeout_ms = 100)]
+fn main(event_loop: &Arc<EventLoop>) {
     env_logger::init();
-    let event_loop = Arc::new(EventLoop::new(2, 1024, 100).unwrap());
-
-    let el = event_loop.clone();
-    let handle = thread::spawn(move || {
-        el.run().unwrap();
-    });
-    thread::sleep(Duration::from_millis(50));
 
     let addr = "127.0.0.1:9002".parse().unwrap();
-    let transport =
-        RpcClient::connect(addr, &event_loop).expect("Failed to connect to echo server");
+    let transport = RpcClient::connect(addr, event_loop).expect("Failed to connect to echo server");
 
     let client = echo::Client::new(transport, Codec::bincode(), 0);
 
@@ -56,7 +47,4 @@ fn main() {
     assert_eq!(count, 3); // echo + uppercase + repeat
 
     println!("\nAll echo tests passed!");
-
-    event_loop.stop();
-    let _ = handle.join();
 }

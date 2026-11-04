@@ -10,9 +10,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use mill_io::EventLoop;
+
 mod common;
 
-use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
+use common::{spawn_loop, stop_loop, wait_until};
 
 const MESSAGE_LEN: usize = 4 * 1024 * 1024;
 
@@ -32,86 +34,76 @@ impl NetworkHandler for Collector {
     }
 }
 
-#[test]
-fn single_4mb_message_without_followup() {
-    for (mode, event_loop) in pool_and_direct() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let expected = message();
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn single_4mb_message_without_followup(event_loop: &Arc<EventLoop>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let expected = message();
 
-        let sent = expected.clone();
-        let server = thread::spawn(move || {
-            let (mut peer, _) = listener.accept().unwrap();
-            peer.write_all(&sent).unwrap();
-            // Returned so it stays open with nothing more to send: only the bytes already
-            // written may wake the client.
-            peer
-        });
+    let sent = expected.clone();
+    let server = thread::spawn(move || {
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.write_all(&sent).unwrap();
+        // Returned so it stays open with nothing more to send: only the bytes already
+        // written may wake the client.
+        peer
+    });
 
-        let collector = Collector::default();
-        let received = Arc::clone(&collector.received);
-        let mut client = TcpClient::connect(addr, TcpClientConfig::default(), collector).unwrap();
-        client.start(&event_loop).unwrap();
-        let runner = spawn_loop(&event_loop);
+    let collector = Collector::default();
+    let received = Arc::clone(&collector.received);
+    let mut client = TcpClient::connect(addr, TcpClientConfig::default(), collector).unwrap();
+    client.start(event_loop).unwrap();
 
-        let started = Instant::now();
-        let complete = wait_until(Duration::from_secs(2), || {
-            received.lock().len() >= MESSAGE_LEN
-        });
-        let elapsed = started.elapsed();
-        let got = received.lock().len();
-        assert!(
-            complete,
-            "{mode}: client received {got} of {MESSAGE_LEN} bytes within 2 s"
-        );
-        assert!(
-            *received.lock() == expected,
-            "{mode}: bytes differ after {elapsed:?}"
-        );
+    let started = Instant::now();
+    let complete = wait_until(Duration::from_secs(2), || {
+        received.lock().len() >= MESSAGE_LEN
+    });
+    let elapsed = started.elapsed();
+    let got = received.lock().len();
+    assert!(
+        complete,
+        "client received {got} of {MESSAGE_LEN} bytes within 2 s"
+    );
+    assert!(
+        *received.lock() == expected,
+        "bytes differ after {elapsed:?}"
+    );
 
-        let peer = server.join().unwrap();
-        stop_loop(&event_loop, runner);
-        drop((client, peer));
-    }
+    let _peer = server.join().unwrap();
 }
 
-#[test]
-fn server_reads_4mb_without_followup() {
-    for (mode, event_loop) in pool_and_direct() {
-        let collector = Collector::default();
-        let received = Arc::clone(&collector.received);
-        let config = TcpServerConfig::builder()
-            .address("127.0.0.1:0".parse().unwrap())
-            .build();
-        let server = Arc::new(TcpServer::new(config, collector).unwrap());
-        let addr = server.local_addr().unwrap();
-        Arc::clone(&server)
-            .start(&event_loop, event_loop.alloc_token())
-            .unwrap();
-        let runner = spawn_loop(&event_loop);
+#[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
+fn server_reads_4mb_without_followup(event_loop: &Arc<EventLoop>) {
+    let collector = Collector::default();
+    let received = Arc::clone(&collector.received);
+    let config = TcpServerConfig::builder()
+        .address("127.0.0.1:0".parse().unwrap())
+        .build();
+    let server = Arc::new(TcpServer::new(config, collector).unwrap());
+    let addr = server.local_addr().unwrap();
+    Arc::clone(&server)
+        .start(event_loop, event_loop.alloc_token())
+        .unwrap();
 
-        let expected = message();
-        let sent = expected.clone();
-        let writer = thread::spawn(move || {
-            let mut peer = TcpStream::connect(addr).unwrap();
-            peer.write_all(&sent).unwrap();
-            peer
-        });
+    let expected = message();
+    let sent = expected.clone();
+    let writer = thread::spawn(move || {
+        let mut peer = TcpStream::connect(addr).unwrap();
+        peer.write_all(&sent).unwrap();
+        peer
+    });
 
-        let complete = wait_until(Duration::from_secs(2), || {
-            received.lock().len() >= MESSAGE_LEN
-        });
-        let got = received.lock().len();
-        assert!(
-            complete,
-            "{mode}: server received {got} of {MESSAGE_LEN} bytes within 2 s"
-        );
-        assert!(*received.lock() == expected, "{mode}: bytes differ");
+    let complete = wait_until(Duration::from_secs(2), || {
+        received.lock().len() >= MESSAGE_LEN
+    });
+    let got = received.lock().len();
+    assert!(
+        complete,
+        "server received {got} of {MESSAGE_LEN} bytes within 2 s"
+    );
+    assert!(*received.lock() == expected, "bytes differ");
 
-        let peer = writer.join().unwrap();
-        stop_loop(&event_loop, runner);
-        drop(peer);
-    }
+    let _peer = writer.join().unwrap();
 }
 
 #[derive(Clone, Default)]

@@ -6,8 +6,7 @@ use mill_io::EventLoop;
 use mill_rpc::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // Both sides in one binary
 mill_rpc::service! {
@@ -31,28 +30,21 @@ impl counter::Service for AtomicCounter {
     }
 }
 
-fn main() {
+#[mill_io::main(workers = 4, compute_workers = 4, poll_timeout_ms = 100)]
+fn main(event_loop: &Arc<EventLoop>) {
     env_logger::init();
 
     let num_clients = 4;
     let requests_per_client = 100;
 
-    let server_el = Arc::new(EventLoop::new(4, 1024, 100).unwrap());
     let addr = "127.0.0.1:9005".parse().unwrap();
-
     let _server = RpcServer::builder()
         .bind(addr)
         .service(counter::server(AtomicCounter {
             value: AtomicU64::new(0),
         }))
-        .build(&server_el)
+        .build(event_loop)
         .expect("Failed to start server");
-
-    let sel = server_el.clone();
-    let server_thread = thread::spawn(move || {
-        sel.run().unwrap();
-    });
-    thread::sleep(Duration::from_millis(100));
 
     println!(
         "Spawning {} clients, {} requests each...\n",
@@ -60,42 +52,29 @@ fn main() {
     );
 
     let start = Instant::now();
-    let mut handles = Vec::new();
+    let clients: Vec<_> = (0..num_clients)
+        .map(|client_id| {
+            let transport = RpcClient::connect(addr, event_loop).unwrap();
+            // Each client blocks on its calls, so it runs as a compute task, not on the reactor.
+            mill_io::spawn(move || {
+                let client = counter::Client::new(transport, Codec::bincode(), 0);
+                let results: Vec<u64> = (0..requests_per_client)
+                    .map(|_| client.increment().unwrap())
+                    .collect();
+                println!(
+                    "  Client {} done: first={}, last={}",
+                    client_id,
+                    results.first().unwrap(),
+                    results.last().unwrap()
+                );
+                results
+            })
+        })
+        .collect();
 
-    for client_id in 0..num_clients {
-        let handle = thread::spawn(move || {
-            let client_el = Arc::new(EventLoop::new(1, 256, 50).unwrap());
-            let cel = client_el.clone();
-            let el_thread = thread::spawn(move || {
-                cel.run().unwrap();
-            });
-            thread::sleep(Duration::from_millis(20));
-
-            let transport = RpcClient::connect(addr, &client_el).unwrap();
-            let client = counter::Client::new(transport, Codec::bincode(), 0);
-
-            let mut results = Vec::new();
-            for _ in 0..requests_per_client {
-                results.push(client.increment().unwrap());
-            }
-
-            println!(
-                "  Client {} done: first={}, last={}",
-                client_id,
-                results.first().unwrap(),
-                results.last().unwrap()
-            );
-
-            client_el.stop();
-            let _ = el_thread.join();
-            results
-        });
-        handles.push(handle);
-    }
-
-    let mut all: Vec<u64> = handles
+    let mut all: Vec<u64> = clients
         .into_iter()
-        .flat_map(|h| h.join().unwrap())
+        .flat_map(|client| client.join().unwrap())
         .collect();
 
     let elapsed = start.elapsed();
@@ -114,7 +93,4 @@ fn main() {
 
     assert_eq!(all.len(), total, "No lost updates");
     println!("\nConcurrency test passed!");
-
-    server_el.stop();
-    let _ = server_thread.join();
 }

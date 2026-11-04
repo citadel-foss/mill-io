@@ -15,10 +15,9 @@
 mod support;
 
 use mill_chain::{Chain, ChainConfig, ChainError, ChainHandle};
-use mill_io::EventLoop;
+use mill_io::JoinHandle;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +34,7 @@ fn read_recent_headers(chain: &ChainHandle) -> Result<usize, ChainError> {
     Ok(read)
 }
 
+#[mill_io::main(low_latency, events = 64, poll_timeout_ms = 100)]
 fn main() -> Result<(), Box<dyn Error>> {
     let pool_threads = thread::available_parallelism().map_or(4, |n| n.get());
     let default_workers = pool_threads.saturating_sub(2).max(1);
@@ -51,34 +51,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let client = Chain::spawn(ChainConfig::Core(support::core_config(None)))?;
-    let app = Arc::new(EventLoop::new_low_latency(64, 100)?);
-    let running = {
-        let app = Arc::clone(&app);
-        thread::spawn(move || app.run().map_err(|e| e.to_string()))
-    };
-    let (report, reports) = mpsc::channel::<Report>();
     let started = Instant::now();
 
     let patient = client.handle().deadline(Duration::from_secs(10)).retries(2);
-    for i in 0..workers {
-        let (chain, report) = (patient.clone(), report.clone());
-        app.spawn_compute(move || {
-            let _ = report.send((format!("worker {}", i), read_recent_headers(&chain)));
-        });
-    }
+    let mut tasks: Vec<JoinHandle<Report>> = (0..workers)
+        .map(|i| {
+            let chain = patient.clone();
+            mill_io::spawn(move || (format!("worker {}", i), read_recent_headers(&chain)))
+        })
+        .collect();
 
     let hasty = client.handle().deadline(Duration::from_micros(50));
-    let hasty_report = report.clone();
-    app.spawn_compute(move || {
-        let _ = hasty_report.send(("50 µs deadline".into(), read_recent_headers(&hasty)));
-    });
+    tasks.push(mill_io::spawn(move || {
+        ("50 µs deadline".into(), read_recent_headers(&hasty))
+    }));
 
     let stop = Arc::new(AtomicBool::new(false));
     let stoppable = client
         .handle()
         .deadline(Duration::from_secs(10))
         .cancel_on(Arc::clone(&stop));
-    app.spawn_compute(move || {
+    tasks.push(mill_io::spawn(move || {
         let mut read = 0;
         let result = loop {
             match read_recent_headers(&stoppable) {
@@ -86,18 +79,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 other => break other,
             }
         };
-        let _ = report.send((format!("cancelled after {} headers", read), result));
-    });
-    app.schedule_once(Duration::from_millis(200), move || {
+        (format!("cancelled after {} headers", read), result)
+    }));
+    mill_io::after(Duration::from_millis(200), move || {
         stop.store(true, Ordering::SeqCst)
     });
 
-    for (who, result) in reports.iter().take(workers + 2) {
+    for task in tasks {
+        let (who, result) = task.join()?;
         println!("{}: {:?}", who, result);
     }
     println!("{} tasks in {:?}", workers + 2, started.elapsed());
-    app.stop();
-    running.join().map_err(|_| "event loop panicked")??;
     println!("{:?}", client.stats());
     client.shutdown()?;
     Ok(())

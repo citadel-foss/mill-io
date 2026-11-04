@@ -12,7 +12,6 @@ use mill_net::tcp::{
 };
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{mpsc, Arc};
-use std::thread;
 use std::time::Duration;
 
 struct Echo;
@@ -76,22 +75,17 @@ fn closed_port() -> std::io::Result<SocketAddr> {
     TcpListener::bind("127.0.0.1:0")?.local_addr()
 }
 
-fn main() -> Result<()> {
-    let event_loop = Arc::new(EventLoop::default());
+#[mill_io::main]
+fn main(event_loop: &Arc<EventLoop>) -> Result<()> {
     let server = Arc::new(TcpServer::new(
         TcpServerConfig::builder()
             .address("127.0.0.1:0".parse()?)
             .build(),
         Echo,
     )?);
-    Arc::clone(&server).start(&event_loop, event_loop.alloc_token())?;
+    Arc::clone(&server).start(event_loop, event_loop.alloc_token())?;
     let server_addr = server.local_addr()?;
     println!("echo server on {server_addr}");
-
-    let runner = {
-        let event_loop = Arc::clone(&event_loop);
-        thread::spawn(move || event_loop.run().expect("event loop failed"))
-    };
 
     let config = TcpClientConfig {
         connect_timeout: Duration::from_secs(2),
@@ -108,7 +102,7 @@ fn main() -> Result<()> {
         },
     )?;
     client.send(b"queued before the handshake")?;
-    client.start(&event_loop)?;
+    client.start(event_loop)?;
     println!(
         "[client] started {:?}; on_connect waits for the handshake",
         client.id()
@@ -132,7 +126,7 @@ fn main() -> Result<()> {
             events,
         },
     )?;
-    refused.start(&event_loop)?;
+    refused.start(event_loop)?;
     println!("[refused] connecting to {refused_addr}, where nothing listens");
     match next_event(&received) {
         ClientEvent::Failed(Some(id), error) => {
@@ -148,8 +142,6 @@ fn main() -> Result<()> {
     drop(refused);
 
     server.stop()?;
-    event_loop.stop();
-    runner.join().expect("event loop thread panicked");
     println!("done");
     Ok(())
 }

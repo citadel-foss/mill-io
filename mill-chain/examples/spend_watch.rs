@@ -21,13 +21,11 @@ mod support;
 
 use mill_chain::bitcoin::{OutPoint, ScriptBuf, Txid};
 use mill_chain::{Chain, ChainConfig, ChainError, ChainHandle};
-use mill_io::EventLoop;
 use std::error::Error;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -39,7 +37,6 @@ enum Outcome {
 }
 
 struct Watch {
-    app: Arc<EventLoop>,
     chain: ChainHandle,
     outpoint: OutPoint,
     script: ScriptBuf,
@@ -48,10 +45,8 @@ struct Watch {
 }
 
 fn poll_later(watch: Arc<Watch>) {
-    let app = Arc::clone(&watch.app);
-    app.schedule_once(POLL_INTERVAL, move || {
-        let app = Arc::clone(&watch.app);
-        app.spawn_compute(move || poll(watch));
+    mill_io::after(POLL_INTERVAL, move || {
+        mill_io::spawn(move || poll(watch));
     });
 }
 
@@ -75,6 +70,7 @@ fn poll(watch: Arc<Watch>) {
     let _ = watch.done.send(outcome);
 }
 
+#[mill_io::main(low_latency, events = 64, poll_timeout_ms = 100)]
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let outpoint: OutPoint = args
@@ -107,26 +103,19 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
         }
     );
 
-    let app = Arc::new(EventLoop::new_low_latency(64, 100)?);
-    let running = {
-        let app = Arc::clone(&app);
-        thread::spawn(move || app.run().map_err(|e| e.to_string()))
-    };
-    app.schedule_once(give_up, move || stop.store(true, Ordering::SeqCst));
+    mill_io::after(give_up, move || stop.store(true, Ordering::SeqCst));
+    // The answer comes from whichever poll ends the chain, so a channel carries it.
     let (done, outcome) = mpsc::sync_channel(1);
     let watch = Arc::new(Watch {
-        app: Arc::clone(&app),
         chain,
         outpoint,
         script,
         confirmed_only,
         done,
     });
-    app.spawn_compute(move || poll(watch));
+    mill_io::spawn(move || poll(watch));
 
     let outcome = outcome.recv()?;
-    app.stop();
-    running.join().map_err(|_| "event loop panicked")??;
     let code = match outcome {
         Outcome::Spent(txid) => {
             println!("spent by {}", txid);

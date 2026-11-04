@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
-    let event_loop = Arc::new(EventLoop::default());
+    let event_loop = EventLoop::default();
     let started = Instant::now();
     let elapsed_ms = move || started.elapsed().as_millis();
 
@@ -38,17 +38,14 @@ fn main() -> Result<()> {
         panic!("timer callback failed");
     });
 
-    let weak_loop = Arc::downgrade(&event_loop);
+    // Timer callbacks run on the reactor thread, inside the loop's context.
     event_loop.schedule_once(Duration::from_millis(150), move || {
-        let Some(event_loop) = weak_loop.upgrade() else {
-            return;
-        };
-        let cancelled = event_loop.cancel_timer(heartbeat);
+        let cancelled = mill_io::cancel_timer(heartbeat);
         println!(
             "[{:>3} ms] heartbeat cancelled: {cancelled}, stopping the loop",
             elapsed_ms()
         );
-        event_loop.stop();
+        mill_io::current().stop();
     });
 
     println!(

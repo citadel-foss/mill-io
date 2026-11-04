@@ -17,7 +17,6 @@ use mill_net::tcp::{
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{mpsc, Arc};
-use std::thread;
 use std::time::Duration;
 
 const MAGIC: &[u8; 4] = b"MILL";
@@ -122,8 +121,8 @@ fn read_raw(stream: &mut TcpStream, len: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn main() -> Result<()> {
-    let event_loop = Arc::new(EventLoop::default());
+#[mill_io::main]
+fn main(event_loop: &Arc<EventLoop>) -> Result<()> {
     let (errors, server_errors) = mpsc::channel();
     let server = Arc::new(
         TcpServer::new(
@@ -134,19 +133,14 @@ fn main() -> Result<()> {
         )?
         .with_layer(|| Box::new(XorHello::new(0x5a))),
     );
-    Arc::clone(&server).start(&event_loop, event_loop.alloc_token())?;
+    Arc::clone(&server).start(event_loop, event_loop.alloc_token())?;
     let addr = server.local_addr()?;
-
-    let runner = {
-        let event_loop = Arc::clone(&event_loop);
-        thread::spawn(move || event_loop.run().expect("event loop failed"))
-    };
 
     let (replies, client_replies) = mpsc::channel();
     let mut client = TcpClient::connect(addr, TcpClientConfig::default(), Client { replies })?
         .with_layer(XorHello::new(0xa5))?;
     client.send(b"sent before the hello finished")?;
-    client.start(&event_loop)?;
+    client.start(event_loop)?;
     let reply = client_replies.recv_timeout(WAIT)?;
     assert_eq!(reply, "SENT BEFORE THE HELLO FINISHED");
 
@@ -172,7 +166,5 @@ fn main() -> Result<()> {
 
     drop(client);
     server.stop()?;
-    event_loop.stop();
-    runner.join().expect("event loop thread panicked");
     Ok(())
 }
