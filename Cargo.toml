@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "mill-io",
+    "mill-io/mill-io-macros",
     "mill-net",
     "mill-rpc",
     "mill-rpc/mill-rpc-core",
@@ -23,4 +24,5 @@ criterion = { version = "0.5.1", features = ["html_reports"] }
 parking_lot = "0.12"
 
 mill-io = { path = "mill-io", version = "4.0.0" }
+mill-io-macros = { path = "mill-io/mill-io-macros", version = "4.0.0" }
 mill-net = { path = "mill-net", version = "4.0.0" }

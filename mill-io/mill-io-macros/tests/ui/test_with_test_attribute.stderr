@@ -1,0 +1,5 @@
+error: #[mill_io::test] already declares the test; remove #[test]
+ --> tests/ui/test_with_test_attribute.rs:2:1
+  |
+2 | #[test]
+  | ^^^^^^^

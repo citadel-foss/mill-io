@@ -1,0 +1,5 @@
+error: expected modes = "pool", "direct" or "both"
+ --> tests/ui/test_bad_mode.rs:1:25
+  |
+1 | #[mill_io::test(modes = "all")]
+  |                         ^^^^^

@@ -1,0 +1,5 @@
+error: expected integer literal
+ --> tests/ui/main_bad_value.rs:1:27
+  |
+1 | #[mill_io::main(workers = "four")]
+  |                           ^^^^^^

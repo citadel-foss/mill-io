@@ -1,0 +1,27 @@
+[package]
+name = "mill-io-macros"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The #[mill_io::main] and #[mill_io::test] attributes"
+documentation = "https://docs.rs/mill-io-macros"
+homepage = "https://github.com/citadel-tech/mill-io"
+repository = "https://github.com/citadel-tech/mill-io"
+readme = "../README.md"
+keywords = ["mill-io", "event-loop", "macros", "proc-macro"]
+categories = ["asynchronous", "concurrency"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+mill-io = { path = ".." }
+mio.workspace = true
+trybuild = "1"

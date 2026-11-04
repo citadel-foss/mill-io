@@ -1,0 +1,5 @@
+error: #[mill_io::main] can only be applied to a function
+ --> tests/ui/main_on_struct.rs:2:1
+  |
+2 | struct Config;
+  | ^^^^^^^^^^^^^^
