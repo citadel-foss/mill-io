@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TimerId(pub(crate) u64);
 
+impl TimerId {
+    /// Never issued by a wheel, so cancelling it does nothing.
+    pub(crate) const NONE: TimerId = TimerId(0);
+}
+
 // 4-level hierarchical timer wheel.
 //
 // Each level has a fixed number of slots. A timer is placed in the lowest

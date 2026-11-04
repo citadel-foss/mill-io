@@ -16,7 +16,7 @@ use std::{
     time::Instant,
 };
 
-use crate::error::Result;
+use crate::{error::Result, handle::Handle};
 
 pub const DEFAULT_POOL_CAPACITY: usize = 4;
 
@@ -45,13 +45,23 @@ impl Default for ThreadPool {
 
 impl ThreadPool {
     pub fn new(capacity: usize) -> Self {
+        Self::with_context(capacity, None)
+    }
+
+    /// Workers keep `context` entered for their whole life.
+    pub(crate) fn with_context(capacity: usize, context: Option<Handle>) -> Self {
         let mut workers = Vec::with_capacity(capacity);
         let mut senders = Vec::with_capacity(capacity);
         let panics = Arc::new(AtomicU64::new(0));
 
         for id in 0..capacity {
             let (sender, receiver) = channel::channel::<WorkerMessage>();
-            workers.push(Worker::new(id, receiver, Arc::clone(&panics)));
+            workers.push(Worker::new(
+                id,
+                receiver,
+                Arc::clone(&panics),
+                context.clone(),
+            ));
             senders.push(sender);
         }
 
@@ -120,11 +130,13 @@ impl Worker {
         id: usize,
         receiver: channel::Receiver<WorkerMessage>,
         panics: Arc<AtomicU64>,
+        context: Option<Handle>,
     ) -> Self {
         let thread = Some(
             Builder::new()
                 .name(format!("thread-pool-worker-{id}"))
                 .spawn(move || {
+                    let _context = context.as_ref().map(Handle::enter);
                     while let Ok(message) = receiver.recv() {
                         match message {
                             WorkerMessage::Task(task) => {
@@ -261,6 +273,11 @@ impl Default for ComputeThreadPool {
 
 impl ComputeThreadPool {
     pub fn new(capacity: usize) -> Self {
+        Self::with_context(capacity, None)
+    }
+
+    /// Workers keep `context` entered for their whole life.
+    pub(crate) fn with_context(capacity: usize, context: Option<Handle>) -> Self {
         let state = Arc::new(ComputeSharedState {
             queue: Mutex::new(BinaryHeap::new()),
             condvar: Condvar::new(),
@@ -276,9 +293,11 @@ impl ComputeThreadPool {
             let state_clone = Arc::clone(&state);
             let barrier_clone = Arc::clone(&barrier);
             let metrics_clone = Arc::clone(&metrics);
+            let context = context.clone();
             let thread = Builder::new()
                 .name(format!("compute-worker-{id}"))
                 .spawn(move || {
+                    let _context = context.as_ref().map(Handle::enter);
                     // wait for all workers to be ready
                     barrier_clone.wait();
 
