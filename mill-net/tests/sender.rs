@@ -17,7 +17,9 @@ use mill_io::EventLoop;
 
 mod common;
 
-use common::{pool_and_direct, spawn_loop, stop_loop, wait_until};
+use common::{
+    pool_and_direct, socket_report, spawn_loop, stop_loop, wait_for_progress, wait_until,
+};
 
 const HEADER: usize = 12;
 
@@ -136,38 +138,6 @@ fn send_retrying(sender: &ConnSender, frame: &[u8], drains: &Drains) {
     }
 }
 
-/// The kernel's view of the test's connection (`ss -tnim`), for a failure message.
-#[cfg(target_os = "linux")]
-fn socket_report(port: u16) -> String {
-    let Ok(out) = std::process::Command::new("ss")
-        .args(["-tnimH", "state", "established"])
-        .output()
-    else {
-        return "ss unavailable".to_string();
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut report = String::new();
-    let mut keep = false;
-    for line in text.lines() {
-        if !line.starts_with(char::is_whitespace) {
-            let port = format!(":{port}");
-            keep = line
-                .split_whitespace()
-                .any(|column| column.ends_with(&port));
-        }
-        if keep {
-            report.push_str(line.trim());
-            report.push('\n');
-        }
-    }
-    report
-}
-
-#[cfg(not(target_os = "linux"))]
-fn socket_report(_port: u16) -> String {
-    String::new()
-}
-
 #[mill_io::test(modes = "both", workers = 2, poll_timeout_ms = 10)]
 fn conn_sender_from_threads_and_timers(event_loop: &Arc<EventLoop>) {
     const THREADS: u32 = 8;
@@ -227,22 +197,14 @@ fn conn_sender_from_threads_and_timers(event_loop: &Arc<EventLoop>) {
             })
         })
         .collect();
-    for producer in producers {
-        producer.join().unwrap();
+    let stalled = wait_for_progress(TOTAL, || frames.load(Ordering::SeqCst))
+        .err()
+        .map(|stall| (stall, socket_report(server.local_addr().unwrap().port())));
+    if stalled.is_none() {
+        for producer in producers {
+            producer.join().unwrap();
+        }
     }
-
-    let all_arrived = wait_until(Duration::from_secs(30), || {
-        frames.load(Ordering::SeqCst) >= TOTAL
-    });
-    let stalled_at = (!all_arrived).then(|| {
-        // Tells a slow machine from a stall in the failure message.
-        let at_deadline = frames.load(Ordering::SeqCst);
-        let sockets = socket_report(server.local_addr().unwrap().port());
-        wait_until(Duration::from_secs(30), || {
-            frames.load(Ordering::SeqCst) >= TOTAL
-        });
-        (at_deadline, frames.load(Ordering::SeqCst), sockets)
-    });
     event_loop.cancel_timer(timer);
     let state = state.lock();
     assert!(
@@ -251,11 +213,8 @@ fn conn_sender_from_threads_and_timers(event_loop: &Arc<EventLoop>) {
         state.errors.len(),
         state.errors[0]
     );
-    if let Some((at_deadline, later, sockets)) = stalled_at {
-        panic!(
-            "{at_deadline} of {TOTAL} frames arrived within 30 s, {later} after 30 s more ({}); sockets at the deadline:\n{sockets}",
-            if later == at_deadline { "stalled" } else { "still moving" }
-        );
+    if let Some((stall, sockets)) = stalled {
+        panic!("frames stalled: {stall}; sockets:\n{sockets}");
     }
     assert_eq!(timer_seq.load(Ordering::SeqCst), TIMER_FRAMES);
     drop(state);
@@ -576,16 +535,23 @@ fn paused_reads_push_back_on_the_peer(event_loop: &Arc<EventLoop>) {
     );
 
     paused.lock().as_ref().unwrap().resume_reads();
-    for chunk in &chunks[next..] {
-        assert!(
-            wait_until(Duration::from_secs(10), || client.send(chunk).is_ok()),
-            "the queue never drained after resume_reads"
+    let transfer = wait_for_progress(TOTAL, || {
+        while next < chunks.len() {
+            match client.send(chunks[next]) {
+                Ok(()) => next += 1,
+                Err(SendError::Backpressure) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        received.lock().len()
+    });
+    if let Err(stall) = transfer {
+        panic!(
+            "bytes stalled after resume_reads: {stall}, {} of {} chunks sent; sockets:\n{}",
+            next,
+            chunks.len(),
+            socket_report(server.local_addr().unwrap().port())
         );
     }
-    assert!(
-        wait_until(Duration::from_secs(30), || received.lock().len() == TOTAL),
-        "{} of {TOTAL} bytes after resume_reads",
-        received.lock().len()
-    );
     assert!(*received.lock() == data, "bytes reordered or lost");
 }

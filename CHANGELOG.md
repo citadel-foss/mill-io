@@ -27,7 +27,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **mill-net**: `Layer` trait for handshakes and byte transforms, added with `with_layer` (#113)
 - **mill-net**: `testing::ChaosProxy`, behind the `testing` feature, splits, throttles, stalls and resets TCP streams (#93, #94)
 - **mill-rpc**: `slow_reader_timeout`: replies to a slow reader wait for `on_drained`, and the connection closes after the timeout (#114)
+- **mill-rpc**: `RpcServer::local_addr` returns the bound address, with the real port after binding port 0 (#127)
 - CI enforces the MSRV, 1.74 (#88)
+
+### Changed
+
+- **mill-io**: `ObjectPool::acquire` no longer re-zeroes pooled `Vec<u8>` buffers: it zeroes only bytes added back to restore the length. mill-net handlers still see only the bytes read (#129)
 
 ### Fixed
 
@@ -38,6 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **mill-net**: Reads drain until `WouldBlock`, so large messages are no longer stuck until more bytes arrive (#109)
 - **mill-net**: Large or concurrent sends no longer tear frames on `WouldBlock` (#110)
 - **mill-net**: `keep_alive` and `buffer_size` are applied, and socket options go through `socket2` with no `unsafe` (#112)
+- **mill-net**: A failed `TCP_NODELAY` or keep-alive on an accepted socket is reported with its connection id instead of `None` (#126)
 - **mill-rpc**: Several clients can share one event loop (#105)
 - **mill-rpc**: The server frames each connection separately, so a corrupt frame closes only that connection (#114)
 
