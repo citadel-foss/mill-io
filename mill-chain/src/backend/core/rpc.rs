@@ -1129,7 +1129,7 @@ mod tests {
     #[test]
     fn long_methods_take_the_long_lane() {
         let call = |method: &str, params: Value, route| {
-            let (reply, _) = crossbeam_channel::bounded(1);
+            let (reply, _) = std::sync::mpsc::sync_channel(1);
             Call {
                 method: method.into(),
                 params,
@@ -1176,7 +1176,7 @@ mod tests {
             events,
         )
         .unwrap();
-        let (reply, replies) = crossbeam_channel::bounded(1);
+        let (reply, replies) = std::sync::mpsc::sync_channel(1);
         let call = Call {
             method: "getblockcount".into(),
             params: Value::Null,

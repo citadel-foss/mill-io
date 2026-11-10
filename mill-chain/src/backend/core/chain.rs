@@ -13,10 +13,10 @@ use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::consensus::Decodable;
 use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, SignedAmount};
 use bitcoin::{Transaction, Txid};
-use crossbeam_channel::RecvTimeoutError;
 use serde_json::{json, Value};
 use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -136,7 +136,7 @@ impl<'a> Query<'a> {
         jobs: Vec<Job<T>>,
     ) -> Result<Vec<T>, ChainError> {
         let n = jobs.len();
-        let (tx, rx) = crossbeam_channel::bounded(n);
+        let (tx, rx) = mpsc::sync_channel(n);
         for (index, job) in jobs.into_iter().enumerate() {
             let tx = tx.clone();
             self.handle.runtime().spawn_compute(Box::new(move || {
@@ -154,7 +154,7 @@ impl<'a> Query<'a> {
             .collect()
     }
 
-    fn recv<T>(&self, rx: &crossbeam_channel::Receiver<T>) -> Result<T, ChainError> {
+    fn recv<T>(&self, rx: &Receiver<T>) -> Result<T, ChainError> {
         loop {
             if self.handle.is_cancelled() {
                 return Err(ChainError::Cancelled);

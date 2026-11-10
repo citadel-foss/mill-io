@@ -1,4 +1,3 @@
-use crossbeam_channel::TryRecvError;
 use mill_chain::testing::{inject_events, on_reactor, MockReply, MockScript, MockServer};
 use mill_chain::{Chain, ChainClient, ChainConfig, ChainError, ChainEvent, EngineOptions};
 use serde_json::json;
@@ -7,6 +6,7 @@ use std::io::Read;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -235,6 +235,37 @@ fn event_overflow_yields_single_resync() {
         .iter()
         .all(|e| matches!(e, ChainEvent::BlockDisconnected { .. })));
     assert_eq!(client.stats().resyncs, 1);
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn reading_events_frees_room_for_more() {
+    let _gate = shared();
+    let server = MockServer::start(echo()).unwrap();
+    let client = spawn(server.addr(), EngineOptions::default(), 16);
+    let events = client.events();
+
+    inject_events(&client, 16);
+    assert_eq!(events.try_iter().take(8).count(), 8);
+    inject_events(&client, 8);
+    let rest: Vec<ChainEvent> = events.try_iter().collect();
+    assert_eq!(rest.len(), 16);
+    assert!(rest
+        .iter()
+        .all(|e| matches!(e, ChainEvent::BlockDisconnected { .. })));
+    assert_eq!(client.stats().resyncs, 0);
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn events_has_a_single_consumer() {
+    let _gate = shared();
+    let server = MockServer::start(echo()).unwrap();
+    let client = connect(&server);
+    let _events = client.events();
+    let clone = client.clone();
+    let second = thread::spawn(move || clone.events()).join();
+    assert!(second.is_err());
     client.shutdown().unwrap();
 }
 
