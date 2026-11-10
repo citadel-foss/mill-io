@@ -25,6 +25,11 @@ fn exe() -> String {
 
 fn node(extra: &[&'static str]) -> BitcoinD {
     let mut conf = Conf::default();
+    // Without an explicit bind, losing the IPv4 RPC port to another socket leaves bitcoind
+    // on ::1 only, and BitcoinD::with_conf dials 127.0.0.1 forever. Binding it makes
+    // bitcoind exit instead, so with_conf retries on a fresh port.
+    conf.args
+        .extend_from_slice(&["-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"]);
     conf.args.extend_from_slice(extra);
     BitcoinD::with_conf(exe(), &conf).unwrap()
 }
