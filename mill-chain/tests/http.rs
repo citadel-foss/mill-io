@@ -644,6 +644,35 @@ fn timed_out_request_closes_its_connection() {
 }
 
 #[test]
+fn handle_deadline_replaces_request_timeout() {
+    let server = MockHttpServer::start(|r| match r.method().as_deref() {
+        Some("slow") => echo(r).after(600 * MS),
+        _ => echo(r),
+    })
+    .unwrap();
+    let mut config = config(server.url());
+    config.request_timeout = 200 * MS;
+    let client = spawn(config);
+
+    assert_eq!(
+        client.handle().call_raw("slow", json!([0])),
+        Err(ChainError::Timeout)
+    );
+    let patient = client.handle().deadline(5 * SECS);
+    assert_eq!(patient.call_raw("slow", json!([1])), Ok(json!([1])));
+    let started = Instant::now();
+    assert_eq!(
+        client
+            .handle()
+            .deadline(300 * MS)
+            .call_raw("slow", json!([2])),
+        Err(ChainError::Timeout)
+    );
+    assert!(started.elapsed() >= 300 * MS);
+    assert_eq!(client.stats().pending_requests, 0);
+}
+
+#[test]
 fn pool_is_bounded_by_rpc_connections() {
     let server = MockHttpServer::start(|r| echo(r).after(20 * MS)).unwrap();
     let mut config = config(server.url());

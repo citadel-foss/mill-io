@@ -59,6 +59,8 @@ Every query returns `Result<_, ChainError>`.
 - With cookie auth the cookie is read when first needed and again on a 401, so a node
   restart needs no reconfiguration. A 401 that a fresh cookie does not fix is
   `ChainError::Auth`.
+- Ordinary calls also end at `CoreConfig::request_timeout` (default 30 s), unless the
+  handle set its own `deadline`, which then replaces it.
 - `importdescriptors` and `rescanblockchain` take a long-call lane: one connection of their
   own, no `request_timeout` (only the handle's deadline), and never resent, not even with
   `retries`.

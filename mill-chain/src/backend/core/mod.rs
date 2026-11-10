@@ -32,8 +32,9 @@ pub struct CoreConfig {
     /// Most connections open at once for ordinary calls; match it to the node's
     /// `-rpcthreads`. Default 4. The long-call lane has one more of its own.
     pub rpc_connections: usize,
-    /// How long an ordinary call may take from submission to reply; the handle's
-    /// deadline still applies on top. Long-lane calls have no such limit. Default 30 s.
+    /// How long an ordinary call may take from submission to reply, for handles without a
+    /// deadline of their own: [`ChainHandle::deadline`](crate::ChainHandle::deadline)
+    /// replaces it. Long-lane calls have no such limit. Default 30 s.
     pub request_timeout: Duration,
     /// Largest response body accepted; a larger one fails its call with
     /// [`ChainError::Protocol`](crate::ChainError::Protocol). Default 32 MiB.

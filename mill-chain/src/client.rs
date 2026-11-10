@@ -193,6 +193,7 @@ impl ChainClient {
         ChainHandle {
             engine: Arc::clone(&self.inner.engine),
             deadline: options.default_deadline,
+            own_deadline: false,
             retries: options.default_retries,
             cancel: None,
         }
@@ -279,6 +280,7 @@ impl fmt::Debug for ChainClient {
 pub struct ChainHandle {
     engine: Arc<dyn Runtime>,
     deadline: Duration,
+    own_deadline: bool,
     retries: u8,
     cancel: Option<Arc<AtomicBool>>,
 }
@@ -286,8 +288,12 @@ pub struct ChainHandle {
 impl ChainHandle {
     /// Each call fails with [`ChainError::Timeout`] after `d`, retries and reconnect waits
     /// included. `Duration::ZERO` is already expired.
+    ///
+    /// On Bitcoin Core it replaces [`CoreConfig::request_timeout`], which otherwise also
+    /// caps every ordinary call.
     pub fn deadline(mut self, d: Duration) -> Self {
         self.deadline = d;
+        self.own_deadline = true;
         self
     }
 
@@ -517,6 +523,7 @@ impl ChainHandle {
             params,
             route,
             deadline,
+            own_deadline: self.own_deadline,
             retries: self.retries,
             cancel: self.cancel.clone(),
             reply,

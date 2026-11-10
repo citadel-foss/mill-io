@@ -413,7 +413,7 @@ impl CoreRpc {
                 .send(Err(ChainError::Transport("request queue full".into())));
             return;
         }
-        if lane == Lane::Normal {
+        if lane == Lane::Normal && !call.own_deadline {
             let timeout = Instant::now().checked_add(self.request_timeout);
             call.deadline = earliest(call.deadline, timeout);
         }
@@ -1135,6 +1135,7 @@ mod tests {
                 params,
                 route,
                 deadline: None,
+                own_deadline: false,
                 retries: 0,
                 cancel: None,
                 reply,
@@ -1182,6 +1183,7 @@ mod tests {
             params: Value::Null,
             route: Route::Chain,
             deadline: Some(deadline),
+            own_deadline: false,
             retries: 0,
             cancel: None,
             reply,
