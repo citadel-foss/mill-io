@@ -169,6 +169,8 @@ struct Conn {
     idle_since: Instant,
     /// Has answered at least once.
     served: bool,
+    /// Index into `CoreRpc::addrs` this connection dialed.
+    addr: usize,
 }
 
 struct State {
@@ -183,6 +185,10 @@ struct State {
     backoff: Option<TimerId>,
     /// Failed connects since the node last answered.
     attempt: u32,
+    /// Index into `CoreRpc::addrs` to dial next; kept after a success.
+    addr: usize,
+    /// Addresses that refused since a connect last succeeded or every address failed.
+    addr_failures: usize,
     jitter: f64,
     rng: u64,
     /// A connection failed or dropped a request; the next one up counts as a reconnect.
@@ -194,8 +200,8 @@ struct State {
 
 pub(crate) struct CoreRpc {
     me: Weak<CoreRpc>,
-    /// The first hop: the proxy if one is set, else the node.
-    addr: SocketAddr,
+    /// The first hop's addresses, never empty: the proxy if one is set, else the node.
+    addrs: Vec<SocketAddr>,
     dialer: Dialer,
     host: String,
     wallet_path: Option<String>,
@@ -310,18 +316,15 @@ impl CoreRpc {
         let (authority, host, port) = parse_url(&config.rpc_url)?;
         let dialer = Dialer::new(&host, port, &config.transport)?;
         // Resolved here, on the caller's thread: through a proxy only the proxy's name is.
-        let addr = match dialer.hop() {
-            Hop::Connect(addr) => addr,
+        let addrs = match dialer.hop() {
+            Hop::Connect(addr) => vec![addr],
             Hop::Resolve(name, port) => (dialer.resolver())(&name, port)
-                .map_err(|e| ChainError::Transport(format!("cannot resolve {}: {}", name, e)))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| ChainError::Transport(format!("{} has no address", name)))?,
+                .map_err(|e| ChainError::Transport(format!("cannot resolve {}: {}", name, e)))?,
         };
         let seed = RandomState::new().build_hasher().finish() | 1;
         Ok(Arc::new_cyclic(|me| CoreRpc {
             me: me.clone(),
-            addr,
+            addrs,
             dialer,
             host: authority,
             wallet_path: config.wallet.as_deref().map(wallet_path),
@@ -343,6 +346,8 @@ impl CoreRpc {
                 next_wire_id: 1,
                 backoff: None,
                 attempt: 0,
+                addr: 0,
+                addr_failures: 0,
                 jitter: 1.0,
                 rng: seed,
                 reconnect_pending: false,
@@ -565,7 +570,8 @@ impl CoreRpc {
         let handler = Events {
             rpc: self.me.clone(),
         };
-        let started = TcpClient::connect(self.addr, config, handler)
+        let addr = st.addr;
+        let started = TcpClient::connect(self.addrs[addr], config, handler)
             .and_then(|client| self.dialer.add_layers(client))
             .and_then(|mut client| client.start(event_loop).map(|()| client));
         match started {
@@ -578,25 +584,46 @@ impl CoreRpc {
                     call: None,
                     idle_since: Instant::now(),
                     served: false,
+                    addr,
                 };
                 st.conns.insert(conn.client.id(), conn);
                 true
             }
             Err(e) => {
-                self.connect_failed(st, event_loop, lane, &e.to_string());
+                if self.connect_failed(st, event_loop, lane, addr, &e.to_string()) {
+                    return self.connect(st, event_loop, lane);
+                }
                 false
             }
         }
     }
 
-    /// A connect for `lane` failed. Backs off, and fails the lane's waiting calls if no
-    /// connection is left to serve them, retrying those that have retries left.
-    fn connect_failed(&self, st: &mut State, event_loop: &Arc<EventLoop>, lane: Lane, why: &str) {
-        log::debug!("connecting to {} failed: {}", self.addr, why);
+    /// A connect to `addrs[addr]` for `lane` failed. Returns true when another address is
+    /// left to try now. Once every address has failed, backs off, and fails the lane's
+    /// waiting calls if no connection is left to serve them, retrying those that have
+    /// retries left.
+    fn connect_failed(
+        &self,
+        st: &mut State,
+        event_loop: &Arc<EventLoop>,
+        lane: Lane,
+        addr: usize,
+        why: &str,
+    ) -> bool {
+        log::debug!("connecting to {} failed: {}", self.addrs[addr], why);
+        if addr != st.addr {
+            return false;
+        }
+        st.addr = (addr + 1) % self.addrs.len();
+        st.addr_failures += 1;
+        if st.addr_failures < self.addrs.len() {
+            return true;
+        }
+        st.addr_failures = 0;
         st.reconnect_pending = true;
         self.schedule_backoff(st, event_loop);
         if st.conns.values().any(|c| c.lane == lane) {
-            return;
+            return false;
         }
         let waiting: Vec<u64> = st.queues[lane.index()].iter().copied().collect();
         for id in waiting {
@@ -610,6 +637,7 @@ impl CoreRpc {
                 self.finish(st, event_loop, id, Err(error));
             }
         }
+        false
     }
 
     fn schedule_backoff(&self, st: &mut State, event_loop: &EventLoop) {
@@ -728,6 +756,7 @@ impl CoreRpc {
         };
         target.sender = Some(target.client.sender());
         target.idle_since = Instant::now();
+        st.addr_failures = 0;
         if std::mem::take(&mut st.reconnect_pending) {
             self.stats.reconnects.fetch_add(1, Ordering::SeqCst);
         }
@@ -876,7 +905,7 @@ impl CoreRpc {
         };
         self.update_open(st);
         if lost.sender.is_none() {
-            self.connect_failed(st, event_loop, lost.lane, why);
+            self.connect_failed(st, event_loop, lost.lane, lost.addr, why);
         } else if let Some(id) = lost.call {
             match lost.parser.finish() {
                 Ok(Some(response)) => self.on_response(st, event_loop, id, response),

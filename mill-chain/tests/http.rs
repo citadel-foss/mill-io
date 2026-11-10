@@ -680,6 +680,24 @@ fn unreachable_node_is_transport() {
 }
 
 #[test]
+fn every_resolved_address_is_tried() {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    let resolved: Vec<SocketAddr> = ("localhost", 0).to_socket_addrs().unwrap().collect();
+    if resolved.len() < 2 || resolved.last().unwrap().ip() != std::net::Ipv4Addr::LOCALHOST {
+        eprintln!("skipped: localhost must resolve to ::1 then 127.0.0.1, got {resolved:?}");
+        return;
+    }
+    let server = MockHttpServer::start(echo).unwrap();
+    let url = format!("http://localhost:{}", server.addr().port());
+    let client = spawn(config(url));
+    assert_eq!(
+        client.handle().call_raw("getblockcount", json!([7])),
+        Ok(json!([7]))
+    );
+    assert_eq!(client.stats().reconnects, 0);
+}
+
+#[test]
 fn bad_urls_are_refused() {
     for url in [
         "https://127.0.0.1:8332",
